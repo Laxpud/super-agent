@@ -11,7 +11,8 @@ import { z } from 'zod'
 import { AgentDelivery } from '../app/delivery.ts'
 import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool } from './assistant.ts'
 import { documentStartArgs, sharedDocumentCommand, sharedDocumentCoordinates, sharedDocumentError } from './document-command.ts'
-import { FeishuDocumentInboxConfig, StudioFeishuInbox, validateFeishuInbox } from './feishu-inbox.ts'
+import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, feishuSourceScope, validateFeishuInbox } from './feishu-inbox.ts'
+import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './feishu-text.ts'
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
 import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
 import { LEADER_PRESET, StudioProjectControl, isLeaderTool } from './project.ts'
@@ -24,6 +25,8 @@ export const Config = s.object({
   guiDocumentInbox: s.boolean().default(false).description('Hold pending document writes for owner review when a new chat message arrives in the bound document Worker.'),
   feishuDocumentInbox: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
     .description('Optional, separately configured single-owner Feishu inbox for a managed document.'),
+  feishuTextInbox: s.union([s.const(null), FeishuTextInboxConfig]).default(null)
+    .description('Optional single-owner Feishu inbox for explicit text tasks. Do not enable it together with the document inbox.'),
 })
 type Config = ReturnType<typeof Config>
 
@@ -85,10 +88,13 @@ function receipt(operation: string, result: ManagedResult<ManagedTask>, showResu
 }
 
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
-export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocumentInbox }: Config): void {
+export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocumentInbox, feishuTextInbox }: Config): void {
   const ctx = localOwnerHost(context)
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
-  if (feishuDocumentInbox) validateFeishuInbox(feishuDocumentInbox)
+  if (feishuDocumentInbox && feishuTextInbox) throw new Error('Choose either the Studio Feishu document or text inbox, not both')
+  const feishuConfig = feishuDocumentInbox ?? feishuTextInbox
+  if (feishuConfig) validateFeishuInbox(feishuConfig)
+  if (feishuTextInbox) validateFeishuTextRoute(feishuTextInbox)
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   let available = true
   const channelStop = new AbortController()
@@ -102,6 +108,11 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
   let store: ManagedWorkerStore
   try { store = new ManagedWorkerStore(join(stateDir, 'managed-worker.sqlite')) }
   catch (error) { unlock(); throw error }
+  if (feishuTextInbox && !store.feishuDraftScopeAvailable(feishuSourceScope(feishuTextInbox))) {
+    // Do not reinterpret messages from a chat previously bound to a document.
+    try { store.finishRun() } finally { try { store.close() } finally { unlock() } }
+    throw new Error('Studio Feishu text requires a private chat not bound to a document')
+  }
   if (store.recoveredTasks) ctx.logger.warn('Managed Worker paused %d unfinished tasks after an unconfirmed run', store.recoveredTasks)
 
   const scopes = new Map<Agent, StudioScope>()
@@ -117,11 +128,13 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
   const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts)
   const intake = new StudioProjectIntake(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal)
   const delivery = new AgentDelivery(ctx)
-  const feishu = feishuDocumentInbox && new StudioFeishuInbox(ctx, store, stateDir, feishuDocumentInbox, () => available && controlReady(ctx))
+  const channelReady = () => available && controlReady(ctx)
+  const feishuText = feishuTextInbox ? new StudioFeishuText(store, drafts, feishuTextInbox, channelStop.signal, channelReady) : undefined
+  const feishu = feishuConfig && new StudioFeishuInbox(ctx, store, stateDir, feishuConfig, channelReady, feishuText)
 
   /** A persisted binding wins over the picker, so a retired or finished Worker cannot become a different role on resume. */
   function roleOf(agent: Agent): StudioRole | undefined {
-    if (store.draftBinding(agent.id) || store.projects.workerBound(agent.id)) return 'draft-worker'
+    if (store.draftBinding(agent.id) || store.feishuDraftBinding(agent.id) || store.projects.workerBound(agent.id)) return 'draft-worker'
     if (store.binding(agent.id)) return 'document-worker'
     if (store.assistantBinding(agent.id)) return 'assistant'
     if (store.projects.binding(agent.id)) return 'leader'
@@ -138,8 +151,9 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
     drafts.stop()
     permits.clear()
     try {
-      // The channel cannot register after admission is closed. Drain its child process and receipts before closing the Store.
+      // Drain the transport and any text Worker it reserved before closing the Store.
       if (channelRun) await channelRun
+      await feishuText?.drain()
       for (const scope of scopes.values()) scope.dispose()
       scopes.clear()
       // Admit no work after marking the run clean. A lost lock or failed shutdown leaves recovery to the next run.
@@ -292,8 +306,14 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
       const id = rawInput.trim()
       if (id && !z.uuid().safeParse(id).success) return { kind: 'error', text: 'Expected one Studio task ID, or no ID for the latest task in this Session.' }
       const result = store.readDraft(agent.id, id || undefined)
-      if (!result.ok) return { kind: 'error', text: `Cannot read Studio result: ${result.reason}.` }
-      return { kind: 'success', text: draftOutput(result.value).text }
+      if (result.ok) return { kind: 'success', text: draftOutput(result.value).text }
+      // Keep no-ID lookup local to the Assistant's own Web tasks. A Feishu result requires its exact durable ID.
+      if (id && result.reason === 'TASK_NOT_FOUND') {
+        const external = store.readFeishuDraft(id)
+        if (external.ok) return { kind: 'success', text: feishuDraftOutput(external.value) }
+        return { kind: 'error', text: `Cannot read Studio result: ${external.reason}.` }
+      }
+      return { kind: 'error', text: `Cannot read Studio result: ${result.reason}.` }
     },
   }))
   ctx.effect(() => ctx.commands.register({

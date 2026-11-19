@@ -354,14 +354,16 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/managed-worker/index.ts` | The opt-in Studio host: keeps its roles read-only, registers Web commands, and guards the one allowed managed document action without running GitHub setup |
-| `src/managed-worker/assistant.ts` | Delegates Assistant requests and runs restricted text Workers for both roles; captures the exact admitted turn's final text and drains the source Session before delivery |
+| `src/managed-worker/assistant.ts` | Delegates Assistant requests and runs restricted text Workers for Web and Feishu; captures the exact admitted turn's final text and drains the source Session before delivery |
 | `src/managed-worker/project.ts` | Owner project commands and Leader tools to register, dispatch and read project work; rechecks current management at the Worker's first step |
 | `src/managed-worker/project-intake.ts` | Presents a source-bound Assistant proposal to the native Web answerer; only a positive owner answer can establish the project and its Leader Session |
 | `src/managed-worker/project-store.ts` | Persists project identities, management history and Worker attempts; only the current management epoch can reserve and begin an execution |
 | `src/managed-worker/instructions.ts` | Records Web inputs before model reads, reviews Web and Feishu corrections against their exact versions, and sends current approved text to the bound Worker |
 | `src/managed-worker/document-intent.ts` | Recognizes a small grammar of unambiguous pause or line-subset requests; it has no authority to change them into actions |
 | `src/managed-worker/owner-confirmation.ts` | Checks the explicit answer to a live native Web owner question; timeout and delayed or mismatched replies cannot confirm a change |
-| `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot and accepts messages only from the configured owner chat; sends receipts independently of ledger registration |
+| `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot, routes the configured owner's private chat to either document review or text tasks, and sends best-effort receipts |
+| `src/managed-worker/feishu-text.ts` | Routes explicit single-message text tasks to a restricted Worker and retrieves exact results without rerunning them |
+| `src/managed-worker/feishu-draft-store.ts` | Preserves Feishu input, task and Worker identities, and result provenance; deduplicates deliveries under the shared SQLite run fence |
 | `src/managed-worker/instruction-store.ts` | Preserves Feishu task links, original deliveries and review receipts, including replacements narrowed to a subset of approved changes; pending inputs hold writes even when the listeners are off |
 | `src/managed-worker/document-command.ts` | Owner-only commands for inspecting, creating and editing a shared document, and for selecting a task's exact base revision |
 | `src/managed-worker/shared-document-store.ts` | Immutable shared document revisions, exact task base links, and provenance for owner and Worker writes; a shared commit cannot update only a task's private snapshot |

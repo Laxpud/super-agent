@@ -10,7 +10,8 @@ import { z } from 'zod'
 import { resolveFeishuBot, type FeishuBot } from '../deployment.ts'
 import { consumeFeishuEvents, consumerRetry } from '../sources/feishu-events.ts'
 import { FeishuEventSchema } from '../sources/feishu-trigger.ts'
-import type { ManagedResult, ManagedTask, ManagedWorkerStore } from './store.ts'
+import type { FeishuTextRoute, StudioFeishuText } from './feishu-text.ts'
+import type { ManagedResult, ManagedTask, ManagedWorkerStore, StudioFeishuInstruction } from './store.ts'
 
 const appId = /^cli_[a-zA-Z0-9]+$/
 const openId = /^ou_[a-zA-Z0-9]+$/
@@ -29,13 +30,25 @@ export interface FeishuInboxConfig {
   chatId: string
 }
 
-export const FeishuDocumentInboxConfig: s<FeishuInboxConfig> = s.object({
+const inboxFields = {
   cli: s.string().required().description('Absolute path to a trusted lark-cli executable restricted to the bot identity.'),
   appId: s.string().pattern(appId).required(),
   botOpenId: s.string().pattern(openId).required(),
   ownerOpenId: s.string().pattern(openId).required(),
   chatId: s.string().pattern(chatId).required(),
+}
+export const FeishuDocumentInboxConfig: s<FeishuInboxConfig> = s.object(inboxFields)
+export const FeishuTextInboxConfig: s<FeishuInboxConfig & FeishuTextRoute> = s.object({
+  ...inboxFields,
+  cwd: s.string().required(),
+  provider: s.string().required(),
+  model: s.string().required(),
+  reasoningEffort: s.string().default(''),
 })
+
+export function feishuSourceScope(config: FeishuInboxConfig): string {
+  return JSON.stringify(['feishu', config.appId, config.botOpenId, config.chatId, config.ownerOpenId])
+}
 
 /** Fail before opening the Studio database if this optional transport is misconfigured. */
 export function validateFeishuInbox(config: FeishuInboxConfig): void {
@@ -58,14 +71,15 @@ export class StudioFeishuInbox {
   private readonly replies = new Set<Promise<void>>()
 
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore, private readonly stateDir: string,
-    private readonly config: FeishuInboxConfig, private readonly allowed: () => boolean) {
-    this.scope = JSON.stringify(['feishu', config.appId, config.botOpenId, config.chatId, config.ownerOpenId])
+    private readonly config: FeishuInboxConfig, private readonly allowed: () => boolean, private readonly text?: StudioFeishuText) {
+    this.scope = feishuSourceScope(config)
   }
 
-  status(): string { return `Studio Feishu inbox: ${this.state}.` }
+  status(): string { return `Studio Feishu inbox: ${this.state}. Mode: ${this.text ? 'text tasks' : 'document review'}.` }
 
   /** The command authorizes one link, not a change to the task or permission to send another action. */
   bind(sessionId: string, commandId: string): ManagedResult<ManagedTask> {
+    if (this.text) return { ok: false, reason: 'FEISHU_TEXT_MODE' }
     if (!this.listening || !this.allowed()) return { ok: false, reason: 'FEISHU_NOT_READY' }
     return this.store.linkFeishuDocument(sessionId, this.scope, commandId)
   }
@@ -125,12 +139,18 @@ export class StudioFeishuInbox {
       throw new Error('Invalid Feishu source coordinates')
     }
     const text = data.content.length <= MAX_TEXT && data.content.isWellFormed() && !data.content.includes('\0') ? data.content : null
-    const result = this.store.receiveFeishuInstruction({ channel: 'feishu', sourceScope: this.scope,
+    const source: StudioFeishuInstruction = { channel: 'feishu', sourceScope: this.scope,
       requestId: data.message_id, messageId: data.message_id, eventSeq: null, sourceTimeMs, text, senderId: data.sender_id,
       ...(data.parent_id && messageId.test(data.parent_id) ? { parentId: data.parent_id } : {}),
       ...(data.root_id && messageId.test(data.root_id) ? { rootId: data.root_id } : {}),
       ...(data.thread_id && threadId.test(data.thread_id) ? { threadId: data.thread_id } : {}),
-    })
+    }
+    // Both modes share identity checks. A fixed composition never treats a document input as fresh work.
+    if (this.text) {
+      this.text.receive(source, (message, phase) => this.reply(bot, data.message_id, message, signal, phase))
+      return
+    }
+    const result = this.store.receiveFeishuInstruction(source)
     if (!result.ok) {
       this.ctx.logger.warn('Studio could not confirm a Feishu document input: %s', result.reason)
       this.reply(bot, data.message_id, 'Studio could not confirm registration. Do not treat this message as an effective instruction; check the Web inbox and document status.', signal)
@@ -149,9 +169,11 @@ export class StudioFeishuInbox {
   }
 
   /** Do not make a later instruction wait behind a notification. Drop surplus receipts, not their ledger records. */
-  private reply(bot: FeishuBot, target: string, text: string, signal: AbortSignal): void {
+  private reply(bot: FeishuBot, target: string, text: string, signal: AbortSignal, phase?: 'accepted' | 'final'): void {
     if (signal.aborted || !this.allowed() || this.replies.size >= MAX_REPLIES) return
-    const key = createHash('sha256').update(this.scope).update('\0').update(target).digest('hex').slice(0, 32)
+    const hash = createHash('sha256').update(this.scope).update('\0').update(target)
+    if (phase) hash.update('\0').update(phase)
+    const key = hash.digest('hex').slice(0, 32)
     const pending = runCli(bot.cli, ['im', '+messages-reply', '--message-id', target, '--markdown', text,
       '--reply-in-thread', '--idempotency-key', `studio-${key}`, '--as', 'bot', '--format', 'json'], signal).then(output => {
       if (!z.object({ ok: z.literal(true) }).safeParse(JSON.parse(output)).success) throw new Error('Feishu reply was not confirmed')

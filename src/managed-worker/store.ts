@@ -4,12 +4,14 @@ import { chmodSync, closeSync, fchmodSync, lstatSync, mkdirSync, openSync, realp
 import { dirname, resolve } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
+import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFeishuDraftTask } from './feishu-draft-store.js'
 import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
   type StudioFeishuInstruction, type StudioInstructionInput } from './instruction-store.js'
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
 import { SHARED_DOCUMENT_SCHEMA, appendSharedRevision, readSharedRevision,
   type SharedDocumentRevision, type SharedDocumentTask } from './shared-document-store.js'
 
+export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
 export type { StudioFeishuInstruction } from './instruction-store.js'
 export type { SharedDocumentRevision } from './shared-document-store.js'
 
@@ -288,6 +290,7 @@ export class ManagedWorkerStore {
   readonly #runId = randomUUID()
   private readonly frozenTasks = new Set<string>()
   private readonly frozenSessions = new Set<string>()
+  private readonly feishuDrafts = new FeishuDraftStore(() => this.db, this.#runId, isDraftText)
   private readonly instructions = new InstructionStore(() => this.db)
   // The failed capture may not identify a task. Keep this document-wide fence until a new run recovers the dirty marker.
   private captureFault = false
@@ -313,6 +316,7 @@ export class ManagedWorkerStore {
         this.db.exec(SCHEMA)
         this.db.exec(PROJECT_SCHEMA)
         this.db.exec(INSTRUCTION_SCHEMA)
+        this.db.exec(FEISHU_DRAFT_SCHEMA)
         this.db.exec(SHARED_DOCUMENT_SCHEMA)
         const previous = this.db.prepare('SELECT clean FROM managed_host_run WHERE singleton = 1').get()
         // A failed pause may have left no task ID in durable storage. A dirty run (or a pre-fence database) cannot carry forward any pending write authorization.
@@ -322,6 +326,7 @@ export class ManagedWorkerStore {
         if (this.db.prepare("SELECT 1 FROM studio_draft_task WHERE state = 'running' LIMIT 1").get()) {
           throw new Error('Cannot interrupt previous Studio drafts')
         }
+        this.feishuDrafts.interruptRunning()
         // A restart frees only reservations that never entered the model. Running attempts remain terminal.
         this.db.exec(`UPDATE studio_project_dispatch SET
           state = CASE state WHEN 'reserved' THEN 'released' ELSE 'interrupted' END,
@@ -406,7 +411,7 @@ export class ManagedWorkerStore {
   bindAssistant(sessionId: string): ManagedResult<string> {
     if (!isId(sessionId)) return deny('INVALID_INPUT')
     return this.write(() => {
-      if (this.binding(sessionId) || this.draftBinding(sessionId) || this.projects.binding(sessionId)
+      if (this.binding(sessionId) || this.draftBinding(sessionId) || this.feishuDraftBinding(sessionId) || this.projects.binding(sessionId)
         || this.projects.workerBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
       const existing = this.assistantBinding(sessionId)
       if (existing) return accept(existing)
@@ -515,15 +520,88 @@ export class ManagedWorkerStore {
     }
   }
 
+  /** Reserve one execution for an authenticated Feishu text delivery before launching a Worker. */
+  startFeishuDraft(input: StudioFeishuInstruction, requestText: string, workerSessionId: string):
+    ManagedResult<{ task: StudioFeishuDraftTask; created: boolean }> {
+    const source = feishuDraftSource(input, isDraftText)
+    if (!source) return deny('INVALID_INPUT')
+    return this.write<{ task: StudioFeishuDraftTask; created: boolean }>(() => {
+      const scope = source.sourceScope
+      // A redelivery must return its original task before checking the current scope state or proposed Worker.
+      const existing = this.feishuDrafts.duplicate(scope, source.requestId)
+      if (existing) return accept({ task: existing, created: false })
+      if (this.instructions.feishuTask(scope) !== undefined) return deny('FEISHU_DOCUMENT_BOUND')
+      if (this.feishuDrafts.late(scope, source.sourceTimeMs)) return deny('FEISHU_MESSAGE_LATE')
+      if (this.feishuDrafts.busy(scope)) return deny('FEISHU_TEXT_BUSY')
+      if (!isId(workerSessionId) || !isDraftText(requestText) || requestText.includes('\0')) return deny('INVALID_INPUT')
+      if (this.sessionBound(workerSessionId)) return deny('SESSION_ALREADY_BOUND')
+      const task = this.feishuDrafts.insert(randomUUID(), randomUUID(), workerSessionId, source, requestText)
+      return accept({ task, created: true })
+    })
+  }
+
+  /** The Host authorizes the caller; Feishu replies must pass the exact scope, and Web must supply an exact task ID. */
+  readFeishuDraft(taskId: string, scope?: string): ManagedResult<StudioFeishuDraftTask> {
+    if (!isId(taskId) || (scope !== undefined && !isId(scope))) return deny('INVALID_INPUT')
+    return this.snapshot(() => {
+      const task = this.feishuDrafts.read(taskId, scope)
+      return task ? accept(task) : deny('TASK_NOT_FOUND')
+    })
+  }
+
+  /** Retain the verified final message, or a failure when there is no result, only for the exact running origin. */
+  settleFeishuDraft(execution: StudioDraftExecution, result: StudioDraftResult | undefined, failure: string): ManagedResult<StudioFeishuDraftTask> {
+    if (!execution) return deny('INVALID_INPUT')
+    const { taskId, workerSessionId, executionEpoch } = execution
+    if (!isId(taskId) || !isId(workerSessionId) || !isVersion(executionEpoch)) return deny('INVALID_INPUT')
+    let outcome: StudioDraftResult | undefined
+    if (result === undefined) {
+      if (!isDraftText(failure) || failure.includes('\0')) return deny('INVALID_INPUT')
+    } else {
+      if (!result) return deny('INVALID_INPUT')
+      const { text, messageId, eventSeq, turn } = result
+      if (!isDraftText(text) || text.includes('\0') || !isId(messageId) || !isEventSeq(eventSeq) || !isVersion(turn)) return deny('INVALID_INPUT')
+      outcome = { text, messageId, eventSeq, turn }
+    }
+    return this.write(() => {
+      const task = this.feishuDrafts.execution({ taskId, workerSessionId, executionEpoch })
+      if (!task) return deny('STALE_EXECUTION')
+      if (task.state !== 'running') return deny('TASK_NOT_RUNNING')
+      return accept(this.feishuDrafts.settle(task, outcome, failure))
+    })
+  }
+
+  /** Recheck the run and reservation before creating the Session and again before sending its request. */
+  feishuDraftCurrent(execution: StudioDraftExecution): boolean {
+    if (!execution) return false
+    const { taskId, workerSessionId, executionEpoch } = execution
+    if (!isId(taskId) || !isId(workerSessionId) || !isVersion(executionEpoch)) return false
+    const result = this.snapshot(() => accept(this.feishuDrafts.current({ taskId, workerSessionId, executionEpoch })))
+    return result.ok && result.value
+  }
+
+  /** A Feishu Worker Session keeps its own role, including past runs and terminal tasks. */
+  feishuDraftBinding(sessionId: string): StudioDraftExecution | undefined {
+    if (!isId(sessionId)) throw new Error('Invalid Studio Feishu draft Worker session ID')
+    return this.feishuDrafts.binding(sessionId)
+  }
+
+  /** Fail closed for text routing if the Host does not own this run or the scope is linked to a document. */
+  feishuDraftScopeAvailable(scope: string): boolean {
+    if (!isId(scope)) return false
+    const result = this.snapshot(() => accept(this.instructions.feishuTask(scope) === undefined))
+    return result.ok && result.value
+  }
+
   /** Check roles other than project Leader; the permanent project Worker lookup does not call back into the Store. */
   private nonProjectSessionBound(sessionId: string): boolean {
     return !!(this.binding(sessionId) || this.assistantBinding(sessionId) || this.draftBinding(sessionId)
-      || this.projects.workerBound(sessionId))
+      || this.feishuDraftBinding(sessionId) || this.projects.workerBound(sessionId))
   }
 
   private studioSessionBound(sessionId: string): boolean {
-    return !!(this.assistantBinding(sessionId) || this.draftBinding(sessionId) || this.projects.binding(sessionId)
-      || this.projects.workerBound(sessionId))
+    return !!(this.assistantBinding(sessionId) || this.draftBinding(sessionId) || this.feishuDraftBinding(sessionId)
+      || this.projects.binding(sessionId) || this.projects.workerBound(sessionId))
   }
 
   private sessionBound(sessionId: string): boolean {
@@ -561,6 +639,8 @@ export class ManagedWorkerStore {
       if (!current.ok) return current
       const task = current.value
       if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
+      // A registered text task permanently claims this scope, even if it no longer has a running Worker.
+      if (this.feishuDrafts.scopeBound(sourceScope)) return deny('FEISHU_TEXT_BOUND')
       const boundTask = this.instructions.feishuTask(sourceScope)
       // The first binding remains the audit record, even if the current session has since changed.
       if (boundTask === task.taskId) return current

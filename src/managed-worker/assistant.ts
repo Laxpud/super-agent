@@ -89,7 +89,7 @@ function textOnly(content: UserMessage['content']): string | undefined {
 }
 
 /** The command and the tool card use the same provenance and unmodified output. */
-export function draftOutput(task: StudioDraftTask): z.infer<typeof outputSchema> {
+export function draftOutput(task: Pick<StudioDraftTask, 'taskId' | 'workerBotId' | 'workerSessionId' | 'executionEpoch' | 'state' | 'result' | 'failure'>): z.infer<typeof outputSchema> {
   const receipt = `Task ${task.taskId}: ${task.state}. Worker Bot ${task.workerBotId}; Worker Session ${task.workerSessionId}; execution epoch ${task.executionEpoch}.`
   const hint = `Retrieve this task with /studio-result ${task.taskId} in a Studio Assistant Session.`
   if (!task.result) {
@@ -202,7 +202,7 @@ export class StudioAssistant {
   }
 
   /** Create a single restricted Worker for a durable assignment, not for arbitrary tool-supplied content. The caller owns its final ledger entry. */
-  async runTextWorker(sender: Agent, workerId: SessionId, route: WorkerRoute, text: string, caller: AbortSignal,
+  async runTextWorker(sender: Agent | undefined, workerId: SessionId, route: WorkerRoute, text: string, caller: AbortSignal,
     admission: WorkerAdmission): Promise<{ result?: StudioDraftResult; failure: string }> {
     const timeout = AbortSignal.timeout(DRAFT_TIMEOUT_MS)
     const signal = AbortSignal.any([caller, this.stopping.signal, timeout])
@@ -220,8 +220,11 @@ export class StudioAssistant {
       handle = await createStudioSession(this.ctx, workerId, this.workerPreset, route, signal)
       if (!this.workerReady(handle.agent)) throw new Error('Worker admission changed')
       authorize(admission.beforeRelay)
-      const message = freezeMessage<UserMessage>({ id: MessageId(randomUUID()), role: 'user', content: [{ type: 'text', text }],
-        source: { kind: 'agent-message', form: 'relay', senderSessionId: sender.id } as unknown as UserMessage['source'] })
+      // External owner input keeps its own source in the ledger; a local relay must not impersonate a Web owner or an Assistant Session.
+      const source: UserMessage['source'] = sender
+        ? { kind: 'agent-message', form: 'relay', senderSessionId: sender.id } as unknown as UserMessage['source']
+        : { kind: 'dsh-superagent', form: 'relay' }
+      const message = freezeMessage<UserMessage>({ id: MessageId(randomUUID()), role: 'user', content: [{ type: 'text', text }], source })
       result = await this.capture(handle.agent, message, signal, () => authorize(admission.beforeEnter))
       if (!result) failure = 'NO_COMPLETE_WORKER_TEXT'
     } catch {
