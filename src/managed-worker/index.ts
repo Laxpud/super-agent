@@ -8,14 +8,15 @@ import type { ToolExecution, ToolExecutionToken } from '@deepseek-ai/dsh-tools'
 import s from '@deepseek-ai/schemastery'
 import { lockSync } from 'proper-lockfile'
 import { z } from 'zod'
+import { AgentDelivery } from '../app/delivery.ts'
 import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool } from './assistant.ts'
 import { FeishuDocumentInboxConfig, StudioFeishuInbox, validateFeishuInbox } from './feishu-inbox.ts'
-import { captureDocumentInstructions, documentHoldError, instructionCommand } from './instructions.ts'
+import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, validateDocumentRelays } from './instructions.ts'
 import { LEADER_PRESET, StudioProjectControl, isLeaderTool } from './project.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
 
 export const name = 'dsh-superagent-managed-worker'
-export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'permissionPresets', 'sandboxPolicy', 'systemPrompt', 'tools', 'webServer']
+export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'permissionPresets', 'sandboxPolicy', 'sessionPersistence', 'systemPrompt', 'tools', 'webServer']
 export const Config = s.object({
   stateDir: s.string().required().description('Absolute directory reserved for the Studio database.'),
   guiDocumentInbox: s.boolean().default(false).description('Hold pending document writes for owner review when a new chat message arrives in the bound document Worker.'),
@@ -41,7 +42,7 @@ type ManagedHost = Context & {
   agentPresets: { presetForSession(session: Agent['session']): string | null }
   connection: { allowsRemoteAuthorities: boolean; browserPeer: { principal: { kind: string } } }
   commands: { register(command: { name: string; description: string; input: { hint: string }; recordInput: boolean;
-    handler(input: CommandInput): CommandResult }): () => void }
+    handler(input: CommandInput): CommandResult | Promise<CommandResult> }): () => void }
   sandboxPolicy: { resolve(request: { session: Agent['session'] }): { mode: string } }
   webServer: { getOrigin(): string }
 }
@@ -110,6 +111,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
     && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
   const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), agent => ready(agent, 'draft-worker'))
   const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'))
+  const delivery = new AgentDelivery(ctx)
   const feishu = feishuDocumentInbox && new StudioFeishuInbox(ctx, store, stateDir, feishuDocumentInbox, () => available && controlReady(ctx))
 
   /** A persisted binding wins over the picker, so a retired or finished Worker cannot become a different role on resume. */
@@ -210,6 +212,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
     const role = scopes.get(agent)?.role
     if ((role === 'assistant' || role === 'leader') && !ready(agent, role)) return { kind: 'reject' }
     if (role === 'draft-worker' && !drafts.admit(agent, messages, turn)) return { kind: 'reject' }
+    if (!validateDocumentRelays(store, agent, messages, () => ready(agent, 'document-worker'))) return { kind: 'reject' }
     return next()
   })
   for (const agent of ctx.agents.list()) configure(agent)
@@ -225,15 +228,16 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
   ctx.effect(() => ctx.commands.register({
     name: 'studio-doc',
     description: 'Manage a document task in this managed worker Session.',
-    input: { hint: 'start <JSON> | status | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review <instruction-id> <authorization-version> <unchanged|pause> | feishu-status | bind-feishu' },
+    input: { hint: 'start <JSON> | status | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review <instruction-id> <authorization-version> <unchanged|pause> | narrow <JSON> | continue <authorization-version> | feishu-status | bind-feishu' },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()
       if (!available || !controlReady(ctx)) return rejected('CONTROL_UNAVAILABLE')
       if (!ready(agent, 'document-worker')) return rejected('MANAGED_SESSION_REQUIRED')
-      // This command commits control state without queuing a Worker message or cancelling the turn. The action checks that state before committing.
       if (rawInput.length > TEXT_LIMIT * 12 + 128) return rejected('INPUT_TOO_LARGE')
       const [, verb, argument = ''] = /^\s*(\S+)(?:\s+([\s\S]*))?$/.exec(rawInput.trim()) ?? []
+      // Only explicit continuation wakes the Worker. Review and other control commands commit without cancelling the active turn.
+      if (verb === 'continue') return continueDocument(delivery, store, agent, argument, signal, () => ready(agent, 'document-worker'))
       // Keep review available even after capture is disabled; toggling the listener must not clear a durable pending hold.
       const instruction = instructionCommand(store, agent.id, commandId, verb, argument)
       if (instruction) return instruction

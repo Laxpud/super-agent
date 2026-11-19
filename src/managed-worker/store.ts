@@ -74,6 +74,8 @@ export interface StudioDraftExecution {
   executionEpoch: number
 }
 
+type InstructionInbox = { task: ManagedTask; pending?: StudioDocumentInstruction; remaining: number; narrowableLines?: number[] }
+
 type FeishuInstructionReceipt = {
   disposition: 'recorded' | 'duplicate' | 'unbound' | 'finished'
   taskId?: string
@@ -226,6 +228,41 @@ function documentAction(action: unknown): { expectedVersion: number; text: strin
   const text = Object.getOwnPropertyDescriptor(action, 'text')
   if (version?.enumerable && text?.enumerable && Object.hasOwn(version, 'value') && Object.hasOwn(text, 'value')
     && isVersion(version.value) && isText(text.value)) return { expectedVersion: version.value, text: text.value }
+}
+
+/** Copy the caller's line numbers without invoking accessors or allowing sparse or duplicate entries. */
+function readKeptLines(value: unknown): Set<number> | undefined {
+  if (types.isProxy(value) || !Array.isArray(value)) return
+  const lines = new Set<number>()
+  for (let index = 0; index < value.length; index++) {
+    const entry = Object.getOwnPropertyDescriptor(value, index)
+    if (!entry || !Object.hasOwn(entry, 'value') || !isVersion(entry.value) || lines.has(entry.value)) return
+    lines.add(entry.value)
+  }
+  return lines
+}
+
+/** Split content and EOLs losslessly. Only content at even offsets can participate in a narrowing. */
+function documentLineChanges(baselineText: string, approvedText: string):
+  { baseline: string[]; approved: string[]; changedLines: number[] } | undefined {
+  const eol = /(\r\n|\r|\n)/
+  const baseline = baselineText.split(eol)
+  const approved = approvedText.split(eol)
+  if (baseline.length !== approved.length) return
+  const changedLines: number[] = []
+  for (let offset = 0; offset < baseline.length; offset++) {
+    if (baseline[offset] === approved[offset]) continue
+    if (offset % 2 !== 0) return
+    changedLines.push(offset / 2 + 1)
+  }
+  // Fewer than two changes cannot yield a strict, nonempty subset.
+  if (changedLines.length < 2) return
+  return { baseline, approved, changedLines }
+}
+
+/** A Feishu source without a confirmed non-late ordering cannot narrow the document. */
+function instructionOrderKnown(instruction: StudioDocumentInstruction): boolean {
+  return instruction.source.channel !== 'feishu' || instruction.feishu?.late === false
 }
 
 /** Do not treat writes ignored by SQLite as successful. This applies to task state, document text, and any audit insert skipped by a trigger. */
@@ -542,15 +579,90 @@ export class ManagedWorkerStore {
       .run(task.taskId, task.executionEpoch, task.authorizationVersion).changes)
   }
 
-  /** Read the oldest pending item and its authorization version. An incomplete ledger cannot attest that the inbox is empty. */
-  instructionInbox(sessionId: string): ManagedResult<{ task: ManagedTask; pending?: StudioDocumentInstruction; remaining: number }> {
+  /** Read the oldest pending item and any eligible line numbers from the same authorization snapshot. */
+  instructionInbox(sessionId: string): ManagedResult<InstructionInbox> {
     if (!isId(sessionId)) return deny('INVALID_INPUT')
-    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-    return this.write(() => {
+    return this.snapshot<InstructionInbox>(() => {
+      if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
       const current = this.currentTask(sessionId)
       if (!current.ok) return current
-      if (this.isFrozen(current.value)) return deny('PAUSE_UNCONFIRMED')
-      return accept({ task: current.value, ...this.instructions.inbox(current.value.taskId) })
+      const task = current.value
+      if (this.isFrozen(task)) return deny('PAUSE_UNCONFIRMED')
+      const { pending, observedEpoch, remaining } = this.instructions.inbox(task.taskId)
+      if (!pending) return accept({ task, remaining })
+      if (task.documentVersion === 1 && observedEpoch === task.executionEpoch && instructionOrderKnown(pending)) {
+        const { baselineText, approvedText } = this.documentTargets(task.taskId)
+        const changes = documentLineChanges(baselineText, approvedText)
+        if (changes) return accept({ task, pending, remaining, narrowableLines: changes.changedLines })
+      }
+      return accept({ task, pending, remaining })
+    })
+  }
+
+  /** Review one source by retaining only a strict, nonempty subset of the current approved content changes. */
+  narrowInstruction(sessionId: string, instructionId: string, expectedEpoch: number, expectedAuthorizationVersion: number,
+    expectedDocumentVersion: number, keepLines: readonly number[], commandId: string):
+    ManagedResult<{ task: ManagedTask; remaining: number; keptLines: number[] }> {
+    if (!isId(sessionId) || !isId(instructionId) || !isVersion(expectedEpoch) || !isVersion(expectedAuthorizationVersion)
+      || !isVersion(expectedDocumentVersion) || !isId(commandId)) return deny('INVALID_INPUT')
+    const requested = readKeptLines(keepLines)
+    if (!requested) return deny('INVALID_INPUT')
+    return this.write(() => {
+      if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
+      const current = this.currentTask(sessionId)
+      if (!current.ok) return current
+      const task = current.value
+      if (this.isFrozen(task)) return deny('PAUSE_UNCONFIRMED')
+      if (task.executionEpoch !== expectedEpoch) return deny('STALE_EXECUTION')
+      if (task.documentVersion !== 1 || expectedDocumentVersion !== 1) return deny('VERSION_CONFLICT')
+      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
+      if (task.authorizationVersion !== expectedAuthorizationVersion) return deny('STALE_AUTHORIZATION')
+      const { pending, observedEpoch, remaining } = this.instructions.inbox(task.taskId)
+      if (pending?.instructionId !== instructionId) return deny('INSTRUCTION_NOT_PENDING')
+      if (observedEpoch !== expectedEpoch) return deny('STALE_EXECUTION')
+      if (!instructionOrderKnown(pending)) return deny('INSTRUCTION_ORDER_UNCLEAR')
+
+      // Derive the exact text under the write lock; unselected content and every EOL come from the version 1 baseline.
+      const { baselineText, approvedText } = this.documentTargets(task.taskId)
+      const changes = documentLineChanges(baselineText, approvedText)
+      if (!changes) return deny('INSTRUCTION_NOT_NARROWABLE')
+      const keptLines = changes.changedLines.filter(line => requested.has(line))
+      if (keptLines.length === 0 || keptLines.length !== requested.size || keptLines.length === changes.changedLines.length) {
+        return deny('INVALID_KEEP_LINES')
+      }
+      const { baseline, approved } = changes
+      for (const line of keptLines) {
+        const offset = (line - 1) * 2
+        baseline[offset] = approved[offset]!
+      }
+      const revisedText = baseline.join('')
+      const authorizationVersion = expectedAuthorizationVersion + 1
+
+      // Advance authorization and close the effective pending item together, without changing the pause or document version.
+      requireWrite(this.db.prepare(`UPDATE managed_task SET approved_text = ?, authorization_version = ?
+        WHERE task_id = ? AND execution_epoch = ? AND authorization_version = ?`)
+        .run(revisedText, authorizationVersion, task.taskId, expectedEpoch, expectedAuthorizationVersion).changes)
+      this.instructions.recordNarrowing({ instructionId, taskId: task.taskId, executionEpoch: expectedEpoch,
+        previousAuthorizationVersion: expectedAuthorizationVersion, nextAuthorizationVersion: authorizationVersion, keptLines,
+        reviewSessionId: sessionId, commandId, previousText: approvedText, nextText: revisedText })
+      return accept({ task: { ...task, authorizationVersion }, remaining: remaining - 1, keptLines })
+    })
+  }
+
+  /** Read the exact current target for Host dispatch to this Worker; do not issue a permit or change the task. */
+  documentContinuation(sessionId: string, expectedAuthorizationVersion: number): ManagedResult<{ task: ManagedTask; text: string }> {
+    if (!isId(sessionId) || !isVersion(expectedAuthorizationVersion)) return deny('INVALID_INPUT')
+    return this.snapshot(() => {
+      if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
+      const current = this.currentTask(sessionId)
+      if (!current.ok) return current
+      const task = current.value
+      if (this.studioSessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
+      const blocked = this.executionBlocked(task)
+      if (blocked) return blocked
+      if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
+      if (task.authorizationVersion !== expectedAuthorizationVersion) return deny('STALE_AUTHORIZATION')
+      return accept({ task, text: this.documentTargets(task.taskId).approvedText })
     })
   }
 
@@ -755,10 +867,10 @@ export class ManagedWorkerStore {
     return result
   }
 
-  /** Acquire the write lock before checking execution authority. Roll back on rejection or error; never report an unconfirmed commit as successful. */
-  private transaction<T>(operation: () => ManagedResult<T>): ManagedResult<T> {
+  /** Use a write lock for mutations and a deferred transaction for read-only snapshots. Roll back on rejection or error. */
+  private transaction<T>(operation: () => ManagedResult<T>, mode: 'write' | 'read' = 'write'): ManagedResult<T> {
     const db = this.db
-    db.exec('BEGIN IMMEDIATE')
+    db.exec(mode === 'write' ? 'BEGIN IMMEDIATE' : 'BEGIN')
     try {
       const result = operation()
       db.exec(result.ok ? 'COMMIT' : 'ROLLBACK')
@@ -773,6 +885,12 @@ export class ManagedWorkerStore {
   /** Serialize writes with run replacement. A host overtaken after its directory lock expires cannot commit a previous run's action. */
   private write<T>(operation: () => ManagedResult<T>): ManagedResult<T> {
     try { return this.transaction(() => this.ownsRun() ? operation() : deny('STALE_HOST_RUN')) }
+    catch { return deny('STORAGE_ERROR') }
+  }
+
+  /** Observe the run fence, binding, and document state together without taking a writer lock. */
+  private snapshot<T>(operation: () => ManagedResult<T>): ManagedResult<T> {
+    try { return this.transaction(() => this.ownsRun() ? operation() : deny('STALE_HOST_RUN'), 'read') }
     catch { return deny('STORAGE_ERROR') }
   }
 
@@ -801,6 +919,14 @@ export class ManagedWorkerStore {
     if (!isId(workerSessionId) || !isVersion(executionEpoch) || !isVersion(authorizationVersion)
       || (paused !== 0 && paused !== 1) || (documentVersion !== 1 && documentVersion !== 2)) throw new Error('Invalid Managed Worker task state')
     return { taskId, workerSessionId, executionEpoch, authorizationVersion, paused: paused === 1, documentVersion }
+  }
+
+  /** Load the baseline and exact currently approved target from the same version 1 document. */
+  private documentTargets(taskId: string): { baselineText: string; approvedText: string } {
+    const row = this.db.prepare(`SELECT d.text AS baseline_text, t.approved_text FROM managed_task t
+      JOIN managed_document d USING (task_id) WHERE t.task_id = ? AND d.document_version = 1`).get(taskId)
+    if (!isText(row?.baseline_text) || !isText(row?.approved_text)) throw new Error('Invalid Managed Worker document targets')
+    return { baselineText: row.baseline_text, approvedText: row.approved_text }
   }
 
   /** Record each committed user command or tool action with the resulting state. Deduplicate commands and tool calls separately. */
