@@ -354,9 +354,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/managed-worker/index.ts` | The opt-in Studio host: keeps its roles read-only, registers Web commands, and guards the one allowed managed document action without running GitHub setup |
-| `src/managed-worker/assistant.ts` | Routes an admitted owner prompt to a tool-free Worker, captures the matching turn's final text, and renders its receipt and result in the original chat |
-| `src/managed-worker/project.ts` | Owner-only project commands and scope-bound Leader tools for reading the project and registering pending work |
-| `src/managed-worker/project-store.ts` | Persists projects, Leader identities, management history, and pending work; verifies the current management epoch in the write transaction |
+| `src/managed-worker/assistant.ts` | Delegates Assistant requests and runs restricted text Workers for both roles; captures the exact admitted turn's final text and drains the source Session before delivery |
+| `src/managed-worker/project.ts` | Owner project commands and Leader tools to register, dispatch and read project work; rechecks current management at the Worker's first step |
+| `src/managed-worker/project-store.ts` | Persists project identities, management history and Worker attempts; only the current management epoch can reserve and begin an execution |
 | `src/managed-worker/instructions.ts` | Records Web inputs before model reads, handles Web and Feishu instruction review, and sends the current approved text to the bound Worker for a fresh guarded write |
 | `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot and accepts messages only from the configured owner chat; sends receipts independently of ledger registration |
 | `src/managed-worker/instruction-store.ts` | Preserves Feishu task links, original deliveries and review receipts, including replacements narrowed to a subset of approved changes; pending inputs hold writes even when the listeners are off |

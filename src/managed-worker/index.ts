@@ -113,13 +113,13 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
   const ready = (agent: Agent, role: StudioRole): boolean => available && controlReady(ctx) && currentSession(agent)
     && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
   const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), agent => ready(agent, 'draft-worker'))
-  const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'))
+  const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts)
   const delivery = new AgentDelivery(ctx)
   const feishu = feishuDocumentInbox && new StudioFeishuInbox(ctx, store, stateDir, feishuDocumentInbox, () => available && controlReady(ctx))
 
   /** A persisted binding wins over the picker, so a retired or finished Worker cannot become a different role on resume. */
   function roleOf(agent: Agent): StudioRole | undefined {
-    if (store.draftBinding(agent.id)) return 'draft-worker'
+    if (store.draftBinding(agent.id) || store.projects.workerBound(agent.id)) return 'draft-worker'
     if (store.binding(agent.id)) return 'document-worker'
     if (store.assistantBinding(agent.id)) return 'assistant'
     if (store.projects.binding(agent.id)) return 'leader'
@@ -296,7 +296,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
   ctx.effect(() => ctx.commands.register({
     name: 'studio-project',
     description: 'Create or transfer a project as the owner, or read the current management state.',
-    input: { hint: 'create <JSON> | status [project-id] | take <project-id> <epoch> [leader-bot-id|new]' },
+    input: { hint: 'create <JSON> | status [project-id] | take <project-id> <epoch> [leader-bot-id|new] | work [work-id]' },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()

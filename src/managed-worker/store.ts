@@ -322,6 +322,13 @@ export class ManagedWorkerStore {
         if (this.db.prepare("SELECT 1 FROM studio_draft_task WHERE state = 'running' LIMIT 1").get()) {
           throw new Error('Cannot interrupt previous Studio drafts')
         }
+        // A restart frees only reservations that never entered the model. Running attempts remain terminal.
+        this.db.exec(`UPDATE studio_project_dispatch SET
+          state = CASE state WHEN 'reserved' THEN 'released' ELSE 'interrupted' END,
+          failure = 'HOST_RESTARTED' WHERE state IN ('reserved', 'running')`)
+        if (this.db.prepare("SELECT 1 FROM studio_project_dispatch WHERE state IN ('reserved', 'running') LIMIT 1").get()) {
+          throw new Error('Cannot recover previous Studio project dispatches')
+        }
         requireWrite(this.db.prepare(`INSERT INTO managed_host_run VALUES (1, ?, 0)
           ON CONFLICT (singleton) DO UPDATE SET run_id = excluded.run_id, clean = 0`).run(this.#runId).changes)
         return accept(recoveredTasks)
@@ -332,6 +339,7 @@ export class ManagedWorkerStore {
         db: () => this.db,
         write: operation => this.write(operation),
         ownsRun: () => this.ownsRun(),
+        runId: this.#runId,
         nonProjectSessionBound: sessionId => this.nonProjectSessionBound(sessionId),
       })
     } catch (error) {
@@ -391,7 +399,8 @@ export class ManagedWorkerStore {
   bindAssistant(sessionId: string): ManagedResult<string> {
     if (!isId(sessionId)) return deny('INVALID_INPUT')
     return this.write(() => {
-      if (this.binding(sessionId) || this.draftBinding(sessionId) || this.projects.binding(sessionId)) return deny('SESSION_ALREADY_BOUND')
+      if (this.binding(sessionId) || this.draftBinding(sessionId) || this.projects.binding(sessionId)
+        || this.projects.workerBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
       const existing = this.assistantBinding(sessionId)
       if (existing) return accept(existing)
       const bot = this.db.prepare('SELECT bot_id FROM studio_assistant_bot WHERE singleton = 1').get()
@@ -499,13 +508,15 @@ export class ManagedWorkerStore {
     }
   }
 
-  /** Check the existing roles without calling back into the project facade. */
+  /** Check roles other than project Leader; the permanent project Worker lookup does not call back into the Store. */
   private nonProjectSessionBound(sessionId: string): boolean {
-    return !!(this.binding(sessionId) || this.assistantBinding(sessionId) || this.draftBinding(sessionId))
+    return !!(this.binding(sessionId) || this.assistantBinding(sessionId) || this.draftBinding(sessionId)
+      || this.projects.workerBound(sessionId))
   }
 
   private studioSessionBound(sessionId: string): boolean {
-    return !!(this.assistantBinding(sessionId) || this.draftBinding(sessionId) || this.projects.binding(sessionId))
+    return !!(this.assistantBinding(sessionId) || this.draftBinding(sessionId) || this.projects.binding(sessionId)
+      || this.projects.workerBound(sessionId))
   }
 
   private sessionBound(sessionId: string): boolean {

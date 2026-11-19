@@ -41,11 +41,12 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 ## 建立项目与移交管理权
 
-已接入项目创建、管理权移交和待办登记。当前用明确的所有者命令操作项目；还不能用普通聊天立项，也不会把复杂任务自动升级为项目。
+已接入项目创建、管理权移交和文字待办派工。立项仍使用所有者命令；不会把复杂任务自动升级为项目。
 
 1. 在未绑定项目的 **SuperAgent Studio Leader** 会话中提交 `/studio-project create {"name":"资料整理","objective":"持续整理研究记录"}`。回执给出项目 ID、Leader Bot、当前会话及管理轮次 `1`。可用 `leaderBotId` 复用已有 Leader Bot，用 `originTaskId` 引用一个已经完成的文字任务；引用原成果不重新派工。
-2. 在当前 Leader 会话中用普通消息明确要求登记一项待办。Leader 工具将原始请求与来源一起保存；看到工具回执中的待办 ID 才算登记。这一步不启动 Worker，也不授权文档写入或外部操作。用 `/studio-project status` 查看当前归属、目标和待办数，目前不列出待办明细。
-3. 要换管理会话，在从未绑定项目的 Leader 会话中提交 `/studio-project take <项目ID> <当前管理轮次>`。默认保留 Leader Bot；末尾可追加已有 Leader Bot ID 或 `new` 以换负责人。回执给出新管理轮次。旧会话仍能查看项目，但不能登记新待办，也不能重新接管。
+2. 在当前 Leader 会话中用普通消息要求登记一项自包含的文字待办，将所需材料放在同一条消息里。登记保留原文与来源，不会启动 Worker。用 `/studio-project work` 可查看最近 20 项。需要执行时，让当前 Leader 派工指定待办 ID；Worker 沿用 Leader 当时选择的模型和思考深度，只接收该待办的原文，不能用工具或修改文档。
+3. 用 `/studio-project work <待办ID>` 查看原请求、状态和 Worker 的原始结果，不调用模型。在同一项目的 Leader 会话中，Worker 结束或宿主重启后仍可取回已保存结果。已经开始的工作中断后会留下状态，不会自动重跑。
+4. 要换管理会话，在从未绑定项目的 Leader 会话中提交 `/studio-project take <项目ID> <当前管理轮次>`。默认保留 Leader Bot；末尾可追加已有 Leader Bot ID 或 `new` 以换负责人。旧会话仍可读本项目记录，但不能再登记或派工。移交前尚未开始的保留名额会释放，由当前 Leader 决定是否继续原待办；已经开始的 Worker 可保存原出处的结果。
 
 如果移交报轮次过时、命令重复，或回执不明，先在原 Leader 会话用 `/studio-project status` 核对当前会话和轮次，也可在新的 Leader 或 Studio Assistant 会话用 `/studio-project status <项目ID>` 查询。不要原样重发旧的移交命令。
 

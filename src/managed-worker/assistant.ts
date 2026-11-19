@@ -11,14 +11,14 @@ import { DRAFT_TEXT_LIMIT, type ManagedResult, type ManagedWorkerStore, type Stu
 export const ASSISTANT_PRESET = 'dsh-superagent-studio-assistant'
 export const DRAFT_DELEGATE = 'studio_delegate_draft'
 const DRAFT_READ = 'studio_read_draft'
-const DRAFT_TIMEOUT_MS = 180_000
+export const DRAFT_TIMEOUT_MS = 180_000
 const delegateSchema = z.strictObject({})
 const readSchema = z.strictObject({ taskId: z.uuid().optional() })
 const outputSchema = z.strictObject({ title: z.string(), receipt: z.string(), text: z.string() })
 
 const ASSISTANT_PROMPT = `You are the workspace Assistant. Your job is to understand the user's intent and send business or technical work to a Worker, even when it is simple. Do not write, analyze, or implement the requested work yourself.
 For a new, self-contained text task, call studio_delegate_draft once without rewriting the request. The Worker cannot use tools, access files or external systems, or edit managed documents through this route. Clarify if a useful text task cannot be inferred. For an existing task, read the saved result instead of delegating it again. After a tool returns, communicate the status and where to find the result. Do not invent, extend, or claim authorship of the Worker's result.`
-const WORKER_PROMPT = `You are the Worker for one task. The Assistant relays the user's self-contained text request. Return the requested text for direct delivery to the user. You have no tools, files, or external systems in this task. Do not claim to have modified or consulted them. If a necessary input is missing, report the specific limitation in your response.`
+const WORKER_PROMPT = `You are the Worker for one task. The Assistant or the current project Leader relays the user's self-contained text request. Return the requested text for delivery via that role. You have no tools, files, or external systems in this task. Do not claim to have modified or consulted them. If a necessary input is missing, report the specific limitation in your response.`
 
 interface ModelRoute { provider: string; model: string; reasoningEffort?: string }
 interface WorkerHandle { agent: Agent; dispose(): Promise<void> }
@@ -32,7 +32,23 @@ interface DraftRuntime {
 }
 
 interface OwnerRequest { sourceMessageId: string; sourceRequestId: string; requestText: string }
-interface DraftInput { messageId: string; turn?: number }
+interface DraftInput { messageId: string; enter(): void; reject(error: unknown): void; turn?: number }
+
+interface WorkerRoute { cwd: string; model: ModelRoute }
+interface WorkerAdmission {
+  /** Return a rejection reason if the pending assignment no longer belongs to the sender. */
+  beforeRelay(): string | undefined
+  /** Claim the reserved execution at the model step boundary, rather than when the Worker session is created. */
+  beforeEnter?(): string | undefined
+}
+
+/** Use the caller's current configured route, never a provider/model supplied by the tool arguments. */
+export function draftWorkerRoute(agent: Agent): WorkerRoute {
+  const cwd = agent.session.header.cwd
+  const model = (agent as Agent & { model?: { current(): ModelRoute | undefined } }).model?.current()
+  if (!cwd || !isAbsolute(cwd) || !model?.provider || !model.model) throw new Error('Studio draft rejected: WORKSPACE_OR_MODEL_MISSING')
+  return { cwd, model }
+}
 
 export function isAssistantTool(name: string): boolean { return name === DRAFT_DELEGATE || name === DRAFT_READ }
 
@@ -81,7 +97,7 @@ function unwrap<T>(result: ManagedResult<T>): T {
   return result.value
 }
 
-/** Own the Assistant's delegation and the temporary admission for each independently created draft Worker. */
+/** Own Assistant delegation and the temporary admission for each independently created text Worker. */
 export class StudioAssistant {
   private readonly runtime: DraftRuntime
   private readonly stopping = new AbortController()
@@ -98,10 +114,17 @@ export class StudioAssistant {
   /** Admit only the relayed task, once and in the exact live Agent. A later GUI or replayed input is not a new assignment. */
   admit(agent: Agent, messages: readonly UserMessage[], turn: number): boolean {
     const input = this.drafts.get(agent)
-    if (!input || input.turn !== undefined || !this.workerReady(agent)
-      || messages.length !== 1 || messages[0]?.id !== input.messageId) return false
-    input.turn = turn
-    return true
+    if (!input || input.turn !== undefined || messages.length !== 1 || messages[0]?.id !== input.messageId) return false
+    try {
+      if (!this.workerReady(agent)) throw new Error('Worker admission changed')
+      input.enter()
+      input.turn = turn
+      return true
+    } catch (error) {
+      // A rejected step never emits the matching model message. Wake the collector so it can dispose this Worker.
+      input.reject(error)
+      return false
+    }
   }
 
   /** Install only role prompt text and the two application tools; the caller hides inherited tools first. */
@@ -158,48 +181,59 @@ export class StudioAssistant {
     } catch (error) { dispose(); throw error }
   }
 
-  /** Reserve the task and Worker ID before any model input, then dispatch using the Assistant's current model route. */
+  /** Reserve the Assistant task and Worker ID before starting the shared text runner. */
   private async delegate(agent: Agent, source: OwnerRequest, caller: AbortSignal): Promise<StudioDraftTask> {
-    const cwd = agent.session.header.cwd
-    const model = (agent as Agent & { model?: { current(): ModelRoute | undefined } }).model?.current()
-    if (!cwd || !isAbsolute(cwd) || !model?.provider || !model.model) throw new Error('Studio draft rejected: WORKSPACE_OR_MODEL_MISSING')
-    const timeout = AbortSignal.timeout(DRAFT_TIMEOUT_MS)
-    const signal = AbortSignal.any([caller, this.stopping.signal, timeout])
-    signal.throwIfAborted()
+    const route = draftWorkerRoute(agent)
+    caller.throwIfAborted()
+    this.stopping.signal.throwIfAborted()
     const workerId = SessionId(randomUUID())
     const { task, created } = unwrap(this.store.startDraft({ ...source, assistantSessionId: agent.id, workerSessionId: workerId }))
     if (!created) return task
+    const check = () => this.assistantReady(agent) ? undefined : 'ASSISTANT_UNAVAILABLE'
+    const { result, failure } = await this.runTextWorker(agent, workerId, route, source.requestText, caller, { beforeRelay: check, beforeEnter: check })
+    if (!this.assistantReady(agent)) return unwrap(this.store.failDraft(task, 'ASSISTANT_UNAVAILABLE'))
+    return unwrap(result ? this.store.completeDraft(task, result) : this.store.failDraft(task, failure))
+  }
 
+  /** Create a single restricted Worker for a durable assignment, not for arbitrary tool-supplied content. The caller owns its final ledger entry. */
+  async runTextWorker(sender: Agent, workerId: SessionId, { cwd, model }: WorkerRoute, text: string, caller: AbortSignal,
+    admission: WorkerAdmission): Promise<{ result?: StudioDraftResult; failure: string }> {
+    const timeout = AbortSignal.timeout(DRAFT_TIMEOUT_MS)
+    const signal = AbortSignal.any([caller, this.stopping.signal, timeout])
     let handle: WorkerHandle | undefined
     let result: StudioDraftResult | undefined
     let failure = 'WORKER_FAILED'
+    const authorize = (check?: () => string | undefined) => {
+      signal.throwIfAborted()
+      const reason = check?.()
+      if (reason) { failure = reason; throw new Error(reason) }
+    }
     try {
-      // Creation mounts the preset and applies the persisted role binding. It must not wait on a model turn while the factory holds maintenance.
+      signal.throwIfAborted()
+      // The factory finishes mounting and classifying the persisted role before the runner supplies any work.
       handle = await this.runtime.agents.create({ sessionId: workerId, meta: { cwd, agentPreset: this.workerPreset },
         agentOptions: model, signal, setup: async workerCtx => { await this.runtime.agentPresets.mount(workerCtx, this.workerPreset) } })
-      signal.throwIfAborted()
-      if (!this.assistantReady(agent) || !this.workerReady(handle.agent)) throw new Error('Worker admission changed')
-      // The rc.3 relay source identifies the sending Assistant without attributing the message to the receiving Worker or to another owner request.
-      const message = freezeMessage<UserMessage>({ id: MessageId(randomUUID()), role: 'user', content: [{ type: 'text', text: source.requestText }],
-        source: { kind: 'agent-message', form: 'relay', senderSessionId: agent.id } as unknown as UserMessage['source'] })
-      result = await this.capture(handle.agent, message, signal)
+      if (!this.workerReady(handle.agent)) throw new Error('Worker admission changed')
+      authorize(admission.beforeRelay)
+      const message = freezeMessage<UserMessage>({ id: MessageId(randomUUID()), role: 'user', content: [{ type: 'text', text }],
+        source: { kind: 'agent-message', form: 'relay', senderSessionId: sender.id } as unknown as UserMessage['source'] })
+      result = await this.capture(handle.agent, message, signal, () => authorize(admission.beforeEnter))
       if (!result) failure = 'NO_COMPLETE_WORKER_TEXT'
     } catch {
-      failure = 'WORKER_FAILED'
+      // Keep the admission reason; other runtime failures need not reveal provider or host details in a project result.
     } finally {
-      // The Worker is explicitly released; its Session log is kept. Do not announce a correct-looking result if closing its source log failed.
+      // Do not present complete text unless disposal also drains the Worker's source log.
       try { await handle?.dispose() }
       catch { result = undefined; failure = 'WORKER_SESSION_CLOSE_FAILED' }
     }
     if (signal.aborted) { result = undefined; failure = timeout.aborted ? 'WORKER_TIMEOUT' : 'WORKER_ABORTED' }
-    if (!this.assistantReady(agent)) { result = undefined; failure = 'ASSISTANT_UNAVAILABLE' }
-    return unwrap(result ? this.store.completeDraft(task, result) : this.store.failDraft(task, failure))
+    return { ...(result ? { result } : {}), failure }
   }
 
   /** Capture by exact Session and admitted turn. A stream delta, failed turn, or unrelated follow-up cannot become a saved result. */
-  private async capture(agent: Agent, message: UserMessage, signal: AbortSignal): Promise<StudioDraftResult | undefined> {
+  private async capture(agent: Agent, message: UserMessage, signal: AbortSignal, enter: () => void): Promise<StudioDraftResult | undefined> {
     const settled = Promise.withResolvers<StudioDraftResult | undefined>()
-    const input: DraftInput = { messageId: message.id }
+    const input: DraftInput = { messageId: message.id, enter, reject: settled.reject }
     let final: StudioDraftResult | undefined
     const remove = this.ctx.on('session/event', (session, event) => {
       if (session !== agent.session || input.turn === undefined) return
