@@ -10,6 +10,7 @@ import { lockSync } from 'proper-lockfile'
 import { z } from 'zod'
 import { AgentDelivery } from '../app/delivery.ts'
 import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool } from './assistant.ts'
+import { documentStartArgs, sharedDocumentCommand, sharedDocumentCoordinates, sharedDocumentError } from './document-command.ts'
 import { FeishuDocumentInboxConfig, StudioFeishuInbox, validateFeishuInbox } from './feishu-inbox.ts'
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, validateDocumentRelays } from './instructions.ts'
 import { LEADER_PRESET, StudioProjectControl, isLeaderTool } from './project.ts'
@@ -29,8 +30,7 @@ const PRESET = 'dsh-superagent-managed-worker'
 const TOOL = 'studio_write_document'
 const TEXT_LIMIT = 32_000
 const version = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
-const startSchema = z.strictObject({ initial: z.string().max(TEXT_LIMIT), replacement: z.string().max(TEXT_LIMIT) })
-const writeSchema = z.strictObject({ expectedVersion: z.literal(1), text: z.string().max(TEXT_LIMIT) })
+const writeSchema = z.strictObject({ expectedVersion: version.describe('The document revision approved for this task.'), text: z.string().max(TEXT_LIMIT) })
 
 interface CommandResult { kind: 'success' | 'error'; text: string }
 interface CommandInput { agent: Agent; commandId: string; rawInput: string; signal: AbortSignal }
@@ -74,10 +74,13 @@ const rejected = (reason: string): CommandResult => ({ kind: 'error', text: `Man
 
 /** Report success only after the Store confirms a durable commit. Keep document text out of Session command history. */
 function receipt(operation: string, result: ManagedResult<ManagedTask>, showResume = true): CommandResult {
-  if (!result.ok) return documentHoldError(result.reason) ?? rejected(result.reason)
+  if (!result.ok) return documentHoldError(result.reason) ?? sharedDocumentError(result.reason) ?? rejected(result.reason)
   const task = result.value
-  const resume = task.paused && showResume ? ` To allow writes again when ready, run /studio-doc resume ${task.authorizationVersion} in the current Worker.` : ''
-  return { kind: 'success', text: `${operation}: task ${task.taskId}; execution epoch ${task.executionEpoch}; authorization version ${task.authorizationVersion}; document version ${task.documentVersion}; ${task.paused ? 'paused' : 'active'}.${resume}` }
+  const shared = task.sharedDocument
+  const resumable = !shared || shared.baseVersion === shared.headVersion
+  const resume = task.paused && showResume && resumable ? ` To allow writes again when ready, run /studio-doc resume ${task.authorizationVersion} in the current Worker.` : ''
+  const snapshot = shared ? 'task snapshot version' : 'document version'
+  return { kind: 'success', text: `${operation}: task ${task.taskId}; execution epoch ${task.executionEpoch}; authorization version ${task.authorizationVersion}; ${snapshot} ${task.documentVersion}; ${task.paused ? 'paused' : 'active'}.${sharedDocumentCoordinates(task)}${resume}` }
 }
 
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
@@ -165,7 +168,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
         description: 'Replace the text of the managed document bound to this worker, using its approved text and version.',
         parameters: z.toJSONSchema(writeSchema),
         output: {
-          schema: { type: 'object', properties: { documentVersion: { type: 'integer' } }, required: ['documentVersion'] },
+          schema: { type: 'object', properties: { documentVersion: { type: 'integer' }, documentId: { type: 'string' } }, required: ['documentVersion'] },
           render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
         },
         async execute(action, exec) {
@@ -176,7 +179,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
           if (!permit || exec.agent !== agent || !ready(agent, 'document-worker')
             || permit.workerSessionId !== agent.id || permit.toolCallId !== exec.callId) throw new Error('Managed write denied: INVALID_EXECUTION')
           const result = store.commit(permit, action)
-          if (!result.ok) throw new Error(`Managed write denied: ${result.reason}`)
+          if (!result.ok) throw new Error(`Managed write denied: ${sharedDocumentError(result.reason)?.text ?? result.reason}`)
           return result.value
         },
       })
@@ -196,7 +199,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
     if (role === 'leader') return projects.guard(agent, exec.name)
     if (role !== 'document-worker' || exec.name !== TOOL) return 'Studio tool denied: INVALID_EXECUTION'
     const result = store.authorize(agent.id, exec.arguments, exec.callId)
-    if (!result.ok) return `Managed write denied: ${result.reason}`
+    if (!result.ok) return `Managed write denied: ${sharedDocumentError(result.reason)?.text ?? result.reason}`
     permits.set(exec.token, result.value)
     return undefined
   }))
@@ -228,7 +231,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
   ctx.effect(() => ctx.commands.register({
     name: 'studio-doc',
     description: 'Manage a document task in this managed worker Session.',
-    input: { hint: 'start <JSON> | status | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review <instruction-id> <authorization-version> <unchanged|pause> | narrow <JSON> | continue <authorization-version> | feishu-status | bind-feishu' },
+    input: { hint: 'doc-new <JSON> | doc-read <document-id> [revision] | doc-save <JSON> | start <JSON> | status | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review <instruction-id> <authorization-version> <unchanged|pause> | narrow <JSON> | continue <authorization-version> | feishu-status | bind-feishu' },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()
@@ -239,8 +242,9 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
       // Only explicit continuation wakes the Worker. Review and other control commands commit without cancelling the active turn.
       if (verb === 'continue') return continueDocument(delivery, store, agent, argument, signal, () => ready(agent, 'document-worker'))
       // Keep review available even after capture is disabled; toggling the listener must not clear a durable pending hold.
-      const instruction = instructionCommand(store, agent.id, commandId, verb, argument)
-      if (instruction) return instruction
+      const control = instructionCommand(store, agent.id, commandId, verb, argument)
+        ?? sharedDocumentCommand(store, agent.id, commandId, verb, argument)
+      if (control) return control
       if ((verb === 'feishu-status' || verb === 'bind-feishu') && !argument) {
         if (!feishu) return rejected('FEISHU_INBOX_DISABLED')
         if (verb === 'feishu-status') return { kind: 'success', text: feishu.status() }
@@ -251,10 +255,12 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
       if (verb === 'start') {
         let json: unknown
         try { json = JSON.parse(argument) } catch { return rejected('INVALID_START_JSON') }
-        const fields = startSchema.safeParse(json)
-        return fields.success
-          ? receipt('Managed task created', store.create(agent.id, fields.data.initial, fields.data.replacement, commandId))
-          : rejected('INVALID_START_JSON')
+        const fields = documentStartArgs.safeParse(json)
+        if (!fields.success) return rejected('INVALID_START_JSON')
+        const input = fields.data
+        const result = 'documentId' in input ? store.createSharedTask(agent.id, input.documentId, input.expectedVersion, input.replacement, commandId)
+          : store.create(agent.id, input.initial, input.replacement, commandId)
+        return receipt('Managed task created', result)
       }
       if (verb === 'status' && argument === '') return receipt('Managed task status', store.status(agent.id))
       if (verb === 'pause' && argument === '') return receipt('Pause effective', store.pause(agent.id, commandId), false)

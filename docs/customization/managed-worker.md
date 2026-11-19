@@ -53,10 +53,20 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 要替换已明确授权的文档，请在新的普通会话中选择 **SuperAgent managed document Worker**。不要在 Assistant、受托起草文字的 Worker、旧执行器或 DSH 子代理会话中登记这项授权。文档 Worker 使用只读沙箱，写入只能通过宿主注册的 `studio_write_document` 动作。
 
-1. **登记一条确切授权。** 在 Worker 会话中提交 `/studio-doc start {"initial":"旧正文","replacement":"获准的新正文"}`。回执包含任务 ID、执行轮次、授权版本和文档版本。之后可用普通消息安排 Worker 提交这次修改。只有登记的新正文与预期文档版本 `1` 完全匹配时，动作才可能把文档更新到版本 `2`。普通聊天文本不增加权限。
+1. **登记一条确切授权。** 在 Worker 会话中提交 `/studio-doc start {"initial":"旧正文","replacement":"获准的新正文"}`。回执包含任务 ID、执行轮次、授权版本和文档版本。用 `/studio-doc continue <授权版本>` 让 Worker 提交这次修改。只有登记的新正文与预期文档版本 `1` 完全匹配时，动作才可能把文档更新到版本 `2`。普通聊天文本不增加权限。多个任务要修改同一文档时，按下文用文档 ID 绑定，不要分别用 `initial` 创建副本。
 2. **暂停和查看状态。** 在当前 Worker 会话中提交 `/studio-doc pause`。收到 `Pause effective` 时，暂停与新授权版本已经提交。随时可用 `/studio-doc status` 查看状态，不会返回正文。若回执说暂停未保存，宿主仍阻止该任务写入，而且不提供可用的恢复版本；可重试暂停，或在宿主重启后重新打开会话查看状态。
 3. **移交到新 Worker。** 新建一个尚未绑定任务的同预设会话，在那里提交 `/studio-doc transfer <任务ID> <当前执行轮次>`。移交保留已登记的文档内容范围和暂停状态；旧会话不能再写入。
 4. **恢复暂停的任务。** 核对任务和写入范围后，在当前 Worker 会话中提交状态或移交回执给出的 `/studio-doc resume <授权版本>`；过时的版本不能恢复写入。收到 `Execution resumed` 只表示重新允许写入，不会重跑旧动作。用回执中的新版本执行 `/studio-doc continue <授权版本>`。
+
+### 多个任务修改同一文档
+
+在 **SuperAgent managed document Worker** 会话中，用 `/studio-doc doc-new {"text":"起始正文"}` 创建共享文档，回执给出文档 ID 和修订 `1`。这一步不创建任务，也不授予 Worker 写入权。`/studio-doc doc-read <文档ID> [修订号]` 可查看正文；省略修订号则读取当前版本。
+
+- **让任务基于同一版本工作。** 在各自尚未绑定的文档 Worker 会话中提交 `/studio-doc start {"documentId":"<文档ID>","expectedVersion":1,"replacement":"该任务获准的新正文"}`，然后用回执中的授权版本继续。任务的基准修订不会随文档改动自动更新。
+- **直接编辑。** 所有者可提交 `/studio-doc doc-save {"documentId":"<文档ID>","expectedVersion":1,"text":"人工修订"}`。只有文档仍在指定修订时才保存；该命令不恢复暂停任务，也不替它完成工作。
+- **遇到冲突。** `/studio-doc status` 分别显示任务的基准修订和文档的当前修订。若另一任务或所有者先保存，旧任务返回 `SHARED_DOCUMENT_CONFLICT`，不会覆盖先保存的正文。用 `doc-read` 比较两个版本，再明确决定如何合并或授权新的修改。当前不自动合并、不自动更新任务的基准；旧写入不要原样重试。
+
+旧任务仍使用各自的独立文档，不会迁移成共享文档。
 
 ### 普通消息待核对
 

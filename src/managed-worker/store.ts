@@ -7,8 +7,11 @@ import { types } from 'node:util'
 import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
   type StudioFeishuInstruction, type StudioInstructionInput } from './instruction-store.js'
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
+import { SHARED_DOCUMENT_SCHEMA, appendSharedRevision, readSharedRevision,
+  type SharedDocumentRevision, type SharedDocumentTask } from './shared-document-store.js'
 
 export type { StudioFeishuInstruction } from './instruction-store.js'
+export type { SharedDocumentRevision } from './shared-document-store.js'
 
 /** A failure does not confirm a write. Use the reason to block the action or guide the user through a retry. */
 export type ManagedResult<T> = { ok: true; value: T } | { ok: false; reason: string }
@@ -21,6 +24,7 @@ export interface ManagedTask {
   authorizationVersion: number
   paused: boolean
   documentVersion: number
+  sharedDocument?: SharedDocumentTask
 }
 
 /** The host retains the original permit for its associated tool call. A structurally identical copy is invalid. */
@@ -30,7 +34,8 @@ export interface ManagedWritePermit {
   readonly executionEpoch: number
   readonly authorizationVersion: number
   readonly toolCallId: string
-  readonly expectedVersion: 1
+  readonly expectedVersion: number
+  readonly documentId?: string
   readonly text: string
 }
 
@@ -85,6 +90,12 @@ type FeishuInstructionReceipt = {
 type Rejection = Extract<ManagedResult<never>, { ok: false }>
 const accept = <T>(value: T): ManagedResult<T> => ({ ok: true, value })
 const deny = (reason: string): Rejection => ({ ok: false, reason })
+
+/** The task never changes its shared base when another actor advances the document. */
+function sharedDocumentConflict(task: ManagedTask): boolean {
+  const shared = task.sharedDocument
+  return !!shared && shared.headVersion !== shared.baseVersion
+}
 
 // Each epoch points to a Session binding that cannot be reused. Keep old bindings to distinguish unmanaged Sessions from replaced ones.
 const SCHEMA = `
@@ -302,6 +313,7 @@ export class ManagedWorkerStore {
         this.db.exec(SCHEMA)
         this.db.exec(PROJECT_SCHEMA)
         this.db.exec(INSTRUCTION_SCHEMA)
+        this.db.exec(SHARED_DOCUMENT_SCHEMA)
         const previous = this.db.prepare('SELECT clean FROM managed_host_run WHERE singleton = 1').get()
         // A failed pause may have left no task ID in durable storage. A dirty run (or a pre-fence database) cannot carry forward any pending write authorization.
         const recoveredTasks = previous?.clean === 1 ? 0 : this.pauseUnfinishedTasks()
@@ -590,7 +602,8 @@ export class ManagedWorkerStore {
       if (this.isFrozen(task)) return deny('PAUSE_UNCONFIRMED')
       const { pending, observedEpoch, remaining } = this.instructions.inbox(task.taskId)
       if (!pending) return accept({ task, remaining })
-      if (task.documentVersion === 1 && observedEpoch === task.executionEpoch && instructionOrderKnown(pending)) {
+      if (task.documentVersion === 1 && !sharedDocumentConflict(task)
+        && observedEpoch === task.executionEpoch && instructionOrderKnown(pending)) {
         const { baselineText, approvedText } = this.documentTargets(task.taskId)
         const changes = documentLineChanges(baselineText, approvedText)
         if (changes) return accept({ task, pending, remaining, narrowableLines: changes.changedLines })
@@ -615,6 +628,7 @@ export class ManagedWorkerStore {
       if (this.isFrozen(task)) return deny('PAUSE_UNCONFIRMED')
       if (task.executionEpoch !== expectedEpoch) return deny('STALE_EXECUTION')
       if (task.documentVersion !== 1 || expectedDocumentVersion !== 1) return deny('VERSION_CONFLICT')
+      if (sharedDocumentConflict(task)) return deny('SHARED_DOCUMENT_CONFLICT')
       if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
       if (task.authorizationVersion !== expectedAuthorizationVersion) return deny('STALE_AUTHORIZATION')
       const { pending, observedEpoch, remaining } = this.instructions.inbox(task.taskId)
@@ -658,6 +672,7 @@ export class ManagedWorkerStore {
       if (!current.ok) return current
       const task = current.value
       if (this.studioSessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
+      if (task.documentVersion === 1 && sharedDocumentConflict(task)) return deny('SHARED_DOCUMENT_CONFLICT')
       const blocked = this.executionBlocked(task)
       if (blocked) return blocked
       if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
@@ -696,14 +711,11 @@ export class ManagedWorkerStore {
   status(sessionId: string): ManagedResult<ManagedTask> {
     if (!isId(sessionId)) return deny('INVALID_INPUT')
     if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-    try {
-      if (!this.ownsRun()) return deny('STALE_HOST_RUN')
+    return this.snapshot(() => {
       const current = this.currentTask(sessionId)
       if (!current.ok) return current
       return this.authorizationBlocked(current.value) ?? current
-    } catch {
-      return deny('STORAGE_ERROR')
-    }
+    })
   }
 
   /** Create the version 1 document for the current Session and record the only approved replacement text. */
@@ -713,14 +725,72 @@ export class ManagedWorkerStore {
     return this.write(() => {
       if (this.sessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
       if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
-      const taskId = randomUUID()
-      requireWrite(this.db.prepare('INSERT INTO managed_task VALUES (?, 1, 1, 0, ?)').run(taskId, approvedText).changes)
-      requireWrite(this.db.prepare('INSERT INTO managed_session_binding VALUES (?, ?, 1)').run(sessionId, taskId).changes)
-      requireWrite(this.db.prepare('INSERT INTO managed_document VALUES (?, 1, ?)').run(taskId, initialText).changes)
-      const task: ManagedTask = { taskId, workerSessionId: sessionId, executionEpoch: 1, authorizationVersion: 1, paused: false, documentVersion: 1 }
-      this.audit('create', task, commandId, null)
-      return accept(task)
+      return accept(this.createDocumentTask(sessionId, initialText, approvedText, commandId))
     })
+  }
+
+  /** Create an independent document and record the Host-authenticated owner command on version 1. */
+  createSharedDocument(sessionId: string, text: string, commandId: string): ManagedResult<SharedDocumentRevision> {
+    if (!isId(sessionId) || !isText(text) || !isId(commandId)) return deny('INVALID_INPUT')
+    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
+    return this.write(() => {
+      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
+      const revision = { documentId: randomUUID(), version: 1, text }
+      requireWrite(appendSharedRevision(this.db, revision, { sessionId, commandId }))
+      return accept(revision)
+    })
+  }
+
+  /** Read any retained revision, defaulting to the global head rather than a task's local snapshot. */
+  readSharedDocument(documentId: string, version?: number): ManagedResult<SharedDocumentRevision> {
+    if (!isId(documentId) || (version !== undefined && !isVersion(version))) return deny('INVALID_INPUT')
+    return this.snapshot(() => {
+      const revision = readSharedRevision(this.db, documentId, version)
+      return revision ? accept(revision) : deny('DOCUMENT_NOT_FOUND')
+    })
+  }
+
+  /** Append a Host-authenticated edit at exactly the expected head, without changing any task authorization. */
+  editSharedDocument(sessionId: string, documentId: string, expectedVersion: number, text: string, commandId: string): ManagedResult<SharedDocumentRevision> {
+    if (!isId(sessionId) || !isId(documentId) || !isVersion(expectedVersion) || !isText(text) || !isId(commandId)) return deny('INVALID_INPUT')
+    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
+    return this.write(() => {
+      const head = readSharedRevision(this.db, documentId)
+      if (!head) return deny('DOCUMENT_NOT_FOUND')
+      if (head.version !== expectedVersion) return deny('SHARED_DOCUMENT_CONFLICT')
+      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
+      const revision = { documentId, version: expectedVersion + 1, text }
+      requireWrite(appendSharedRevision(this.db, revision, { sessionId, commandId }))
+      return accept(revision)
+    })
+  }
+
+  /** Bind a new Worker to the expected shared head and copy that immutable baseline into its private version 1. */
+  createSharedTask(sessionId: string, documentId: string, expectedVersion: number, approvedText: string, commandId: string): ManagedResult<ManagedTask> {
+    if (!isId(sessionId) || !isId(documentId) || !isVersion(expectedVersion) || !isText(approvedText) || !isId(commandId)) return deny('INVALID_INPUT')
+    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
+    return this.write(() => {
+      const head = readSharedRevision(this.db, documentId)
+      if (!head) return deny('DOCUMENT_NOT_FOUND')
+      if (head.version !== expectedVersion) return deny('SHARED_DOCUMENT_CONFLICT')
+      if (this.sessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
+      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
+      const task = this.createDocumentTask(sessionId, head.text, approvedText, commandId)
+      requireWrite(this.db.prepare('INSERT INTO studio_shared_document_task (task_id, document_id, base_version) VALUES (?, ?, ?)')
+        .run(task.taskId, documentId, expectedVersion).changes)
+      return accept({ ...task, sharedDocument: { documentId, baseVersion: expectedVersion, headVersion: expectedVersion } })
+    })
+  }
+
+  /** Insert the private document, its initial Session binding, and the existing create audit in one transaction. */
+  private createDocumentTask(sessionId: string, initialText: string, approvedText: string, commandId: string): ManagedTask {
+    const taskId = randomUUID()
+    requireWrite(this.db.prepare('INSERT INTO managed_task VALUES (?, 1, 1, 0, ?)').run(taskId, approvedText).changes)
+    requireWrite(this.db.prepare('INSERT INTO managed_session_binding VALUES (?, ?, 1)').run(sessionId, taskId).changes)
+    requireWrite(this.db.prepare('INSERT INTO managed_document VALUES (?, 1, ?)').run(taskId, initialText).changes)
+    const task: ManagedTask = { taskId, workerSessionId: sessionId, executionEpoch: 1, authorizationVersion: 1, paused: false, documentVersion: 1 }
+    this.audit('create', task, commandId, null)
+    return task
   }
 
   /** Block writes to the current task before persisting the pause. A failed state or audit write leaves the block in place and the pause can be retried. */
@@ -797,6 +867,7 @@ export class ManagedWorkerStore {
       const current = this.currentTask(sessionId)
       if (!current.ok) return current
       const task = current.value
+      if (task.documentVersion === 1 && sharedDocumentConflict(task)) return deny('SHARED_DOCUMENT_CONFLICT')
       const blocked = this.authorizationBlocked(task)
       if (blocked) return blocked
       if (task.authorizationVersion !== expectedAuthorizationVersion) return deny('STALE_AUTHORIZATION')
@@ -815,53 +886,68 @@ export class ManagedWorkerStore {
   authorize(sessionId: string, action: unknown, toolCallId: string): ManagedResult<ManagedWritePermit> {
     if (!isId(sessionId) || !isId(toolCallId)) return deny('INVALID_INPUT')
     if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-    try {
-      if (!this.ownsRun()) return deny('STALE_HOST_RUN')
+    return this.snapshot(() => {
       const current = this.currentTask(sessionId)
       if (!current.ok) return current
       const task = current.value
       // Even if conflicting role bindings exist, Studio Sessions cannot receive document permits.
       if (this.studioSessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
+      if (task.documentVersion === 1 && sharedDocumentConflict(task)) return deny('SHARED_DOCUMENT_CONFLICT')
       const blocked = this.executionBlocked(task)
       if (blocked) return blocked
       if (this.actionUsed(sessionId, toolCallId)) return deny('DUPLICATE_ACTION')
       const input = documentAction(action)
       if (!input) return deny('INVALID_ACTION')
-      if (input.expectedVersion !== 1 || task.documentVersion !== 1) return deny('VERSION_CONFLICT')
+      if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
+      const expectedVersion = task.sharedDocument?.baseVersion ?? 1
+      if (input.expectedVersion !== expectedVersion) return deny(task.sharedDocument ? 'SHARED_DOCUMENT_CONFLICT' : 'VERSION_CONFLICT')
       if (!this.textApproved(task.taskId, input.text)) return deny('ACTION_NOT_APPROVED')
-      const { taskId, executionEpoch, authorizationVersion } = task
+      const { taskId, executionEpoch, authorizationVersion, sharedDocument } = task
       const permit: ManagedWritePermit = Object.freeze({ taskId, workerSessionId: sessionId, executionEpoch, authorizationVersion,
-        toolCallId, expectedVersion: 1, text: input.text })
+        toolCallId, expectedVersion, text: input.text, ...(sharedDocument ? { documentId: sharedDocument.documentId } : {}) })
       this.#permits.set(permit, false)
       return accept(permit)
-    } catch {
-      return deny('STORAGE_ERROR')
-    }
+    })
   }
 
   /** With the write lock held, recheck ownership, the permit, the action, and the document. Commit the one allowed change from version 1 to 2 with its audit record. */
-  commit(permit: ManagedWritePermit, action: unknown): ManagedResult<{ documentVersion: number }> {
+  commit(permit: ManagedWritePermit, action: unknown): ManagedResult<{ documentVersion: number; documentId?: string }> {
     const spent = this.#permits.get(permit)
     if (spent === undefined) return deny('INVALID_PERMIT')
     if (spent) return deny('DUPLICATE_ACTION')
     if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-    const result = this.write(() => {
+    const result = this.write<{ documentVersion: number; documentId?: string }>(() => {
       const current = this.currentTask(permit.workerSessionId)
       if (!current.ok || current.value.taskId !== permit.taskId || current.value.executionEpoch !== permit.executionEpoch) return deny('STALE_EXECUTION')
       if (this.studioSessionBound(permit.workerSessionId)) return deny('SESSION_ALREADY_BOUND')
       const task = current.value
+      const shared = task.sharedDocument
+      if (task.documentVersion === 1 && sharedDocumentConflict(task)) return deny('SHARED_DOCUMENT_CONFLICT')
       const blocked = this.executionBlocked(task)
       if (blocked) return blocked
       if (task.authorizationVersion !== permit.authorizationVersion) return deny('STALE_AUTHORIZATION')
       if (this.actionUsed(permit.workerSessionId, permit.toolCallId)) return deny('DUPLICATE_ACTION')
       const input = documentAction(action)
       if (!input) return deny('INVALID_ACTION')
-      if (input.expectedVersion !== permit.expectedVersion || task.documentVersion !== permit.expectedVersion) return deny('VERSION_CONFLICT')
+      if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
+      if (permit.documentId !== shared?.documentId) return deny('INVALID_PERMIT')
+      if (input.expectedVersion !== permit.expectedVersion || permit.expectedVersion !== (shared?.baseVersion ?? 1)) {
+        return deny(shared ? 'SHARED_DOCUMENT_CONFLICT' : 'VERSION_CONFLICT')
+      }
       if (input.text !== permit.text || !this.textApproved(task.taskId, input.text)) return deny('ACTION_NOT_APPROVED')
+      const committedVersion = shared ? shared.baseVersion + 1 : 2
+      if (shared) {
+        // Append before updating the private result. The trigger requires this exact revision as proof.
+        requireWrite(appendSharedRevision(this.db, { documentId: shared.documentId, version: committedVersion, text: input.text },
+          { sessionId: permit.workerSessionId, taskId: task.taskId, toolCallId: permit.toolCallId }))
+        requireWrite(this.db.prepare(`UPDATE studio_shared_document_task SET committed_version = ?
+          WHERE task_id = ? AND document_id = ? AND base_version = ? AND committed_version IS NULL`)
+          .run(committedVersion, task.taskId, shared.documentId, shared.baseVersion).changes)
+      }
       requireWrite(this.db.prepare('UPDATE managed_document SET document_version = 2, text = ? WHERE task_id = ? AND document_version = 1')
         .run(input.text, task.taskId).changes)
       this.audit('commit', { ...task, documentVersion: 2 }, null, permit.toolCallId)
-      return accept({ documentVersion: 2 })
+      return accept(shared ? { documentVersion: committedVersion, documentId: shared.documentId } : { documentVersion: 2 })
     })
     if (result.ok) this.#permits.set(permit, true)
     return result
@@ -910,15 +996,27 @@ export class ManagedWorkerStore {
 
   private task(taskId: string): ManagedTask | undefined {
     const row: Record<string, SQLOutputValue> | undefined = this.db.prepare(`SELECT t.execution_epoch, t.authorization_version, t.paused,
-      b.session_id, d.document_version FROM managed_task t
+      b.session_id, d.document_version, shared.document_id, shared.base_version, shared.committed_version,
+      (SELECT MAX(version) FROM studio_shared_document_revision WHERE document_id = shared.document_id) AS head_version
+      FROM managed_task t
       JOIN managed_session_binding b ON b.task_id = t.task_id AND b.execution_epoch = t.execution_epoch
-      JOIN managed_document d ON d.task_id = t.task_id WHERE t.task_id = ?`).get(taskId)
+      JOIN managed_document d ON d.task_id = t.task_id
+      LEFT JOIN studio_shared_document_task shared ON shared.task_id = t.task_id WHERE t.task_id = ?`).get(taskId)
     if (!row) return
     const { session_id: workerSessionId, execution_epoch: executionEpoch, authorization_version: authorizationVersion,
       paused, document_version: documentVersion } = row
     if (!isId(workerSessionId) || !isVersion(executionEpoch) || !isVersion(authorizationVersion)
       || (paused !== 0 && paused !== 1) || (documentVersion !== 1 && documentVersion !== 2)) throw new Error('Invalid Managed Worker task state')
-    return { taskId, workerSessionId, executionEpoch, authorizationVersion, paused: paused === 1, documentVersion }
+    const task: ManagedTask = { taskId, workerSessionId, executionEpoch, authorizationVersion, paused: paused === 1, documentVersion }
+    const { document_id: documentId, base_version: baseVersion, head_version: headVersion, committed_version: committedVersion } = row
+    if (documentId !== null) {
+      if (!isId(documentId) || !isVersion(baseVersion) || !isVersion(headVersion) || headVersion < baseVersion
+        || (documentVersion === 1 ? committedVersion !== null : committedVersion !== baseVersion + 1 || headVersion < committedVersion)) {
+        throw new Error('Invalid Studio shared document task state')
+      }
+      task.sharedDocument = { documentId, baseVersion, headVersion, ...(isVersion(committedVersion) ? { committedVersion } : {}) }
+    }
+    return task
   }
 
   /** Load the baseline and exact currently approved target from the same version 1 document. */
@@ -940,6 +1038,7 @@ export class ManagedWorkerStore {
   private commandUsed(commandId: string): boolean {
     return !!this.db.prepare('SELECT 1 FROM managed_audit WHERE command_id = ?').get(commandId)
       || this.instructions.commandUsed(commandId)
+      || !!this.db.prepare('SELECT 1 FROM studio_shared_document_revision WHERE command_id = ?').get(commandId)
   }
 
   private actionUsed(sessionId: string, toolCallId: string): boolean {

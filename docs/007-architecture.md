@@ -360,7 +360,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/instructions.ts` | Records Web inputs before model reads, handles Web and Feishu instruction review, and sends the current approved text to the bound Worker for a fresh guarded write |
 | `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot and accepts messages only from the configured owner chat; sends receipts independently of ledger registration |
 | `src/managed-worker/instruction-store.ts` | Preserves Feishu task links, original deliveries and review receipts, including replacements narrowed to a subset of approved changes; pending inputs hold writes even when the listeners are off |
-| `src/managed-worker/store.ts` | The SQLite store for Studio Bot identities, draft results, managed documents, and project state; write authority and recovery across host runs |
+| `src/managed-worker/document-command.ts` | Owner-only commands for inspecting, creating and editing a shared document, and for selecting a task's exact base revision |
+| `src/managed-worker/shared-document-store.ts` | Immutable shared document revisions, exact task base links, and provenance for owner and Worker writes; a shared commit cannot update only a task's private snapshot |
+| `src/managed-worker/store.ts` | The SQLite store for Studio Bot identities, draft results, managed documents, and project state; checks shared revisions together with write authority and recovery across host runs |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
