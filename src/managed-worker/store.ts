@@ -72,11 +72,21 @@ const SCHEMA = `
     CHECK ((kind = 'commit' AND command_id IS NULL AND tool_call_id IS NOT NULL AND document_version = 2)
       OR (kind <> 'commit' AND command_id IS NOT NULL AND tool_call_id IS NULL))
   ) STRICT;
+  CREATE TABLE IF NOT EXISTS managed_host_run (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    run_id TEXT NOT NULL,
+    clean INTEGER NOT NULL CHECK (clean IN (0, 1))
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS managed_recovery_pause (
+    task_id TEXT NOT NULL,
+    execution_epoch INTEGER NOT NULL,
+    authorization_version INTEGER NOT NULL,
+    run_id TEXT NOT NULL,
+    at TEXT NOT NULL,
+    PRIMARY KEY (task_id, authorization_version),
+    FOREIGN KEY (task_id, execution_epoch) REFERENCES managed_session_binding (task_id, execution_epoch)
+  ) STRICT;
 `
-
-/** Key unconfirmed pauses by the resolved database path so reopening the Store in the same process leaves writes blocked. Not shared across hosts. */
-interface PendingPause { tasks: Set<string>; sessions: Set<string> }
-const pendingPauses = new Map<string, PendingPause>()
 
 const isText = (value: unknown): value is string => typeof value === 'string' && value.isWellFormed()
 const isId = (value: unknown): value is string => isText(value) && value.length > 0 && !value.includes('\0')
@@ -111,31 +121,59 @@ function requireWrite(changes: number | bigint): void {
   if (changes !== 1 && changes !== 1n) throw new Error('Managed Worker write did not affect exactly one row')
 }
 
-/** Single-host SQLite Store. State and audit records commit together; permits and unconfirmed pauses stay in memory. */
+/** Single-host SQLite Store. State, recovery fences, and audit records are durable; tool permits belong only to this Store. */
 export class ManagedWorkerStore {
   readonly #db: DatabaseSync
   readonly #permits = new WeakMap<ManagedWritePermit, boolean>()
-  private readonly path: string
+  readonly #runId = randomUUID()
+  private readonly frozenTasks = new Set<string>()
+  private readonly frozenSessions = new Set<string>()
   private closed = false
+  readonly recoveredTasks: number
 
-  /** Open or create the durable database. Throw on initialization failure so the caller cannot enable managed writes. */
+  /** Open the database under the host directory lock. Do not enable actions until the recovery transaction has committed. */
   constructor(path: string) {
     if (!isId(path) || path === ':memory:') throw new Error('Managed Worker requires a persistent SQLite path')
     const file = resolve(path)
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
     privateFile(file, true)
-    this.path = realpathSync(file)
+    const dbPath = realpathSync(file)
     // New WAL and SHM files inherit database permissions. Tighten permissions on existing auxiliary files before reopening the database.
-    for (const suffix of ['-wal', '-shm', '-journal']) privateFile(this.path + suffix, false)
-    this.#db = new DatabaseSync(this.path)
+    for (const suffix of ['-wal', '-shm', '-journal']) privateFile(dbPath + suffix, false)
+    this.#db = new DatabaseSync(dbPath)
     try {
       if (this.db.prepare('PRAGMA journal_mode=WAL').get()?.journal_mode !== 'wal') throw new Error('Cannot enable WAL for Managed Worker')
       this.db.exec('PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON')
-      this.transaction(() => { this.db.exec(SCHEMA); return accept(undefined) })
+      const started = this.transaction(() => {
+        this.db.exec(SCHEMA)
+        const previous = this.db.prepare('SELECT clean FROM managed_host_run WHERE singleton = 1').get()
+        // A failed pause may have left no task ID in durable storage. A dirty run (or a pre-fence database) cannot carry forward any pending write authorization.
+        const recoveredTasks = previous?.clean === 1 ? 0 : this.pauseUnfinishedTasks()
+        requireWrite(this.db.prepare(`INSERT INTO managed_host_run VALUES (1, ?, 0)
+          ON CONFLICT (singleton) DO UPDATE SET run_id = excluded.run_id, clean = 0`).run(this.#runId).changes)
+        return accept(recoveredTasks)
+      })
+      if (!started.ok) throw new Error('Cannot establish Managed Worker run')
+      this.recoveredTasks = started.value
     } catch (error) {
       try { this.close() } catch { /* Preserve the initialization error. */ }
       throw error
     }
+  }
+
+  /** Audit each system pause separately from user commands. Leave committed documents and already paused tasks unchanged. */
+  private pauseUnfinishedTasks(): number {
+    const rows = this.db.prepare(`SELECT task_id, execution_epoch, authorization_version FROM managed_task
+      JOIN managed_document USING (task_id) WHERE paused = 0 AND document_version = 1`).all()
+    const update = this.db.prepare('UPDATE managed_task SET paused = 1, authorization_version = authorization_version + 1 WHERE task_id = ?')
+    const audit = this.db.prepare(`INSERT INTO managed_recovery_pause (task_id, execution_epoch, authorization_version, run_id, at)
+      VALUES (?, ?, ?, ?, ?)`)
+    for (const { task_id: taskId, execution_epoch: epoch, authorization_version: revision } of rows) {
+      if (!isId(taskId) || !isVersion(epoch) || !isVersion(revision)) throw new Error('Invalid Managed Worker recovery state')
+      requireWrite(update.run(taskId).changes)
+      requireWrite(audit.run(taskId, epoch, revision + 1, this.#runId, new Date().toISOString()).changes)
+    }
+    return rows.length
   }
 
   private get db(): DatabaseSync {
@@ -143,7 +181,18 @@ export class ManagedWorkerStore {
     return this.#db
   }
 
-  /** Close the SQLite connection without clearing pending pauses. */
+  /** Mark a normal stop only after admission is disabled and every pause is confirmed. Otherwise leave the committed dirty marker intact. */
+  finishRun(): void {
+    if (this.closed || this.frozenTasks.size || this.frozenSessions.size) return
+    this.transaction(() => {
+      if (!this.ownsRun()) return deny('STALE_HOST_RUN')
+      requireWrite(this.db.prepare('UPDATE managed_host_run SET clean = 1 WHERE singleton = 1 AND run_id = ?')
+        .run(this.#runId).changes)
+      return accept(undefined)
+    })
+  }
+
+  /** Close without attesting that the run was safe to resume. Used on both normal teardown and storage failure. */
   close(): void {
     if (this.closed) return
     this.closed = true
@@ -157,6 +206,18 @@ export class ManagedWorkerStore {
     if (!row) return
     if (!isId(row.task_id) || !isVersion(row.execution_epoch)) throw new Error('Invalid Managed Worker binding')
     return { taskId: row.task_id, executionEpoch: row.execution_epoch }
+  }
+
+  /** Show the current authorization version without exposing document text or treating an unconfirmed pause as active. */
+  status(sessionId: string): ManagedResult<ManagedTask> {
+    if (!isId(sessionId)) return deny('INVALID_INPUT')
+    try {
+      if (!this.ownsRun()) return deny('STALE_HOST_RUN')
+      const current = this.currentTask(sessionId)
+      return current.ok && this.isFrozen(current.value) ? deny('PAUSE_UNCONFIRMED') : current
+    } catch {
+      return deny('STORAGE_ERROR')
+    }
   }
 
   /** Create the version 1 document for the current Session and record the only approved replacement text. */
@@ -180,26 +241,24 @@ export class ManagedWorkerStore {
     if (!isId(sessionId) || !isId(commandId)) return deny('INVALID_INPUT')
     let task: ManagedTask | undefined
     try {
+      if (!this.ownsRun()) return deny('STALE_HOST_RUN')
       const current = this.currentTask(sessionId)
       if (!current.ok) {
-        pendingPauses.get(this.path)?.sessions.delete(sessionId)
-        this.clearEmptyPauses()
+        this.frozenSessions.delete(sessionId)
         return current
       }
       // A committed command is not a new pause. Replaying it cannot block writes again after the task resumes.
       task = current.value
       if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
     } catch {
-      const pending = this.pendingPause()
-      if (task) pending.tasks.add(task.taskId)
-      else pending.sessions.add(sessionId)
+      if (task) this.frozenTasks.add(task.taskId)
+      else this.frozenSessions.add(sessionId)
       return deny('PAUSE_UNCONFIRMED')
     }
-    // Block writes before acquiring the SQLite write lock. The block remains even if SQLite is busy or the audit insert fails.
+    // Block writes before taking the SQLite write lock. A failed transaction leaves the local block in place and prevents a clean-stop marker.
     const { taskId, executionEpoch } = task
-    const pending = this.pendingPause()
-    pending.tasks.add(taskId)
-    pending.sessions.delete(sessionId)
+    this.frozenTasks.add(taskId)
+    this.frozenSessions.delete(sessionId)
     const result = this.write(() => {
       const current = this.currentTask(sessionId)
       if (!current.ok || current.value.taskId !== taskId || current.value.executionEpoch !== executionEpoch) return deny('STALE_EXECUTION')
@@ -210,9 +269,8 @@ export class ManagedWorkerStore {
       return accept(paused)
     })
     if (!result.ok) return deny('PAUSE_UNCONFIRMED')
-    // Clear the in-memory block only after COMMIT is confirmed and the durable pause can block writes.
-    pending.tasks.delete(taskId)
-    this.clearEmptyPauses()
+    // Clear the local block only after COMMIT is confirmed and the durable pause can block writes.
+    this.frozenTasks.delete(taskId)
     return result
   }
 
@@ -259,6 +317,7 @@ export class ManagedWorkerStore {
   authorize(sessionId: string, action: unknown, toolCallId: string): ManagedResult<ManagedWritePermit> {
     if (!isId(sessionId) || !isId(toolCallId)) return deny('INVALID_INPUT')
     try {
+      if (!this.ownsRun()) return deny('STALE_HOST_RUN')
       const current = this.currentTask(sessionId)
       if (!current.ok) return current
       const task = current.value
@@ -320,9 +379,14 @@ export class ManagedWorkerStore {
     }
   }
 
+  /** Serialize writes with run replacement. A host overtaken after its directory lock expires cannot commit a previous run's action. */
   private write<T>(operation: () => ManagedResult<T>): ManagedResult<T> {
-    try { return this.transaction(operation) }
+    try { return this.transaction(() => this.ownsRun() ? operation() : deny('STALE_HOST_RUN')) }
     catch { return deny('STORAGE_ERROR') }
+  }
+
+  private ownsRun(): boolean {
+    return !!this.db.prepare('SELECT 1 FROM managed_host_run WHERE singleton = 1 AND run_id = ? AND clean = 0').get(this.#runId)
   }
 
   /** Historical bindings are readable but no longer grant execution authority. */
@@ -369,21 +433,9 @@ export class ManagedWorkerStore {
     return !!this.db.prepare('SELECT 1 FROM managed_task WHERE task_id = ? AND approved_text = ? COLLATE BINARY').get(taskId, text)
   }
 
-  private pendingPause(): PendingPause {
-    let pending = pendingPauses.get(this.path)
-    if (!pending) pendingPauses.set(this.path, pending = { tasks: new Set(), sessions: new Set() })
-    return pending
-  }
-
-  private clearEmptyPauses(): void {
-    const pending = pendingPauses.get(this.path)
-    if (pending && !pending.tasks.size && !pending.sessions.size) pendingPauses.delete(this.path)
-  }
-
-  /** If the initial read fails before the task ID is known, block writes to tasks owned by the Session until the pause can be resolved and persisted. */
+  /** If the initial read fails before the task ID is known, block writes from the Session until the pause can be resolved and persisted. */
   private isFrozen(task: ManagedTask): boolean {
-    const pending = pendingPauses.get(this.path)
-    return !!pending && (pending.tasks.has(task.taskId) || pending.sessions.has(task.workerSessionId))
+    return this.frozenTasks.has(task.taskId) || this.frozenSessions.has(task.workerSessionId)
   }
 
   private executionBlocked(task: ManagedTask): Rejection | undefined {

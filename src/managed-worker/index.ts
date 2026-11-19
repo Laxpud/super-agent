@@ -65,9 +65,11 @@ const rejected = (reason: string): CommandResult => ({ kind: 'error', text: `Man
 /** Report success only after the Store confirms a durable commit. Keep document text out of Session command history. */
 function receipt(operation: string, result: ManagedResult<ManagedTask>): CommandResult {
   if (!result.ok) return result.reason === 'PAUSE_UNCONFIRMED'
-    ? { kind: 'error', text: 'Pause not saved; affected writes remain blocked in this host.' } : rejected(result.reason)
+    ? { kind: 'error', text: 'Pause not saved; affected writes remain blocked in this host. Retry /studio-doc pause in the current Worker, or run /studio-doc status there after restart.' }
+    : rejected(result.reason)
   const task = result.value
-  return { kind: 'success', text: `${operation}: task ${task.taskId}; execution epoch ${task.executionEpoch}; authorization version ${task.authorizationVersion}; document version ${task.documentVersion}; ${task.paused ? 'paused' : 'active'}.` }
+  const resume = task.paused ? ` To allow writes again when ready, run /studio-doc resume ${task.authorizationVersion} in the current Worker.` : ''
+  return { kind: 'success', text: `${operation}: task ${task.taskId}; execution epoch ${task.executionEpoch}; authorization version ${task.authorizationVersion}; document version ${task.documentVersion}; ${task.paused ? 'paused' : 'active'}.${resume}` }
 }
 
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
@@ -76,7 +78,7 @@ export function apply(context: Context, { stateDir }: Config): void {
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   let available = true
-  // Reserve the directory for one host because an in-memory block for an unconfirmed pause is not shared across hosts.
+  // Reserve the directory for one host. The SQLite run fence also rejects commits from a prior holder of the lock.
   const unlock = lockSync(stateDir, { stale: 30_000, onCompromised(error) {
     available = false
     ctx.logger.error('Managed Worker lost its state directory lock: %s', String(error))
@@ -84,6 +86,7 @@ export function apply(context: Context, { stateDir }: Config): void {
   let store: ManagedWorkerStore
   try { store = new ManagedWorkerStore(join(stateDir, 'managed-worker.sqlite')) }
   catch (error) { unlock(); throw error }
+  if (store.recoveredTasks) ctx.logger.warn('Managed Worker paused %d unfinished tasks after an unconfirmed run', store.recoveredTasks)
 
   const scopes = new Map<Agent, () => void>()
   const permits = new Map<ToolExecutionToken, ManagedWritePermit>()
@@ -92,11 +95,14 @@ export function apply(context: Context, { stateDir }: Config): void {
   const restricted = (agent: Agent): boolean => ctx.permissionPresets.current(agent.session) === 'read-only'
     && ctx.sandboxPolicy.resolve({ session: agent.session }).mode === 'read-only'
   ctx.effect(() => () => {
+    const heldLock = available
     available = false
     permits.clear()
     try {
       for (const dispose of scopes.values()) dispose()
       scopes.clear()
+      // Admit no work after marking the run clean. A lost lock or failed shutdown leaves recovery to the next run.
+      if (heldLock) store.finishRun()
     } finally {
       try { store.close() } finally { unlock() }
     }
@@ -164,7 +170,7 @@ export function apply(context: Context, { stateDir }: Config): void {
   ctx.effect(() => ctx.commands.register({
     name: 'studio-doc',
     description: 'Manage a document task in this managed worker Session.',
-    input: { hint: 'start <JSON> | pause | transfer <task-id> <epoch> | resume <authorization-version>' },
+    input: { hint: 'start <JSON> | status | pause | transfer <task-id> <epoch> | resume <authorization-version>' },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()
@@ -181,6 +187,7 @@ export function apply(context: Context, { stateDir }: Config): void {
           ? receipt('Managed task created', store.create(agent.id, fields.data.initial, fields.data.replacement, commandId))
           : rejected('INVALID_START_JSON')
       }
+      if (verb === 'status' && argument === '') return receipt('Managed task status', store.status(agent.id))
       if (verb === 'pause' && argument === '') return receipt('Pause effective', store.pause(agent.id, commandId))
       if (verb === 'transfer') {
         const fields = /^([a-f0-9-]{36})\s+([1-9]\d*)$/.exec(argument)
