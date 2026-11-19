@@ -1,6 +1,6 @@
-# 受管文档 Worker（实验入口）
+# SuperAgent Studio：文字任务与受管文档
 
-这条入口只管理数据库里的单份文档，不接管 GitHub Ticket，也不能写普通工作区文件。原型的 GitHub、飞书和执行器预设维持原有行为。受管入口及其配套预设默认关闭。
+Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户取回。另有一条受管文档入口，只允许替换数据库里已明确授权的正文。两者都不接管 GitHub Ticket，也不能写普通工作区文件。Studio 宿主和配套预设默认关闭；原型的 GitHub、飞书和执行器预设维持原有行为。
 
 ## 在隔离环境启用
 
@@ -25,11 +25,21 @@
     stateDir: /absolute/path/to/managed-worker-state
 - id: dsh-superagent-managed-worker-preset
   disabled: false
+- id: dsh-superagent-studio-assistant-preset
+  disabled: false
 ```
 
-在新的普通会话中选择 **SuperAgent managed document Worker** 预设。不要在原型的旧 Worker 或 DSH 子代理会话上使用这条命令。受管 Worker 使用只读沙箱和原生执行器，写入只能通过宿主注册的 `studio_write_document` 动作。
+## 交代文字任务和取回成果
 
-## 授权、暂停和移交
+1. 在新会话中选择 **SuperAgent Studio Assistant**，选择支持工具调用的模型，用普通消息提出一个独立的纯文字任务，例如「把这三条材料整理成一个简短比较表」。当前只转交该条请求，不自动带上过去的聊天、附件或文件；请把所需文字放在同一条消息。Worker 沿用 Assistant 当时选择的模型和思考深度，不具备业务工具。
+2. 在原会话展开 **Worker result** 工具卡片，看 Worker 的原文和任务 ID。宿主同时保存产出 Bot、会话、执行轮次与消息位置。Assistant 可以报告任务状态，但卡片中的原文不靠它复述。
+3. 在这个会话用 `/studio-result` 取回最新任务，或在任意 Studio Assistant 会话用 `/studio-result <任务ID>` 取回指定任务。此命令不调用模型，不需要 Worker 在线。宿主重启后，已经保存的成果仍可读；未完成的任务显示为中断，不自动再派一遍。
+
+文字请求和结果各限 32,000 个 UTF-16 代码单元。三分钟内未完成时，宿主会请求取消 Worker，再关闭其会话。超时、失败或没有完整文字时，不把中间内容当作完成。文字任务不授予任何文档写入权，也不用于运行外部长作业。
+
+## 文档写入控制
+
+要替换已明确授权的文档，请在新的普通会话中选择 **SuperAgent managed document Worker**。不要在 Assistant、受托起草文字的 Worker、旧执行器或 DSH 子代理会话中登记这项授权。文档 Worker 使用只读沙箱，写入只能通过宿主注册的 `studio_write_document` 动作。
 
 1. **登记一条确切授权。** 在 Worker 会话中提交 `/studio-doc start {"initial":"旧正文","replacement":"获准的新正文"}`。回执包含任务 ID、执行轮次、授权版本和文档版本。之后可用普通消息安排 Worker 提交这次修改。只有登记的新正文与预期文档版本 `1` 完全匹配时，动作才可能把文档更新到版本 `2`。普通聊天文本不增加权限。
 2. **暂停和查看状态。** 在当前 Worker 会话中提交 `/studio-doc pause`。收到 `Pause effective` 时，暂停与新授权版本已经提交。随时可用 `/studio-doc status` 查看状态，不会返回正文。若回执说暂停未保存，宿主仍阻止该任务写入，而且不提供可用的恢复版本；可重试暂停，或在宿主重启后重新打开会话查看状态。

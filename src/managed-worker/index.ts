@@ -1,4 +1,4 @@
-/** Managed document Worker independent of GitHub setup; writes only the single document authorized by the host. */
+/** Opt-in Studio roles independent of GitHub setup. Only a bound document Worker can request a managed write. */
 import { mkdirSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -8,10 +8,11 @@ import type { ToolExecution, ToolExecutionToken } from '@deepseek-ai/dsh-tools'
 import s from '@deepseek-ai/schemastery'
 import { lockSync } from 'proper-lockfile'
 import { z } from 'zod'
+import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool } from './assistant.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
 
 export const name = 'dsh-superagent-managed-worker'
-export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'permissionPresets', 'sandboxPolicy', 'tools', 'webServer']
+export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'permissionPresets', 'sandboxPolicy', 'systemPrompt', 'tools', 'webServer']
 export const Config = s.object({
   stateDir: s.string().required().description('Absolute directory reserved for the managed document worker database.'),
 })
@@ -26,6 +27,8 @@ const writeSchema = z.strictObject({ expectedVersion: z.literal(1), text: z.stri
 
 interface CommandResult { kind: 'success' | 'error'; text: string }
 interface CommandInput { agent: Agent; commandId: string; rawInput: string; signal: AbortSignal }
+type StudioRole = 'assistant' | 'draft-worker' | 'document-worker'
+interface StudioScope { role: StudioRole; dispose(): void }
 
 /** Only the rc.3 additions used here are declared. The running host provides the services; no second Cordis or DSH runtime is loaded. */
 type ManagedHost = Context & {
@@ -88,18 +91,34 @@ export function apply(context: Context, { stateDir }: Config): void {
   catch (error) { unlock(); throw error }
   if (store.recoveredTasks) ctx.logger.warn('Managed Worker paused %d unfinished tasks after an unconfirmed run', store.recoveredTasks)
 
-  const scopes = new Map<Agent, () => void>()
+  const scopes = new Map<Agent, StudioScope>()
   const permits = new Map<ToolExecutionToken, ManagedWritePermit>()
-  const matchingPreset = (agent: Agent): boolean => ctx.agentPresets.presetForSession(agent.session) === PRESET
+  const presetOf = (agent: Agent) => ctx.agentPresets.presetForSession(agent.session)
+  const presetFor = (role: StudioRole) => role === 'assistant' ? ASSISTANT_PRESET : PRESET
   const currentSession = (agent: Agent): boolean => ctx.agents.get(agent.id) === agent
   const restricted = (agent: Agent): boolean => ctx.permissionPresets.current(agent.session) === 'read-only'
     && ctx.sandboxPolicy.resolve({ session: agent.session }).mode === 'read-only'
+  const ready = (agent: Agent, role: StudioRole): boolean => available && controlReady(ctx) && currentSession(agent)
+    && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
+  const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), agent => ready(agent, 'draft-worker'))
+
+  /** A persisted binding wins over the picker, so a retired or finished Worker cannot become a different role on resume. */
+  function roleOf(agent: Agent): StudioRole | undefined {
+    if (store.draftBinding(agent.id)) return 'draft-worker'
+    if (store.binding(agent.id)) return 'document-worker'
+    if (store.assistantBinding(agent.id)) return 'assistant'
+    const preset = presetOf(agent)
+    if (preset === ASSISTANT_PRESET) return 'assistant'
+    if (preset === PRESET) return 'document-worker'
+  }
+
   ctx.effect(() => () => {
     const heldLock = available
     available = false
+    drafts.stop()
     permits.clear()
     try {
-      for (const dispose of scopes.values()) dispose()
+      for (const scope of scopes.values()) scope.dispose()
       scopes.clear()
       // Admit no work after marking the run clean. A lost lock or failed shutdown leaves recovery to the next run.
       if (heldLock) store.finishRun()
@@ -108,14 +127,22 @@ export function apply(context: Context, { stateDir }: Config): void {
     }
   })
 
-  /** Set read-only permissions and restrict tools when an Agent is created or resumed. Changing presets cannot bypass checks on a prior binding. */
+  /** Configure the persisted role before admitting any Agent work, including work on a cold resume. */
   function configure(agent: Agent): void {
-    if (scopes.has(agent) || (!matchingPreset(agent) && !store.binding(agent.id))) return
+    const role = roleOf(agent)
+    const prior = scopes.get(agent)
+    if (!role || prior?.role === role) return
+    prior?.dispose()
+    scopes.delete(agent)
     ctx.permissionPresets.set(agent.session, 'read-only')
-    // Hide inherited tools and register one managed action for this Agent. The global Guard still denies other Agent-local tools.
+    // Hide inherited tools. The host guard also denies other Agent-local tools even if another plugin registers one.
     const unmask = agent.ctx.tools.restrict({ allow: [] })
     try {
-      const unregister = agent.ctx.tools.register({
+      if (role === 'assistant') {
+        const bound = store.bindAssistant(agent.id)
+        if (!bound.ok) throw new Error(`Cannot bind Studio Assistant: ${bound.reason}`)
+      }
+      const unregister = role !== 'document-worker' ? drafts.install(agent, role) : agent.ctx.tools.register({
         name: TOOL,
         description: 'Replace the text of the managed document bound to this worker, using its approved text and version.',
         parameters: z.toJSONSchema(writeSchema),
@@ -128,29 +155,26 @@ export function apply(context: Context, { stateDir }: Config): void {
           const permit = permits.get(exec.token)
           permits.delete(exec.token)
           // Use only the permit issued through the tool pipeline. Even after the Guard allows a call, the write transaction checks the current execution epoch.
-          if (!available || !permit || !controlReady(ctx) || exec.agent !== agent || !currentSession(agent) || !matchingPreset(agent) || !restricted(agent)
+          if (!permit || exec.agent !== agent || !ready(agent, 'document-worker')
             || permit.workerSessionId !== agent.id || permit.toolCallId !== exec.callId) throw new Error('Managed write denied: INVALID_EXECUTION')
           const result = store.commit(permit, action)
           if (!result.ok) throw new Error(`Managed write denied: ${result.reason}`)
           return result.value
         },
       })
-      scopes.set(agent, () => { try { unregister() } finally { unmask() } })
+      scopes.set(agent, { role, dispose() { try { unregister() } finally { unmask() } } })
     } catch (error) { unmask(); throw error }
   }
 
   ctx.effect(() => ctx.tools.guard((exec: Readonly<ToolExecution>) => {
     const { agent } = exec
-    let subject = false
-    try {
-      subject = agent !== undefined && (scopes.has(agent) || matchingPreset(agent) || store.binding(agent.id) !== undefined)
-    } catch {
-      // If the binding cannot be read, do not let a potentially retired Worker proceed as an ordinary Session.
-      return 'Managed write denied: STORAGE_ERROR'
-    }
-    if (!subject) return exec.name === TOOL ? 'Managed write denied: INVALID_EXECUTION' : undefined
-    if (!available || !controlReady(ctx) || !agent || !scopes.has(agent) || !currentSession(agent) || !matchingPreset(agent) || !restricted(agent)
-      || exec.name !== TOOL || exec.parent !== undefined) return 'Managed write denied: INVALID_EXECUTION'
+    let role: StudioRole | undefined
+    try { role = agent && (scopes.get(agent)?.role ?? roleOf(agent)) }
+    catch { return 'Studio tool denied: STORAGE_ERROR' }
+    if (!role || !agent) return exec.name === TOOL || isAssistantTool(exec.name) ? 'Studio tool denied: INVALID_EXECUTION' : undefined
+    if (!ready(agent, role) || exec.parent !== undefined) return 'Studio tool denied: INVALID_EXECUTION'
+    if (role === 'assistant' && isAssistantTool(exec.name)) return undefined
+    if (role !== 'document-worker' || exec.name !== TOOL) return 'Studio tool denied: INVALID_EXECUTION'
     const result = store.authorize(agent.id, exec.arguments, exec.callId)
     if (!result.ok) return `Managed write denied: ${result.reason}`
     permits.set(exec.token, result.value)
@@ -158,15 +182,21 @@ export function apply(context: Context, { stateDir }: Config): void {
   }))
   ctx.on('tools/result', exec => { permits.delete(exec.token); return undefined })
   ctx.on('agent/created', ({ agent }) => { configure(agent); return undefined })
-  ctx.on('agent/disposed', ({ agent }) => { scopes.get(agent)?.(); scopes.delete(agent) })
+  ctx.on('agent/disposed', ({ agent }) => { scopes.get(agent)?.dispose(); scopes.delete(agent) })
   ctx.on('agent-preset/selected', (id, preset) => {
-    if (preset !== PRESET) return
+    if (preset !== PRESET && preset !== ASSISTANT_PRESET) return
     const agent = ctx.agents.get(id as SessionId)
     if (agent) configure(agent)
   })
+  ctx.on('agent/pre-step', async ({ agent, turn, messages }, next) => {
+    const role = scopes.get(agent)?.role
+    if (role === 'assistant' && !ready(agent, role)) return { kind: 'reject' }
+    if (role === 'draft-worker' && !drafts.admit(agent, messages, turn)) return { kind: 'reject' }
+    return next()
+  })
   for (const agent of ctx.agents.list()) configure(agent)
 
-  // DSH Web authorizes commands.execute through its native remote access checks. This plugin adds no model control tool and grants no access to shared roles.
+  // DSH Web authorizes commands.execute through its native remote access checks. Document authorization stays user-only.
   ctx.effect(() => ctx.commands.register({
     name: 'studio-doc',
     description: 'Manage a document task in this managed worker Session.',
@@ -175,7 +205,7 @@ export function apply(context: Context, { stateDir }: Config): void {
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()
       if (!available || !controlReady(ctx)) return rejected('CONTROL_UNAVAILABLE')
-      if (!currentSession(agent) || !matchingPreset(agent) || !scopes.has(agent) || !restricted(agent)) return rejected('MANAGED_SESSION_REQUIRED')
+      if (!ready(agent, 'document-worker')) return rejected('MANAGED_SESSION_REQUIRED')
       // This command commits control state without queuing a Worker message or cancelling the turn. The action checks that state before committing.
       if (rawInput.length > TEXT_LIMIT * 12 + 128) return rejected('INPUT_TOO_LARGE')
       const [, verb, argument = ''] = /^\s*(\S+)(?:\s+([\s\S]*))?$/.exec(rawInput.trim()) ?? []
@@ -203,5 +233,20 @@ export function apply(context: Context, { stateDir }: Config): void {
       return rejected('INVALID_CONTROL_COMMAND')
     },
   }))
-  ctx.logger.info('SuperAgent managed document Worker ready (no GitHub source)')
+  ctx.effect(() => ctx.commands.register({
+    name: 'studio-result',
+    description: 'Read a Studio Worker result without running a model.',
+    input: { hint: '[task-id]' },
+    recordInput: false,
+    handler({ agent, rawInput, signal }) {
+      signal.throwIfAborted()
+      if (!ready(agent, 'assistant')) return { kind: 'error', text: 'Open a Studio Assistant Session to read Studio results.' }
+      const id = rawInput.trim()
+      if (id && !z.uuid().safeParse(id).success) return { kind: 'error', text: 'Expected one Studio task ID, or no ID for the latest task in this Session.' }
+      const result = store.readDraft(agent.id, id || undefined)
+      if (!result.ok) return { kind: 'error', text: `Cannot read Studio result: ${result.reason}.` }
+      return { kind: 'success', text: draftOutput(result.value).text }
+    },
+  }))
+  ctx.logger.info('SuperAgent Studio ready (no GitHub source)')
 }

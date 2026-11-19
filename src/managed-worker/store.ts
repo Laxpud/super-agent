@@ -1,4 +1,4 @@
-/** Current execution authority, single-document authorization, and commit audit records for managed Workers. */
+/** Durable execution authority for managed document Workers and Studio text drafts. */
 import { randomUUID } from 'node:crypto'
 import { chmodSync, closeSync, fchmodSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
@@ -27,6 +27,46 @@ export interface ManagedWritePermit {
   readonly toolCallId: string
   readonly expectedVersion: 1
   readonly text: string
+}
+
+/** Maximum request and result length in UTF-16 code units. */
+export const DRAFT_TEXT_LIMIT = 32_000
+
+/** Snapshot of the Worker's final text message and its event coordinates. */
+export interface StudioDraftResult {
+  text: string
+  messageId: string
+  eventSeq: number
+  turn: number
+}
+
+export interface StudioDraftTask {
+  taskId: string
+  assistantBotId: string
+  assistantSessionId: string
+  sourceMessageId: string
+  sourceRequestId: string
+  workerBotId: string
+  workerSessionId: string
+  executionEpoch: number
+  state: 'running' | 'completed' | 'failed' | 'interrupted'
+  result?: StudioDraftResult
+  failure?: string
+}
+
+/** Source coordinates describe the GUI request; they are not a permit for any action. */
+export interface StudioDraftInput {
+  assistantSessionId: string
+  sourceMessageId: string
+  sourceRequestId: string
+  workerSessionId: string
+  requestText: string
+}
+
+export interface StudioDraftExecution {
+  taskId: string
+  workerSessionId: string
+  executionEpoch: number
 }
 
 type Rejection = Extract<ManagedResult<never>, { ok: false }>
@@ -86,11 +126,72 @@ const SCHEMA = `
     PRIMARY KEY (task_id, authorization_version),
     FOREIGN KEY (task_id, execution_epoch) REFERENCES managed_session_binding (task_id, execution_epoch)
   ) STRICT;
+  CREATE TABLE IF NOT EXISTS studio_assistant_bot (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    bot_id TEXT NOT NULL UNIQUE
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS studio_assistant_binding (
+    session_id TEXT PRIMARY KEY,
+    bot_id TEXT NOT NULL REFERENCES studio_assistant_bot (bot_id),
+    UNIQUE (session_id, bot_id)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS studio_draft_task (
+    seq INTEGER PRIMARY KEY,
+    task_id TEXT NOT NULL UNIQUE,
+    assistant_bot_id TEXT NOT NULL,
+    assistant_session_id TEXT NOT NULL,
+    source_message_id TEXT NOT NULL,
+    source_request_id TEXT NOT NULL,
+    request_text TEXT NOT NULL,
+    worker_bot_id TEXT NOT NULL UNIQUE,
+    worker_session_id TEXT NOT NULL UNIQUE,
+    execution_epoch INTEGER NOT NULL CHECK (execution_epoch BETWEEN 1 AND 9007199254740991),
+    run_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('running', 'completed', 'failed', 'interrupted')),
+    result_text TEXT,
+    result_message_id TEXT,
+    result_event_seq INTEGER CHECK (result_event_seq BETWEEN 0 AND 9007199254740991),
+    result_turn INTEGER CHECK (result_turn BETWEEN 1 AND 9007199254740991),
+    failure TEXT,
+    FOREIGN KEY (assistant_session_id, assistant_bot_id) REFERENCES studio_assistant_binding (session_id, bot_id),
+    UNIQUE (assistant_session_id, source_request_id),
+    CHECK (assistant_session_id <> worker_session_id),
+    CHECK ((state = 'completed' AND result_text IS NOT NULL AND result_message_id IS NOT NULL
+      AND result_event_seq IS NOT NULL AND result_turn IS NOT NULL AND failure IS NULL)
+      OR (state <> 'completed' AND result_text IS NULL AND result_message_id IS NULL
+        AND result_event_seq IS NULL AND result_turn IS NULL AND (failure IS NULL) = (state = 'running')))
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS studio_draft_session_latest ON studio_draft_task (assistant_session_id, seq DESC);
 `
 
 const isText = (value: unknown): value is string => typeof value === 'string' && value.isWellFormed()
 const isId = (value: unknown): value is string => isText(value) && value.length > 0 && !value.includes('\0')
 const isVersion = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 1
+const isDraftText = (value: unknown): value is string => isText(value) && value.length > 0 && value.length <= DRAFT_TEXT_LIMIT
+const isEventSeq = (value: unknown): value is number => value === 0 || isVersion(value)
+
+/** Decode the stored snapshot without casting unchecked SQL values into a public task. */
+function readDraftRow(row: Record<string, SQLOutputValue>): StudioDraftTask {
+  const { task_id: taskId, assistant_bot_id: assistantBotId, assistant_session_id: assistantSessionId,
+    source_message_id: sourceMessageId, source_request_id: sourceRequestId, worker_bot_id: workerBotId,
+    worker_session_id: workerSessionId, execution_epoch: executionEpoch, state, result_text: text,
+    result_message_id: messageId, result_event_seq: eventSeq, result_turn: turn, failure } = row
+  if (!isId(taskId) || !isId(assistantBotId) || !isId(assistantSessionId) || !isId(sourceMessageId) || !isId(sourceRequestId)
+    || !isId(workerBotId) || !isId(workerSessionId) || !isVersion(executionEpoch)
+    || (state !== 'running' && state !== 'completed' && state !== 'failed' && state !== 'interrupted')) {
+    throw new Error('Invalid Studio draft task')
+  }
+  const task: StudioDraftTask = { taskId, assistantBotId, assistantSessionId, sourceMessageId, sourceRequestId,
+    workerBotId, workerSessionId, executionEpoch, state }
+  if (state === 'completed') {
+    if (!isDraftText(text) || !isId(messageId) || !isEventSeq(eventSeq) || !isVersion(turn)) throw new Error('Invalid Studio draft result')
+    task.result = { text, messageId, eventSeq, turn }
+  } else if (state !== 'running') {
+    if (!isDraftText(failure)) throw new Error('Invalid Studio draft failure')
+    task.failure = failure
+  }
+  return task
+}
 
 /** Restrict file permissions in the trusted host directory before SQLite opens the files. Reject symlinks and other non-regular files. */
 function privateFile(path: string, create: boolean): void {
@@ -149,6 +250,11 @@ export class ManagedWorkerStore {
         const previous = this.db.prepare('SELECT clean FROM managed_host_run WHERE singleton = 1').get()
         // A failed pause may have left no task ID in durable storage. A dirty run (or a pre-fence database) cannot carry forward any pending write authorization.
         const recoveredTasks = previous?.clean === 1 ? 0 : this.pauseUnfinishedTasks()
+        // A draft can never be resumed by a new host run, even after a clean stop.
+        this.db.exec(`UPDATE studio_draft_task SET state = 'interrupted', failure = 'HOST_RESTARTED' WHERE state = 'running'`)
+        if (this.db.prepare("SELECT 1 FROM studio_draft_task WHERE state = 'running' LIMIT 1").get()) {
+          throw new Error('Cannot interrupt previous Studio drafts')
+        }
         requireWrite(this.db.prepare(`INSERT INTO managed_host_run VALUES (1, ?, 0)
           ON CONFLICT (singleton) DO UPDATE SET run_id = excluded.run_id, clean = 0`).run(this.#runId).changes)
         return accept(recoveredTasks)
@@ -208,6 +314,122 @@ export class ManagedWorkerStore {
     return { taskId: row.task_id, executionEpoch: row.execution_epoch }
   }
 
+  /** Give each Assistant Session the same durable Bot identity without changing an existing Session role. */
+  bindAssistant(sessionId: string): ManagedResult<string> {
+    if (!isId(sessionId)) return deny('INVALID_INPUT')
+    return this.write(() => {
+      if (this.binding(sessionId) || this.draftBinding(sessionId)) return deny('SESSION_ALREADY_BOUND')
+      const existing = this.assistantBinding(sessionId)
+      if (existing) return accept(existing)
+      const bot = this.db.prepare('SELECT bot_id FROM studio_assistant_bot WHERE singleton = 1').get()
+      const botId = bot ? bot.bot_id : randomUUID()
+      if (!isId(botId)) throw new Error('Invalid Studio Assistant Bot ID')
+      if (!bot) requireWrite(this.db.prepare('INSERT INTO studio_assistant_bot VALUES (1, ?)').run(botId).changes)
+      requireWrite(this.db.prepare('INSERT INTO studio_assistant_binding VALUES (?, ?)').run(sessionId, botId).changes)
+      return accept(botId)
+    })
+  }
+
+  /** Read the persisted Assistant role. Invalid input or storage errors are not an unbound result. */
+  assistantBinding(sessionId: string): string | undefined {
+    if (!isId(sessionId)) throw new Error('Invalid Studio Assistant session ID')
+    const row = this.db.prepare('SELECT bot_id FROM studio_assistant_binding WHERE session_id = ?').get(sessionId)
+    if (!row) return
+    if (!isId(row.bot_id)) throw new Error('Invalid Studio Assistant binding')
+    return row.bot_id
+  }
+
+  /** Keep classifying a draft Worker after its task ends; a historical execution does not grant document tools. */
+  draftBinding(sessionId: string): StudioDraftExecution | undefined {
+    if (!isId(sessionId)) throw new Error('Invalid Studio draft Worker session ID')
+    const row = this.db.prepare('SELECT task_id, execution_epoch FROM studio_draft_task WHERE worker_session_id = ?').get(sessionId)
+    if (!row) return
+    const { task_id: taskId, execution_epoch: executionEpoch } = row
+    if (!isId(taskId) || !isVersion(executionEpoch)) throw new Error('Invalid Studio draft binding')
+    return { taskId, workerSessionId: sessionId, executionEpoch }
+  }
+
+  /** Reserve a Worker Session before launching it. Only a new GUI request may create another draft. */
+  startDraft(input: StudioDraftInput): ManagedResult<{ task: StudioDraftTask; created: boolean }> {
+    if (!input) return deny('INVALID_INPUT')
+    const { assistantSessionId, sourceMessageId, sourceRequestId, workerSessionId, requestText } = input
+    if (!isId(assistantSessionId) || !isId(sourceMessageId) || !isId(sourceRequestId) || !isId(workerSessionId)
+      || !isDraftText(requestText)) return deny('INVALID_INPUT')
+    return this.write<{ task: StudioDraftTask; created: boolean }>(() => {
+      const assistantBotId = this.assistantBinding(assistantSessionId)
+      if (!assistantBotId) return deny('SESSION_NOT_BOUND')
+      // Check the original request before the proposed Worker so duplicate delivery cannot create another execution.
+      const existing = this.db.prepare('SELECT * FROM studio_draft_task WHERE assistant_session_id = ? AND source_request_id = ?')
+        .get(assistantSessionId, sourceRequestId)
+      if (existing) return accept({ task: readDraftRow(existing), created: false })
+      if (this.sessionBound(workerSessionId)) return deny('SESSION_ALREADY_BOUND')
+      const taskId = randomUUID()
+      const workerBotId = randomUUID()
+      requireWrite(this.db.prepare(`INSERT INTO studio_draft_task (task_id, assistant_bot_id, assistant_session_id, source_message_id,
+        source_request_id, request_text, worker_bot_id, worker_session_id, execution_epoch, run_id, state)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'running')`)
+        .run(taskId, assistantBotId, assistantSessionId, sourceMessageId, sourceRequestId, requestText, workerBotId, workerSessionId, this.#runId).changes)
+      return accept({ task: { taskId, assistantBotId, assistantSessionId, sourceMessageId, sourceRequestId,
+        workerBotId, workerSessionId, executionEpoch: 1, state: 'running' }, created: true })
+    })
+  }
+
+  /** Persist the final message snapshot only for the exact running execution. */
+  completeDraft(execution: StudioDraftExecution, result: StudioDraftResult): ManagedResult<StudioDraftTask> {
+    if (!result) return deny('INVALID_INPUT')
+    const { text, messageId, eventSeq, turn } = result
+    if (!isDraftText(text) || !isId(messageId) || !isEventSeq(eventSeq) || !isVersion(turn)) return deny('INVALID_INPUT')
+    return this.finishDraft(execution, { text, messageId, eventSeq, turn })
+  }
+
+  /** Stop the exact execution without replacing any previously recorded outcome. */
+  failDraft(execution: StudioDraftExecution, reason: string): ManagedResult<StudioDraftTask> {
+    if (!isDraftText(reason)) return deny('INVALID_INPUT')
+    return this.finishDraft(execution, reason)
+  }
+
+  private finishDraft(execution: StudioDraftExecution, outcome: StudioDraftResult | string): ManagedResult<StudioDraftTask> {
+    if (!execution) return deny('INVALID_INPUT')
+    const { taskId, workerSessionId, executionEpoch } = execution
+    if (!isId(taskId) || !isId(workerSessionId) || !isVersion(executionEpoch)) return deny('INVALID_INPUT')
+    return this.write(() => {
+      const row = this.db.prepare(`SELECT * FROM studio_draft_task
+        WHERE task_id = ? AND worker_session_id = ? AND execution_epoch = ? AND run_id = ?`)
+        .get(taskId, workerSessionId, executionEpoch, this.#runId)
+      if (!row) return deny('STALE_EXECUTION')
+      const task = readDraftRow(row)
+      if (task.state !== 'running') return deny('TASK_NOT_RUNNING')
+      const failed = typeof outcome === 'string'
+      const state = failed ? 'failed' : 'completed'
+      requireWrite(this.db.prepare(`UPDATE studio_draft_task SET state = ?, result_text = ?, result_message_id = ?,
+        result_event_seq = ?, result_turn = ?, failure = ?
+        WHERE task_id = ? AND worker_session_id = ? AND execution_epoch = ? AND run_id = ? AND state = 'running'`)
+        .run(state, failed ? null : outcome.text, failed ? null : outcome.messageId, failed ? null : outcome.eventSeq,
+          failed ? null : outcome.turn, failed ? outcome : null, taskId, workerSessionId, executionEpoch, this.#runId).changes)
+      return accept(failed ? { ...task, state: 'failed', failure: outcome } : { ...task, state: 'completed', result: outcome })
+    })
+  }
+
+  /** An explicit task ID can follow the Assistant Bot across Sessions; the implicit lookup stays in this Session. */
+  readDraft(assistantSessionId: string, taskId?: string): ManagedResult<StudioDraftTask> {
+    if (!isId(assistantSessionId) || (taskId !== undefined && !isId(taskId))) return deny('INVALID_INPUT')
+    try {
+      const assistantBotId = this.assistantBinding(assistantSessionId)
+      if (!assistantBotId) return deny('SESSION_NOT_BOUND')
+      const row = taskId === undefined
+        ? this.db.prepare(`SELECT * FROM studio_draft_task WHERE assistant_session_id = ? AND assistant_bot_id = ?
+          ORDER BY seq DESC LIMIT 1`).get(assistantSessionId, assistantBotId)
+        : this.db.prepare('SELECT * FROM studio_draft_task WHERE task_id = ? AND assistant_bot_id = ?').get(taskId, assistantBotId)
+      return row ? accept(readDraftRow(row)) : deny('TASK_NOT_FOUND')
+    } catch {
+      return deny('STORAGE_ERROR')
+    }
+  }
+
+  private sessionBound(sessionId: string): boolean {
+    return !!(this.binding(sessionId) || this.assistantBinding(sessionId) || this.draftBinding(sessionId))
+  }
+
   /** Show the current authorization version without exposing document text or treating an unconfirmed pause as active. */
   status(sessionId: string): ManagedResult<ManagedTask> {
     if (!isId(sessionId)) return deny('INVALID_INPUT')
@@ -224,7 +446,7 @@ export class ManagedWorkerStore {
   create(sessionId: string, initialText: string, approvedText: string, commandId: string): ManagedResult<ManagedTask> {
     if (!isId(sessionId) || !isText(initialText) || !isText(approvedText) || !isId(commandId)) return deny('INVALID_INPUT')
     return this.write(() => {
-      if (this.binding(sessionId)) return deny('SESSION_ALREADY_BOUND')
+      if (this.sessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
       if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
       const taskId = randomUUID()
       requireWrite(this.db.prepare('INSERT INTO managed_task VALUES (?, 1, 1, 0, ?)').run(taskId, approvedText).changes)
@@ -282,7 +504,7 @@ export class ManagedWorkerStore {
       if (!task) return deny('TASK_NOT_FOUND')
       if (task.executionEpoch !== expectedEpoch) return deny('STALE_EXECUTION')
       if (this.isFrozen(task)) return deny('PAUSE_UNCONFIRMED')
-      if (this.binding(nextSessionId)) return deny('SESSION_ALREADY_BOUND')
+      if (this.sessionBound(nextSessionId)) return deny('SESSION_ALREADY_BOUND')
       if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
       const next = { ...task, workerSessionId: nextSessionId, executionEpoch: expectedEpoch + 1, authorizationVersion: task.authorizationVersion + 1 }
       requireWrite(this.db.prepare('INSERT INTO managed_session_binding VALUES (?, ?, ?)').run(nextSessionId, taskId, next.executionEpoch).changes)
@@ -321,6 +543,8 @@ export class ManagedWorkerStore {
       const current = this.currentTask(sessionId)
       if (!current.ok) return current
       const task = current.value
+      // Even if conflicting role bindings exist, Studio Sessions cannot receive document permits.
+      if (this.assistantBinding(sessionId) || this.draftBinding(sessionId)) return deny('SESSION_ALREADY_BOUND')
       const blocked = this.executionBlocked(task)
       if (blocked) return blocked
       if (this.actionUsed(sessionId, toolCallId)) return deny('DUPLICATE_ACTION')
