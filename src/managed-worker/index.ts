@@ -9,6 +9,7 @@ import s from '@deepseek-ai/schemastery'
 import { lockSync } from 'proper-lockfile'
 import { z } from 'zod'
 import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool } from './assistant.ts'
+import { FeishuDocumentInboxConfig, StudioFeishuInbox, validateFeishuInbox } from './feishu-inbox.ts'
 import { captureDocumentInstructions, documentHoldError, instructionCommand } from './instructions.ts'
 import { LEADER_PRESET, StudioProjectControl, isLeaderTool } from './project.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
@@ -18,6 +19,8 @@ export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'perm
 export const Config = s.object({
   stateDir: s.string().required().description('Absolute directory reserved for the Studio database.'),
   guiDocumentInbox: s.boolean().default(false).description('Hold pending document writes for owner review when a new chat message arrives in the bound document Worker.'),
+  feishuDocumentInbox: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
+    .description('Optional, separately configured single-owner Feishu inbox for a managed document.'),
 })
 type Config = ReturnType<typeof Config>
 
@@ -77,14 +80,18 @@ function receipt(operation: string, result: ManagedResult<ManagedTask>, showResu
 }
 
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
-export function apply(context: Context, { stateDir, guiDocumentInbox }: Config): void {
+export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocumentInbox }: Config): void {
   const ctx = localOwnerHost(context)
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
+  if (feishuDocumentInbox) validateFeishuInbox(feishuDocumentInbox)
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   let available = true
+  const channelStop = new AbortController()
+  let channelRun: Promise<void> | undefined
   // Reserve the directory for one host. The SQLite run fence also rejects commits from a prior holder of the lock.
   const unlock = lockSync(stateDir, { stale: 30_000, onCompromised(error) {
     available = false
+    channelStop.abort()
     ctx.logger.error('Managed Worker lost its state directory lock: %s', String(error))
   } })
   let store: ManagedWorkerStore
@@ -103,6 +110,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox }: Config):
     && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
   const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), agent => ready(agent, 'draft-worker'))
   const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'))
+  const feishu = feishuDocumentInbox && new StudioFeishuInbox(ctx, store, stateDir, feishuDocumentInbox, () => available && controlReady(ctx))
 
   /** A persisted binding wins over the picker, so a retired or finished Worker cannot become a different role on resume. */
   function roleOf(agent: Agent): StudioRole | undefined {
@@ -116,12 +124,15 @@ export function apply(context: Context, { stateDir, guiDocumentInbox }: Config):
     if (preset === PRESET) return 'document-worker'
   }
 
-  ctx.effect(() => () => {
+  ctx.effect(() => async () => {
     const heldLock = available
     available = false
+    channelStop.abort()
     drafts.stop()
     permits.clear()
     try {
+      // The channel cannot register after admission is closed. Drain its child process and receipts before closing the Store.
+      if (channelRun) await channelRun
       for (const scope of scopes.values()) scope.dispose()
       scopes.clear()
       // Admit no work after marking the run clean. A lost lock or failed shutdown leaves recovery to the next run.
@@ -214,7 +225,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox }: Config):
   ctx.effect(() => ctx.commands.register({
     name: 'studio-doc',
     description: 'Manage a document task in this managed worker Session.',
-    input: { hint: 'start <JSON> | status | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review <instruction-id> <authorization-version> <unchanged|pause>' },
+    input: { hint: 'start <JSON> | status | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review <instruction-id> <authorization-version> <unchanged|pause> | feishu-status | bind-feishu' },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()
@@ -226,6 +237,13 @@ export function apply(context: Context, { stateDir, guiDocumentInbox }: Config):
       // Keep review available even after capture is disabled; toggling the listener must not clear a durable pending hold.
       const instruction = instructionCommand(store, agent.id, commandId, verb, argument)
       if (instruction) return instruction
+      if ((verb === 'feishu-status' || verb === 'bind-feishu') && !argument) {
+        if (!feishu) return rejected('FEISHU_INBOX_DISABLED')
+        if (verb === 'feishu-status') return { kind: 'success', text: feishu.status() }
+        const result = feishu.bind(agent.id, commandId)
+        if (!result.ok) return documentHoldError(result.reason) ?? rejected(result.reason)
+        return { kind: 'success', text: `The configured Feishu private chat is linked to task ${result.value.taskId}. Incoming messages require review; no write scope or pause changed.` }
+      }
       if (verb === 'start') {
         let json: unknown
         try { json = JSON.parse(argument) } catch { return rejected('INVALID_START_JSON') }
@@ -275,5 +293,6 @@ export function apply(context: Context, { stateDir, guiDocumentInbox }: Config):
       return projects.command(agent, commandId, rawInput, ready(agent, 'assistant') || ready(agent, 'leader'))
     },
   }))
+  if (feishu) channelRun = feishu.run(channelStop.signal)
   ctx.logger.info('SuperAgent Studio ready (no GitHub source)')
 }

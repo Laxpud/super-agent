@@ -5,8 +5,10 @@ import { dirname, resolve } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
 import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
-  type StudioInstructionInput } from './instruction-store.js'
+  type StudioFeishuInstruction, type StudioInstructionInput } from './instruction-store.js'
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
+
+export type { StudioFeishuInstruction } from './instruction-store.js'
 
 /** A failure does not confirm a write. Use the reason to block the action or guide the user through a retry. */
 export type ManagedResult<T> = { ok: true; value: T } | { ok: false; reason: string }
@@ -70,6 +72,12 @@ export interface StudioDraftExecution {
   taskId: string
   workerSessionId: string
   executionEpoch: number
+}
+
+type FeishuInstructionReceipt = {
+  disposition: 'recorded' | 'duplicate' | 'unbound' | 'finished'
+  taskId?: string
+  late?: boolean
 }
 
 type Rejection = Extract<ManagedResult<never>, { ok: false }>
@@ -463,21 +471,75 @@ export class ManagedWorkerStore {
       if (channel !== 'gui' || sourceScope !== sessionId) return deny('INVALID_INPUT')
       const { requestId, messageId, eventSeq, sourceTimeMs, text } = input
       const source: StudioInstructionInput = { channel, sourceScope, requestId, messageId, eventSeq, sourceTimeMs, text }
-      const result = this.write<{ recorded: boolean }>(() => {
+      return this.captureInstruction<{ recorded: boolean }>(() => {
         const current = this.currentTask(sessionId)
         if (!current.ok || current.value.documentVersion !== 1) return accept({ recorded: false })
-        const { taskId, executionEpoch, authorizationVersion } = current.value
-        if (!this.instructions.record(taskId, executionEpoch, source)) return accept({ recorded: false })
-        // Preserve the approved text and pause state, but invalidate every permit issued before this input.
-        requireWrite(this.db.prepare(`UPDATE managed_task SET authorization_version = authorization_version + 1
-          WHERE task_id = ? AND execution_epoch = ? AND authorization_version = ?`)
-          .run(taskId, executionEpoch, authorizationVersion).changes)
+        const task = current.value
+        if (!this.instructions.record(task.taskId, task.executionEpoch, source)) return accept({ recorded: false })
+        this.invalidatePriorPermits(task)
         return accept({ recorded: true })
       })
-      if (result.ok) return result
-    } catch { /* Source could not be read safely. Treat it as an unconfirmed capture. */ }
+    } catch {
+      // Source fields could not be read safely, even before opening the transaction.
+      return this.unconfirmedCapture()
+    }
+  }
+
+  /** Link this current version 1 document to one host-validated scope, without changing its authorization. */
+  linkFeishuDocument(sessionId: string, sourceScope: string, commandId: string): ManagedResult<ManagedTask> {
+    if (!isId(sessionId) || !isId(sourceScope) || !isId(commandId)) return deny('INVALID_INPUT')
+    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
+    return this.write(() => {
+      const current = this.currentTask(sessionId)
+      if (!current.ok) return current
+      const task = current.value
+      if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
+      const boundTask = this.instructions.feishuTask(sourceScope)
+      // The first binding remains the audit record, even if the current session has since changed.
+      if (boundTask === task.taskId) return current
+      if (boundTask !== undefined) return deny('FEISHU_SCOPE_ALREADY_BOUND')
+      if (this.instructions.hasFeishuScope(task.taskId)) return deny('TASK_ALREADY_BOUND')
+      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
+      this.instructions.linkFeishu(task.taskId, sessionId, sourceScope, commandId)
+      return current
+    })
+  }
+
+  /** Capture an authenticated Feishu delivery at the fixed target's current epoch, including while paused. */
+  receiveFeishuInstruction(input: StudioFeishuInstruction): ManagedResult<FeishuInstructionReceipt> {
+    return this.captureInstruction<FeishuInstructionReceipt>(() => {
+      const { channel, sourceScope } = input
+      if (channel !== 'feishu' || !isId(sourceScope)) throw new Error('Invalid Studio Feishu scope')
+      const taskId = this.instructions.feishuTask(sourceScope)
+      if (taskId === undefined) return accept({ disposition: 'unbound' })
+      const task = this.task(taskId)
+      if (!task) throw new Error('Missing task or document for Studio Feishu binding')
+      if (task.documentVersion !== 1) return accept({ disposition: 'finished', taskId })
+      const { requestId, messageId, eventSeq, sourceTimeMs, text, senderId, parentId, rootId, threadId } = input
+      const recorded = this.instructions.recordFeishu(taskId, task.executionEpoch,
+        { channel, sourceScope, requestId, messageId, eventSeq, sourceTimeMs, text, senderId, parentId, rootId, threadId })
+      if (!recorded) return accept({ disposition: 'duplicate', taskId })
+      this.invalidatePriorPermits(task)
+      return accept({ disposition: 'recorded', taskId, late: recorded.late })
+    })
+  }
+
+  /** Use the document write fence for every capture; any unconfirmed outcome keeps this run blocked. */
+  private captureInstruction<T>(operation: () => ManagedResult<T>): ManagedResult<T> {
+    const result = this.write(operation)
+    return result.ok ? result : this.unconfirmedCapture()
+  }
+
+  private unconfirmedCapture(): Rejection {
     this.captureFault = true
     return deny('INSTRUCTION_UNCONFIRMED')
+  }
+
+  /** In the capture transaction, invalidate old permits without clearing a pause or changing approved text. */
+  private invalidatePriorPermits(task: ManagedTask): void {
+    requireWrite(this.db.prepare(`UPDATE managed_task SET authorization_version = authorization_version + 1
+      WHERE task_id = ? AND execution_epoch = ? AND authorization_version = ?`)
+      .run(task.taskId, task.executionEpoch, task.authorizationVersion).changes)
   }
 
   /** Read the oldest pending item and its authorization version. An incomplete ledger cannot attest that the inbox is empty. */

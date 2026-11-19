@@ -63,10 +63,16 @@ export function instructionCommand(store: ManagedWorkerStore, sessionId: string,
     const { task, pending, remaining } = result.value
     const state = `Task ${task.taskId}; authorization version ${task.authorizationVersion}; ${remaining} pending; ${task.paused ? 'paused' : 'not paused'}.`
     if (!pending) return { kind: 'success', text: state }
-    const { source } = pending
-    const original = source.text === null ? 'The input is not retained as text here. Read the original message in the Session before reviewing.' : source.text
+    const { source, feishu } = pending
+    const location = feishu ? 'the Feishu private chat' : 'the original Web Session'
+    const original = source.text ?? `The input is not retained as text here. Read the original message in ${location} before reviewing.`
+    // Sequence is local to the Web Session. Feishu has its own source time and references, which do not order it against Web messages.
+    const coordinates = feishu
+      ? `sent ${new Date(source.sourceTimeMs).toISOString()}${feishu.parentId ? `; replies to ${feishu.parentId}` : ''}`
+      : `event ${source.eventSeq ?? 'unavailable'}`
+    const ordering = feishu?.late ? 'Older than a Feishu message already registered for this chat. Verify the order before deciding.\n' : ''
     return { kind: 'success', text: `${state}\nWrites are blocked until all pending input is reviewed, even if the task is not paused.\n`
-      + `Instruction ${pending.instructionId}; ${source.channel} message ${source.messageId}; event ${source.eventSeq ?? 'unavailable'}.\n`
+      + `Instruction ${pending.instructionId}; ${source.channel} message ${source.messageId}; ${coordinates}.\n${ordering}`
       + `Review: /studio-doc review ${pending.instructionId} ${task.authorizationVersion} <unchanged|pause>\n\n${original}` }
   }
   const parsed = reviewArgs.safeParse(argument.split(/\s+/))

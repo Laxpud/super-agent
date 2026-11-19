@@ -13,9 +13,19 @@ export interface StudioInstructionInput {
   text: string | null
 }
 
+/** Feishu coordinates from a delivery already authenticated by the host. */
+export interface StudioFeishuInstruction extends StudioInstructionInput {
+  channel: 'feishu'
+  senderId: string
+  parentId?: string
+  rootId?: string
+  threadId?: string
+}
+
 export interface StudioDocumentInstruction {
   instructionId: string
   source: StudioInstructionInput
+  feishu?: Pick<StudioFeishuInstruction, 'senderId' | 'parentId' | 'rootId' | 'threadId'> & { late: boolean }
 }
 
 export type InstructionDecision = 'unchanged' | 'pause'
@@ -48,6 +58,23 @@ export const INSTRUCTION_SCHEMA = `
   ) STRICT;
   CREATE INDEX IF NOT EXISTS studio_document_instruction_pending
     ON studio_document_instruction (task_id, seq) WHERE state = 'pending';
+  CREATE TABLE IF NOT EXISTS studio_document_feishu_binding (
+    source_scope TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL UNIQUE REFERENCES managed_task (task_id),
+    session_id TEXT NOT NULL REFERENCES managed_session_binding (session_id),
+    command_id TEXT NOT NULL UNIQUE,
+    at TEXT NOT NULL
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS studio_document_feishu_instruction (
+    instruction_id TEXT PRIMARY KEY REFERENCES studio_document_instruction (instruction_id),
+    sender_id TEXT NOT NULL,
+    parent_id TEXT,
+    root_id TEXT,
+    thread_id TEXT,
+    late INTEGER NOT NULL CHECK (late IN (0, 1))
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS studio_document_instruction_feishu_time
+    ON studio_document_instruction (source_scope, source_time_ms) WHERE channel = 'feishu';
 `
 
 const isId = (value: unknown): value is string => typeof value === 'string' && value.length > 0
@@ -69,21 +96,66 @@ function requireWrite(changes: number | bigint): void {
 export class InstructionStore {
   constructor(private readonly database: () => DatabaseSync) {}
 
-  /** Keep the first delivery of each source request, including across reviews and restarts. */
+  /** Read the fixed target, not a candidate inferred from recent activity or a session name. */
+  feishuTask(sourceScope: string): string | undefined {
+    const row = this.database().prepare('SELECT task_id FROM studio_document_feishu_binding WHERE source_scope = ?').get(sourceScope)
+    if (!row) return
+    if (!isId(row.task_id)) throw new Error('Invalid Studio Feishu binding')
+    return row.task_id
+  }
+
+  hasFeishuScope(taskId: string): boolean {
+    return !!this.database().prepare('SELECT 1 FROM studio_document_feishu_binding WHERE task_id = ?').get(taskId)
+  }
+
+  /** Record the original binding command without changing any authorization or pending instruction. */
+  linkFeishu(taskId: string, sessionId: string, sourceScope: string, commandId: string): void {
+    requireWrite(this.database().prepare(`INSERT INTO studio_document_feishu_binding
+      (source_scope, task_id, session_id, command_id, at) VALUES (?, ?, ?, ?, ?)`)
+      .run(sourceScope, taskId, sessionId, commandId, new Date().toISOString()).changes)
+  }
+
   record(taskId: string, epoch: number, source: StudioInstructionInput): boolean {
+    return this.recordSource(taskId, epoch, source) !== undefined
+  }
+
+  /** Keep causal evidence on the same pending row; a strictly older source time is a review hint only. */
+  recordFeishu(taskId: string, epoch: number, source: StudioFeishuInstruction): { late: boolean } | undefined {
+    if (source.channel !== 'feishu' || source.requestId !== source.messageId || source.eventSeq !== null) {
+      throw new Error('Invalid Studio Feishu source coordinates')
+    }
+    const instructionId = this.recordSource(taskId, epoch, source)
+    if (instructionId === undefined) return
+    const { senderId, parentId, rootId, threadId } = source
+    if (!isId(senderId) || [parentId, rootId, threadId].some(id => id !== undefined && !isId(id))) {
+      throw new Error('Invalid Studio Feishu causal evidence')
+    }
+    const db = this.database()
+    // Include already reviewed deliveries; the newly inserted row cannot satisfy the strict comparison against its own time.
+    const late = !!db.prepare(`SELECT 1 FROM studio_document_instruction
+      WHERE channel = 'feishu' AND source_scope = ? AND source_time_ms > ? LIMIT 1`).get(source.sourceScope, source.sourceTimeMs)
+    requireWrite(db.prepare(`INSERT INTO studio_document_feishu_instruction
+      (instruction_id, sender_id, parent_id, root_id, thread_id, late) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(instructionId, senderId, parentId ?? null, rootId ?? null, threadId ?? null, late ? 1 : 0).changes)
+    return { late }
+  }
+
+  /** Keep the first delivery of each source request, including across reviews and restarts. */
+  private recordSource(taskId: string, epoch: number, source: StudioInstructionInput): string | undefined {
     const db = this.database()
     const { channel, sourceScope, requestId, messageId, eventSeq, sourceTimeMs, text } = source
     if (!isId(requestId)) throw new Error('Invalid Studio instruction request ID')
     if (db.prepare(`SELECT 1 FROM studio_document_instruction WHERE channel = ? AND source_scope = ? AND request_id = ?`)
-      .get(channel, sourceScope, requestId)) return false
+      .get(channel, sourceScope, requestId)) return
     if (!isSource(source)) throw new Error('Invalid Studio instruction source')
     // An explicit lookup distinguishes a known duplicate from an insert suppressed by a trigger.
+    const instructionId = randomUUID()
     requireWrite(db.prepare(`INSERT INTO studio_document_instruction (instruction_id, task_id, observed_execution_epoch,
       channel, source_scope, request_id, message_id, event_seq, source_time_ms, text, received_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(randomUUID(), taskId, epoch, channel, sourceScope, requestId, messageId, eventSeq, sourceTimeMs, text,
+      .run(instructionId, taskId, epoch, channel, sourceScope, requestId, messageId, eventSeq, sourceTimeMs, text,
         new Date().toISOString()).changes)
-    return true
+    return instructionId
   }
 
   /** Pending work is task-wide; neither runtime config nor historic source scope controls the gate. */
@@ -94,17 +166,29 @@ export class InstructionStore {
 
   /** Return the oldest pending instruction and the count from the same SQLite snapshot. */
   inbox(taskId: string): { pending?: StudioDocumentInstruction; remaining: number } {
-    const row = this.database().prepare(`SELECT instruction_id, channel, source_scope, request_id, message_id, event_seq,
-      source_time_ms, text, (SELECT COUNT(*) FROM studio_document_instruction WHERE task_id = ? AND state = 'pending') AS remaining
-      FROM studio_document_instruction WHERE task_id = ? AND state = 'pending' ORDER BY seq LIMIT 1`).get(taskId, taskId)
+    const row = this.database().prepare(`SELECT i.instruction_id, i.channel, i.source_scope, i.request_id, i.message_id, i.event_seq,
+      i.source_time_ms, i.text, f.sender_id, f.parent_id, f.root_id, f.thread_id, f.late,
+      (SELECT COUNT(*) FROM studio_document_instruction WHERE task_id = ? AND state = 'pending') AS remaining
+      FROM studio_document_instruction i LEFT JOIN studio_document_feishu_instruction f USING (instruction_id)
+      WHERE i.task_id = ? AND i.state = 'pending' ORDER BY i.seq LIMIT 1`).get(taskId, taskId)
     if (!row) return { remaining: 0 }
     const { instruction_id: instructionId, channel, source_scope: sourceScope, request_id: requestId, message_id: messageId,
-      event_seq: eventSeq, source_time_ms: sourceTimeMs, text, remaining } = row
+      event_seq: eventSeq, source_time_ms: sourceTimeMs, text, remaining,
+      sender_id: senderId, parent_id: parentId, root_id: rootId, thread_id: threadId, late } = row
     const source = { channel, sourceScope, requestId, messageId, eventSeq, sourceTimeMs, text }
     if (!isId(instructionId) || !isSource(source) || !isCoordinate(remaining) || remaining < 1) {
       throw new Error('Invalid pending Studio instruction')
     }
-    return { pending: { instructionId, source }, remaining }
+    const pending: StudioDocumentInstruction = { instructionId, source }
+    if (senderId !== null) {
+      if (channel !== 'feishu' || !isId(senderId) || (parentId !== null && !isId(parentId))
+        || (rootId !== null && !isId(rootId)) || (threadId !== null && !isId(threadId)) || (late !== 0 && late !== 1)) {
+        throw new Error('Invalid pending Studio Feishu evidence')
+      }
+      pending.feishu = { senderId, late: late === 1, ...(parentId === null ? {} : { parentId }),
+        ...(rootId === null ? {} : { rootId }), ...(threadId === null ? {} : { threadId }) }
+    }
+    return { pending, remaining }
   }
 
   /** Persist the explicit disposition and its resulting authorization version without replacing the source record. */
@@ -117,6 +201,7 @@ export class InstructionStore {
   }
 
   commandUsed(commandId: string): boolean {
-    return !!this.database().prepare('SELECT 1 FROM studio_document_instruction WHERE command_id = ?').get(commandId)
+    return !!this.database().prepare(`SELECT 1 FROM studio_document_instruction WHERE command_id = ?
+      UNION ALL SELECT 1 FROM studio_document_feishu_binding WHERE command_id = ? LIMIT 1`).get(commandId, commandId)
   }
 }

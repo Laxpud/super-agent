@@ -357,8 +357,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/assistant.ts` | Routes an admitted owner prompt to a tool-free Worker, captures the matching turn's final text, and renders its receipt and result in the original chat |
 | `src/managed-worker/project.ts` | Owner-only project commands and scope-bound Leader tools for reading the project and registering pending work |
 | `src/managed-worker/project-store.ts` | Persists projects, Leader identities, management history, and pending work; verifies the current management epoch in the write transaction |
-| `src/managed-worker/instructions.ts` | Records owner document inputs at Web inbox insertion, before a model reads them, and handles owner review commands |
-| `src/managed-worker/instruction-store.ts` | Preserves the first delivery of a source request and its review; pending inputs hold document writes regardless of the active listener configuration |
+| `src/managed-worker/instructions.ts` | Records owner document inputs at Web inbox insertion, before a model reads them, and handles review of Web and Feishu inputs |
+| `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot and accepts messages only from the configured owner chat; sends receipts independently of ledger registration |
+| `src/managed-worker/instruction-store.ts` | Preserves fixed Feishu task links, first deliveries, source evidence and their reviews; pending inputs hold document writes even when the listeners are off |
 | `src/managed-worker/store.ts` | The SQLite store for Studio Bot identities, draft results, managed documents, and project state; write authority and recovery across host runs |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
@@ -375,7 +376,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/github-channel.ts` | The GitHub Channel: comments and review thread replies, `sent` or `gone` |
 | `src/sources/github-read.ts` | CI snapshots, repository reads, the `github/` resources, and `githubThreadContext`: an Issue's or pull request's conversation by page |
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
-| `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
+| `src/sources/feishu-trigger.ts` | Validates the Feishu message envelope and maps messages to Triggers for the live, history and topic paths |
+| `src/sources/feishu-events.ts` | Streams bounded Feishu bot CLI events in order and manages readiness, failure and shutdown for both Feishu listeners |
 | `src/sources/feishu-loops.ts` | The Feishu loops: the event consumer, history recovery, chat names and polling of subscribed topics |
 | `src/sources/feishu-channel.ts` | The Feishu Channel: topic replies, `sent` or `gone` |
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |

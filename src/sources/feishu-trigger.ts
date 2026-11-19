@@ -8,11 +8,11 @@ export const SOURCE = 'feishu'
 export const feishuChannel = (chatId: string, messageId: string, direct = false): ChannelRef =>
   ({ source: SOURCE, thread: `feishu:${chatId}`, address: { chatId, messageId, ...direct ? { direct: 'true' } : {} } })
 /** A message as the live event consumer prints it; the history and topic-page paths normalize what they read into this shape. */
-const EventSchema = z.object({ message_id: z.string(), chat_id: z.string(), chat_type: z.enum(['p2p', 'group']),
+export const FeishuEventSchema = z.object({ message_id: z.string(), chat_id: z.string(), chat_type: z.enum(['p2p', 'group']),
   sender_id: z.string(), sender_type: z.enum(['user', 'bot']), content: z.string(), create_time: z.string(),
   mentions: z.array(z.object({ id: z.string(), key: z.string().optional(), name: z.string().optional() })).default([]),
   root_id: z.string().optional(), parent_id: z.string().optional(), thread_id: z.string().optional(), message_app_link: z.url().optional() })
-export type FeishuEvent = z.infer<typeof EventSchema>
+export type FeishuEvent = z.infer<typeof FeishuEventSchema>
 export const feishuThreadId = (chatId: string, rootId: string | undefined, messageId: string): string => `${chatId}:${rootId ?? messageId}`
 /** Deterministic trigger ID for a Feishu message; every read path for this message produces the same ID. */
 export const feishuTriggerId = (messageId: string): string => key('feishu', messageId)
@@ -29,7 +29,7 @@ export function feishuTime(value: string): string {
 }
 /** Converts a normalized Feishu event into a Trigger, returning undefined for messages sent by the bot itself. */
 export function feishuTrigger(input: unknown, botId: string, botAppId: string): Trigger | undefined {
-  const event = EventSchema.parse(input)
+  const event = FeishuEventSchema.parse(input)
   if (event.sender_id === botId || event.sender_id === botAppId) return
   const direct = event.chat_type === 'p2p'
   const mentioned = event.mentions.some(mention => mention.id === botId || mention.id === botAppId)
