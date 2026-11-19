@@ -1,9 +1,10 @@
-/** Durable execution authority for managed document Workers and Studio text drafts. */
+/** Durable execution authority for managed document Workers, Studio drafts, and Studio projects. */
 import { randomUUID } from 'node:crypto'
 import { chmodSync, closeSync, fchmodSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
+import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
 
 /** A failure does not confirm a write. Use the reason to block the action or guide the user through a retry. */
 export type ManagedResult<T> = { ok: true; value: T } | { ok: false; reason: string }
@@ -231,6 +232,8 @@ export class ManagedWorkerStore {
   private readonly frozenSessions = new Set<string>()
   private closed = false
   readonly recoveredTasks: number
+  /** Internal Studio project facade sharing this Store's connection and run fence. */
+  readonly projects: ProjectStore
 
   /** Open the database under the host directory lock. Do not enable actions until the recovery transaction has committed. */
   constructor(path: string) {
@@ -247,6 +250,7 @@ export class ManagedWorkerStore {
       this.db.exec('PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON')
       const started = this.transaction(() => {
         this.db.exec(SCHEMA)
+        this.db.exec(PROJECT_SCHEMA)
         const previous = this.db.prepare('SELECT clean FROM managed_host_run WHERE singleton = 1').get()
         // A failed pause may have left no task ID in durable storage. A dirty run (or a pre-fence database) cannot carry forward any pending write authorization.
         const recoveredTasks = previous?.clean === 1 ? 0 : this.pauseUnfinishedTasks()
@@ -261,6 +265,12 @@ export class ManagedWorkerStore {
       })
       if (!started.ok) throw new Error('Cannot establish Managed Worker run')
       this.recoveredTasks = started.value
+      this.projects = new ProjectStore({
+        db: () => this.db,
+        write: operation => this.write(operation),
+        ownsRun: () => this.ownsRun(),
+        nonProjectSessionBound: sessionId => this.nonProjectSessionBound(sessionId),
+      })
     } catch (error) {
       try { this.close() } catch { /* Preserve the initialization error. */ }
       throw error
@@ -318,7 +328,7 @@ export class ManagedWorkerStore {
   bindAssistant(sessionId: string): ManagedResult<string> {
     if (!isId(sessionId)) return deny('INVALID_INPUT')
     return this.write(() => {
-      if (this.binding(sessionId) || this.draftBinding(sessionId)) return deny('SESSION_ALREADY_BOUND')
+      if (this.binding(sessionId) || this.draftBinding(sessionId) || this.projects.binding(sessionId)) return deny('SESSION_ALREADY_BOUND')
       const existing = this.assistantBinding(sessionId)
       if (existing) return accept(existing)
       const bot = this.db.prepare('SELECT bot_id FROM studio_assistant_bot WHERE singleton = 1').get()
@@ -426,8 +436,17 @@ export class ManagedWorkerStore {
     }
   }
 
-  private sessionBound(sessionId: string): boolean {
+  /** Check the existing roles without calling back into the project facade. */
+  private nonProjectSessionBound(sessionId: string): boolean {
     return !!(this.binding(sessionId) || this.assistantBinding(sessionId) || this.draftBinding(sessionId))
+  }
+
+  private studioSessionBound(sessionId: string): boolean {
+    return !!(this.assistantBinding(sessionId) || this.draftBinding(sessionId) || this.projects.binding(sessionId))
+  }
+
+  private sessionBound(sessionId: string): boolean {
+    return !!this.binding(sessionId) || this.studioSessionBound(sessionId)
   }
 
   /** Show the current authorization version without exposing document text or treating an unconfirmed pause as active. */
@@ -544,7 +563,7 @@ export class ManagedWorkerStore {
       if (!current.ok) return current
       const task = current.value
       // Even if conflicting role bindings exist, Studio Sessions cannot receive document permits.
-      if (this.assistantBinding(sessionId) || this.draftBinding(sessionId)) return deny('SESSION_ALREADY_BOUND')
+      if (this.studioSessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
       const blocked = this.executionBlocked(task)
       if (blocked) return blocked
       if (this.actionUsed(sessionId, toolCallId)) return deny('DUPLICATE_ACTION')
@@ -570,6 +589,7 @@ export class ManagedWorkerStore {
     const result = this.write(() => {
       const current = this.currentTask(permit.workerSessionId)
       if (!current.ok || current.value.taskId !== permit.taskId || current.value.executionEpoch !== permit.executionEpoch) return deny('STALE_EXECUTION')
+      if (this.studioSessionBound(permit.workerSessionId)) return deny('SESSION_ALREADY_BOUND')
       const task = current.value
       const blocked = this.executionBlocked(task)
       if (blocked) return blocked

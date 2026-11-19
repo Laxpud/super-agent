@@ -37,13 +37,13 @@ interface DraftInput { messageId: string; turn?: number }
 export function isAssistantTool(name: string): boolean { return name === DRAFT_DELEGATE || name === DRAFT_READ }
 
 /** Use the latest admitted owner input in the open turn, not history, a model summary, or a tool argument. */
-function ownerRequest(agent: Agent, callId: string): OwnerRequest | undefined {
+export function ownerRequest(agent: Agent, callId: string, toolName: string): OwnerRequest | undefined {
   const session = agent.session
   let recordedCall = false
   for (let offset = session.seq - 1; offset >= session.firstLiveSeq; offset--) {
     const event = session.eventAt(SessionSeq(offset))
     if (event?.type === 'turn/start' || event?.type === 'turn/end') break
-    if (event?.type === 'tool/call' && event.data.callId === callId && event.data.name === DRAFT_DELEGATE) recordedCall = true
+    if (event?.type === 'tool/call' && event.data.callId === callId && event.data.name === toolName) recordedCall = true
     if (!recordedCall || event?.type !== 'user/message') continue
     const { source, content, id } = event.data
     const attribution: { kind: string; rpcId?: unknown; principal?: unknown } = source
@@ -135,7 +135,7 @@ export class StudioAssistant {
           if (!delegateSchema.safeParse(args).success || exec.agent !== agent || exec.parent !== undefined || !this.assistantReady(agent)) {
             throw new Error('Studio draft rejected: INVALID_EXECUTION')
           }
-          const source = ownerRequest(agent, exec.callId)
+          const source = ownerRequest(agent, exec.callId, DRAFT_DELEGATE)
           if (!source) throw new Error('Studio draft rejected: EXPECTED_CURRENT_OWNER_TEXT_REQUEST')
           return draftOutput(await this.delegate(agent, source, exec.signal))
         },

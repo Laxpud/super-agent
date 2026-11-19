@@ -9,12 +9,13 @@ import s from '@deepseek-ai/schemastery'
 import { lockSync } from 'proper-lockfile'
 import { z } from 'zod'
 import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool } from './assistant.ts'
+import { LEADER_PRESET, StudioProjectControl, isLeaderTool } from './project.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
 
 export const name = 'dsh-superagent-managed-worker'
 export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'permissionPresets', 'sandboxPolicy', 'systemPrompt', 'tools', 'webServer']
 export const Config = s.object({
-  stateDir: s.string().required().description('Absolute directory reserved for the managed document worker database.'),
+  stateDir: s.string().required().description('Absolute directory reserved for the Studio database.'),
 })
 type Config = ReturnType<typeof Config>
 
@@ -27,7 +28,7 @@ const writeSchema = z.strictObject({ expectedVersion: z.literal(1), text: z.stri
 
 interface CommandResult { kind: 'success' | 'error'; text: string }
 interface CommandInput { agent: Agent; commandId: string; rawInput: string; signal: AbortSignal }
-type StudioRole = 'assistant' | 'draft-worker' | 'document-worker'
+type StudioRole = 'assistant' | 'leader' | 'draft-worker' | 'document-worker'
 interface StudioScope { role: StudioRole; dispose(): void }
 
 /** Only the rc.3 additions used here are declared. The running host provides the services; no second Cordis or DSH runtime is loaded. */
@@ -94,21 +95,24 @@ export function apply(context: Context, { stateDir }: Config): void {
   const scopes = new Map<Agent, StudioScope>()
   const permits = new Map<ToolExecutionToken, ManagedWritePermit>()
   const presetOf = (agent: Agent) => ctx.agentPresets.presetForSession(agent.session)
-  const presetFor = (role: StudioRole) => role === 'assistant' ? ASSISTANT_PRESET : PRESET
+  const presetFor = (role: StudioRole) => role === 'assistant' ? ASSISTANT_PRESET : role === 'leader' ? LEADER_PRESET : PRESET
   const currentSession = (agent: Agent): boolean => ctx.agents.get(agent.id) === agent
   const restricted = (agent: Agent): boolean => ctx.permissionPresets.current(agent.session) === 'read-only'
     && ctx.sandboxPolicy.resolve({ session: agent.session }).mode === 'read-only'
   const ready = (agent: Agent, role: StudioRole): boolean => available && controlReady(ctx) && currentSession(agent)
     && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
   const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), agent => ready(agent, 'draft-worker'))
+  const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'))
 
   /** A persisted binding wins over the picker, so a retired or finished Worker cannot become a different role on resume. */
   function roleOf(agent: Agent): StudioRole | undefined {
     if (store.draftBinding(agent.id)) return 'draft-worker'
     if (store.binding(agent.id)) return 'document-worker'
     if (store.assistantBinding(agent.id)) return 'assistant'
+    if (store.projects.binding(agent.id)) return 'leader'
     const preset = presetOf(agent)
     if (preset === ASSISTANT_PRESET) return 'assistant'
+    if (preset === LEADER_PRESET) return 'leader'
     if (preset === PRESET) return 'document-worker'
   }
 
@@ -142,7 +146,8 @@ export function apply(context: Context, { stateDir }: Config): void {
         const bound = store.bindAssistant(agent.id)
         if (!bound.ok) throw new Error(`Cannot bind Studio Assistant: ${bound.reason}`)
       }
-      const unregister = role !== 'document-worker' ? drafts.install(agent, role) : agent.ctx.tools.register({
+      const unregister = role === 'leader' ? projects.install(agent)
+        : role !== 'document-worker' ? drafts.install(agent, role) : agent.ctx.tools.register({
         name: TOOL,
         description: 'Replace the text of the managed document bound to this worker, using its approved text and version.',
         parameters: z.toJSONSchema(writeSchema),
@@ -171,9 +176,11 @@ export function apply(context: Context, { stateDir }: Config): void {
     let role: StudioRole | undefined
     try { role = agent && (scopes.get(agent)?.role ?? roleOf(agent)) }
     catch { return 'Studio tool denied: STORAGE_ERROR' }
-    if (!role || !agent) return exec.name === TOOL || isAssistantTool(exec.name) ? 'Studio tool denied: INVALID_EXECUTION' : undefined
+    if (!role || !agent) return exec.name === TOOL || isAssistantTool(exec.name) || isLeaderTool(exec.name)
+      ? 'Studio tool denied: INVALID_EXECUTION' : undefined
     if (!ready(agent, role) || exec.parent !== undefined) return 'Studio tool denied: INVALID_EXECUTION'
     if (role === 'assistant' && isAssistantTool(exec.name)) return undefined
+    if (role === 'leader') return projects.guard(agent, exec.name)
     if (role !== 'document-worker' || exec.name !== TOOL) return 'Studio tool denied: INVALID_EXECUTION'
     const result = store.authorize(agent.id, exec.arguments, exec.callId)
     if (!result.ok) return `Managed write denied: ${result.reason}`
@@ -184,13 +191,13 @@ export function apply(context: Context, { stateDir }: Config): void {
   ctx.on('agent/created', ({ agent }) => { configure(agent); return undefined })
   ctx.on('agent/disposed', ({ agent }) => { scopes.get(agent)?.dispose(); scopes.delete(agent) })
   ctx.on('agent-preset/selected', (id, preset) => {
-    if (preset !== PRESET && preset !== ASSISTANT_PRESET) return
+    if (preset !== PRESET && preset !== ASSISTANT_PRESET && preset !== LEADER_PRESET) return
     const agent = ctx.agents.get(id as SessionId)
     if (agent) configure(agent)
   })
   ctx.on('agent/pre-step', async ({ agent, turn, messages }, next) => {
     const role = scopes.get(agent)?.role
-    if (role === 'assistant' && !ready(agent, role)) return { kind: 'reject' }
+    if ((role === 'assistant' || role === 'leader') && !ready(agent, role)) return { kind: 'reject' }
     if (role === 'draft-worker' && !drafts.admit(agent, messages, turn)) return { kind: 'reject' }
     return next()
   })
@@ -246,6 +253,16 @@ export function apply(context: Context, { stateDir }: Config): void {
       const result = store.readDraft(agent.id, id || undefined)
       if (!result.ok) return { kind: 'error', text: `Cannot read Studio result: ${result.reason}.` }
       return { kind: 'success', text: draftOutput(result.value).text }
+    },
+  }))
+  ctx.effect(() => ctx.commands.register({
+    name: 'studio-project',
+    description: 'Create or transfer a project as the owner, or read the current management state.',
+    input: { hint: 'create <JSON> | status [project-id] | take <project-id> <epoch> [leader-bot-id|new]' },
+    recordInput: false,
+    handler({ agent, commandId, rawInput, signal }) {
+      signal.throwIfAborted()
+      return projects.command(agent, commandId, rawInput, ready(agent, 'assistant') || ready(agent, 'leader'))
     },
   }))
   ctx.logger.info('SuperAgent Studio ready (no GitHub source)')

@@ -37,6 +37,18 @@
         plugins:
           - id: tool-executor-native
             name: '@deepseek-ai/dsh-tool-executor-native'
+    # The Studio Leader can read its project and register pending work only while it manages that project.
+    - id: dsh-superagent-studio-leader-preset
+      name: '@deepseek-ai/dsh-agent-preset'
+      disabled: true
+      config:
+        id: dsh-superagent-studio-leader
+        name: SuperAgent Studio Leader
+        description: Manages a Studio project and registers pending work without launching workers. Requires the Studio host entry.
+        order: 94
+        plugins:
+          - id: tool-executor-native
+            name: '@deepseek-ai/dsh-tool-executor-native'
     # The agent preset of every Executor Session (WORKER_PRESET in src/app/sessions.ts); the main Session has its own, below.
     # It is DSH's `standard` preset with only what a worker needs, and a shell whose foreground command moves to a background job
     # after 5 seconds, so a long command does not hold back a person's message, which the Session takes at its next step. Left
