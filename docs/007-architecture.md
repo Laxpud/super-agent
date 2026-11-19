@@ -358,7 +358,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/project.ts` | Owner project commands and Leader tools to register, dispatch and read project work; rechecks current management at the Worker's first step |
 | `src/managed-worker/project-intake.ts` | Presents a source-bound Assistant proposal to the native Web answerer; only a positive owner answer can establish the project and its Leader Session |
 | `src/managed-worker/project-store.ts` | Persists project identities, management history and Worker attempts; only the current management epoch can reserve and begin an execution |
-| `src/managed-worker/instructions.ts` | Records Web inputs before model reads, handles Web and Feishu instruction review, and sends the current approved text to the bound Worker for a fresh guarded write |
+| `src/managed-worker/instructions.ts` | Records Web inputs before model reads, reviews Web and Feishu corrections against their exact versions, and sends current approved text to the bound Worker |
+| `src/managed-worker/document-intent.ts` | Recognizes a small grammar of unambiguous pause or line-subset requests; it has no authority to change them into actions |
+| `src/managed-worker/owner-confirmation.ts` | Checks the explicit answer to a live native Web owner question; timeout and delayed or mismatched replies cannot confirm a change |
 | `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot and accepts messages only from the configured owner chat; sends receipts independently of ledger registration |
 | `src/managed-worker/instruction-store.ts` | Preserves Feishu task links, original deliveries and review receipts, including replacements narrowed to a subset of approved changes; pending inputs hold writes even when the listeners are off |
 | `src/managed-worker/document-command.ts` | Owner-only commands for inspecting, creating and editing a shared document, and for selecting a task's exact base revision |

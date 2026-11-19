@@ -12,7 +12,7 @@ import { AgentDelivery } from '../app/delivery.ts'
 import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool } from './assistant.ts'
 import { documentStartArgs, sharedDocumentCommand, sharedDocumentCoordinates, sharedDocumentError } from './document-command.ts'
 import { FeishuDocumentInboxConfig, StudioFeishuInbox, validateFeishuInbox } from './feishu-inbox.ts'
-import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, validateDocumentRelays } from './instructions.ts'
+import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
 import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
 import { LEADER_PRESET, StudioProjectControl, isLeaderTool } from './project.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
@@ -233,7 +233,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
   ctx.effect(() => ctx.commands.register({
     name: 'studio-doc',
     description: 'Manage a document task in this managed worker Session.',
-    input: { hint: 'doc-new <JSON> | doc-read <document-id> [revision] | doc-save <JSON> | start <JSON> | status | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review <instruction-id> <authorization-version> <unchanged|pause> | narrow <JSON> | continue <authorization-version> | feishu-status | bind-feishu' },
+    input: { hint: 'doc-new <JSON> | doc-read <document-id> [revision] | doc-save <JSON> | start <JSON> | status | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review [<instruction-id> <authorization-version> <unchanged|pause>] | narrow <JSON> | continue <authorization-version> | feishu-status | bind-feishu' },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()
@@ -243,6 +243,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
       const [, verb, argument = ''] = /^\s*(\S+)(?:\s+([\s\S]*))?$/.exec(rawInput.trim()) ?? []
       // Only explicit continuation wakes the Worker. Review and other control commands commit without cancelling the active turn.
       if (verb === 'continue') return continueDocument(delivery, store, agent, argument, signal, () => ready(agent, 'document-worker'))
+      if (verb === 'review' && !argument) return reviewDocumentIntent(store, agent, commandId, signal, channelStop.signal, () => ready(agent, 'document-worker'))
       // Keep review available even after capture is disabled; toggling the listener must not clear a durable pending hold.
       const control = instructionCommand(store, agent.id, commandId, verb, argument)
         ?? sharedDocumentCommand(store, agent.id, commandId, verb, argument)

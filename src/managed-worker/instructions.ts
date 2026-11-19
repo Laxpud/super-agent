@@ -6,7 +6,10 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { messageId, type AgentDelivery } from '../app/delivery.ts'
 import { sharedDocumentCoordinates, sharedDocumentError } from './document-command.ts'
-import type { ManagedTask, ManagedWorkerStore } from './store.ts'
+import { documentIntent } from './document-intent.ts'
+import type { InstructionDecision } from './instruction-store.ts'
+import { confirmWithOwner, ownerConfirmationAvailable } from './owner-confirmation.ts'
+import type { ManagedResult, ManagedTask, ManagedWorkerStore } from './store.ts'
 
 const TEXT_LIMIT = 32_000
 const version = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
@@ -111,12 +114,68 @@ export function documentHoldError(reason: string): CommandResult | undefined {
 function instructionFailure(reason: string): CommandResult {
   if (reason === 'WORKER_BUSY') return { kind: 'error', text: 'Continuation was not queued. Wait for the current Worker turn to finish, then check /studio-doc status.' }
   if (reason === 'TASK_PAUSED') return { kind: 'error', text: 'TASK_PAUSED: Continuation was not queued. Check /studio-doc status for the current version.' }
-  if (reason === 'INSTRUCTION_ORDER_UNCLEAR') return { kind: 'error', text: `${reason}: Do not narrow from this delivery. Check the ordering in /studio-doc inbox; pause if the intended scope is uncertain.` }
+  if (reason === 'INSTRUCTION_ORDER_UNCLEAR') return { kind: 'error', text: `${reason}: This delivery cannot drive a suggested correction. Check the ordering in /studio-doc inbox; pause if the intended scope is uncertain.` }
   return documentHoldError(reason) ?? sharedDocumentError(reason)
     ?? { kind: 'error', text: `Document instruction control rejected: ${reason}. Run /studio-doc inbox to check current input and authorization.` }
 }
 
-/** Process only the inbox and review commands. A source message is not itself authorization to change the approved text. */
+function narrowReceipt(result: ManagedResult<{ task: ManagedTask; remaining: number; keptLines: number[] }>): CommandResult {
+  if (!result.ok) return instructionFailure(result.reason)
+  const { task, remaining, keptLines } = result.value
+  const preview = keptLines.slice(0, 24).join(', ') + (keptLines.length > 24 ? ', …' : '')
+  const next = remaining ? 'Writes still await review: /studio-doc inbox.'
+    : task.paused ? `The task remains paused. When ready, run /studio-doc resume ${task.authorizationVersion} and check the new version.`
+      : `To continue in the same Worker, run /studio-doc continue ${task.authorizationVersion}.`
+  return { kind: 'success', text: `Scope narrowed for task ${task.taskId}; authorization version ${task.authorizationVersion}; ${remaining} pending. Kept ${keptLines.length} approved changed lines (${preview}). No document was written. ${next}` }
+}
+
+function reviewReceipt(result: ManagedResult<{ task: ManagedTask; remaining: number }>, decision: InstructionDecision): CommandResult {
+  if (!result.ok) return instructionFailure(result.reason)
+  const { task, remaining } = result.value
+  const effect = decision === 'pause' ? 'Pause effective.' : 'Instruction reviewed; the existing write scope and pause state are unchanged.'
+  const next = remaining ? 'Writes still await review: /studio-doc inbox.'
+    : task.paused ? 'The task remains paused; it does not resume automatically.' : 'Any further write requires a fresh check against the existing scope.'
+  return { kind: 'success', text: `${effect} Task ${task.taskId}; authorization version ${task.authorizationVersion}; ${remaining} pending. ${next}` }
+}
+
+/** Interpret only the oldest retained text, show a bounded proposal, then apply the same versioned owner operation as manual review. */
+export async function reviewDocumentIntent(store: ManagedWorkerStore, agent: Agent, commandId: string, caller: AbortSignal,
+  stopping: AbortSignal, ready: () => boolean): Promise<CommandResult> {
+  const snapshot = store.instructionInbox(agent.id)
+  if (!snapshot.ok) return instructionFailure(snapshot.reason)
+  const { task, pending, narrowableLines } = snapshot.value
+  if (!pending) return { kind: 'success', text: 'No document input awaits review.' }
+  if (pending.source.channel === 'feishu' && pending.feishu?.late !== false) return instructionFailure('INSTRUCTION_ORDER_UNCLEAR')
+  const intent = documentIntent(pending.source.text)
+  if (!intent) return instructionFailure('NO_CLEAR_DOCUMENT_CORRECTION')
+  if (intent.kind === 'narrow') {
+    if (!narrowableLines) return instructionFailure('INSTRUCTION_NOT_NARROWABLE')
+    const approved = new Set(narrowableLines)
+    if (intent.keepLines.length >= approved.size || intent.keepLines.some(line => !approved.has(line))) return instructionFailure('INVALID_KEEP_LINES')
+  }
+  if (!ownerConfirmationAvailable(agent)) return instructionFailure('OWNER_CONFIRMATION_UNAVAILABLE')
+  const signal = AbortSignal.any([caller, stopping, AbortSignal.timeout(120_000)])
+  const effect = intent.kind === 'pause' ? 'Pause further writes to this task. Do not write the document or cancel other work.'
+    : `Keep only the already approved changes on lines ${intent.keepLines.join(', ')}; leave all other lines at their original text. Do not write the document or lift a pause.`
+  try {
+    const confirmed = await confirmWithOwner(agent, signal, { id: commandId, approve: 'Apply correction',
+      question: 'Apply this correction to the document task?',
+      detail: `Task ${task.taskId}; authorization version ${task.authorizationVersion}.${sharedDocumentCoordinates(task)}\n\n`
+        + `Original ${pending.source.channel} message ${pending.source.messageId}:\n${pending.source.text}\n\n${effect}`,
+    })
+    if (!confirmed) return { kind: 'success', text: 'Correction not applied. This review did not change authorization. Check /studio-doc inbox for pending input.' }
+  } catch {
+    return { kind: 'error', text: 'Correction not applied. A live owner confirmation did not complete. Review the pending input with /studio-doc inbox.' }
+  }
+  if (!ready() || signal.aborted) return instructionFailure('CONTROL_UNAVAILABLE')
+  // The confirmation may stay open while another message, pause, or shared edit commits. The Store compares the original snapshot in its write transaction.
+  const { instructionId } = pending
+  const { executionEpoch, authorizationVersion, documentVersion } = task
+  return intent.kind === 'pause' ? reviewReceipt(store.reviewInstruction(agent.id, instructionId, authorizationVersion, 'pause', commandId), 'pause')
+    : narrowReceipt(store.narrowInstruction(agent.id, instructionId, executionEpoch, authorizationVersion, documentVersion, intent.keepLines, commandId))
+}
+
+/** Process only the inbox and manual review commands. A source message is not itself authorization to change the approved text. */
 export function instructionCommand(store: ManagedWorkerStore, sessionId: string, commandId: string, verb: string | undefined,
   argument: string): CommandResult | undefined {
   if (verb === 'narrow') {
@@ -125,14 +184,7 @@ export function instructionCommand(store: ManagedWorkerStore, sessionId: string,
     const fields = narrowArgs.safeParse(json)
     if (!fields.success) return instructionFailure('EXPECTED_NARROW_JSON')
     const { instructionId, executionEpoch, authorizationVersion, documentVersion, keepLines } = fields.data
-    const result = store.narrowInstruction(sessionId, instructionId, executionEpoch, authorizationVersion, documentVersion, keepLines, commandId)
-    if (!result.ok) return instructionFailure(result.reason)
-    const { task, remaining, keptLines } = result.value
-    const preview = keptLines.slice(0, 24).join(', ') + (keptLines.length > 24 ? ', …' : '')
-    const next = remaining ? 'Writes still await review: /studio-doc inbox.'
-      : task.paused ? `The task remains paused. When ready, run /studio-doc resume ${task.authorizationVersion} and check the new version.`
-        : `To continue in the same Worker, run /studio-doc continue ${task.authorizationVersion}.`
-    return { kind: 'success', text: `Scope narrowed for task ${task.taskId}; authorization version ${task.authorizationVersion}; ${remaining} pending. Kept ${keptLines.length} approved changed lines (${preview}). No document was written. ${next}` }
+    return narrowReceipt(store.narrowInstruction(sessionId, instructionId, executionEpoch, authorizationVersion, documentVersion, keepLines, commandId))
   }
   if (verb !== 'inbox' && verb !== 'review') return
   if (verb === 'inbox') {
@@ -157,16 +209,11 @@ export function instructionCommand(store: ManagedWorkerStore, sessionId: string,
         authorizationVersion: task.authorizationVersion, documentVersion: task.documentVersion, keepLines: [] })}\n` : ''
     return { kind: 'success', text: `${state}\nWrites are blocked until all pending input is reviewed, even if the task is not paused.\n`
       + `Instruction ${pending.instructionId}; ${source.channel} message ${source.messageId}; ${coordinates}.\n${ordering}`
-      + `Review: /studio-doc review ${pending.instructionId} ${task.authorizationVersion} <unchanged|pause>\n${narrow}\n${original}` }
+      + 'For a clear pause or line-only correction, try /studio-doc review without arguments.\n'
+      + `Manual review: /studio-doc review ${pending.instructionId} ${task.authorizationVersion} <unchanged|pause>\n${narrow}\n${original}` }
   }
   const parsed = reviewArgs.safeParse(argument.split(/\s+/))
   if (!parsed.success) return instructionFailure('EXPECTED_INSTRUCTION_ID_VERSION_AND_DECISION')
   const [instructionId, expectedVersion, decision] = parsed.data
-  const result = store.reviewInstruction(sessionId, instructionId, expectedVersion, decision, commandId)
-  if (!result.ok) return instructionFailure(result.reason)
-  const { task, remaining } = result.value
-  const effect = decision === 'pause' ? 'Pause effective.' : 'Instruction reviewed; the existing write scope and pause state are unchanged.'
-  const next = remaining ? 'Writes still await review: /studio-doc inbox.'
-    : task.paused ? 'The task remains paused; it does not resume automatically.' : 'Any further write requires a fresh check against the existing scope.'
-  return { kind: 'success', text: `${effect} Task ${task.taskId}; authorization version ${task.authorizationVersion}; ${remaining} pending. ${next}` }
+  return reviewReceipt(store.reviewInstruction(sessionId, instructionId, expectedVersion, decision, commandId), decision)
 }

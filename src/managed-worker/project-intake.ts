@@ -6,12 +6,11 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { draftWorkerRoute, ownerRequest, createStudioSession } from './assistant.ts'
 import { LEADER_PRESET, projectText } from './project.ts'
+import { confirmWithOwner, ownerConfirmationAvailable } from './owner-confirmation.ts'
 import { PROJECT_NAME_LIMIT, type StudioProjectProposal } from './project-store.ts'
 import type { ManagedWorkerStore } from './store.ts'
 
 export const PROPOSE_PROJECT = 'studio_propose_project'
-const APPROVE = 'Create project'
-const DECLINE = 'Not now'
 const TIMEOUT_MS = 120_000
 const plain = (limit: number) => z.string().min(1).max(limit)
   .refine(value => value.isWellFormed() && !value.includes('\0') && value.trim().length > 0)
@@ -24,27 +23,15 @@ const proposalArgs = z.strictObject({
 })
 const outputSchema = z.strictObject({ text: z.string() })
 
-/** The rc.3 Web answerer provides a blocking approval intent. Do not accept model arguments or delayed replies as answers. */
-interface NativeQuestions {
-  ask(request: { agent: Agent; signal: AbortSignal; questions: Array<{
-    id: string; question: string; detail: string; options: Array<{ label: string }>;
-    intent: { kind: 'approval'; approve: string; reject: string };
-  }> }): Promise<{ answers: Array<{ id: string; selected: string[]; custom?: string }> }>
-}
-export function nativeProjectQuestions(ctx: Context): NativeQuestions | undefined {
-  const questions = (ctx as unknown as { get(name: string): unknown }).get('userQuestions') as Partial<NativeQuestions> | undefined
-  return typeof questions?.ask === 'function' ? questions as NativeQuestions : undefined
-}
-
 /** Bind an Assistant's proposed project to one owner request and present a native confirmation without delegating authority to the model. */
 export class StudioProjectIntake {
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore,
     private readonly ready: (agent: Agent) => boolean, private readonly stopping: AbortSignal) {}
 
-  available(agent: Agent): boolean { return this.ready(agent) && nativeProjectQuestions(agent.ctx) !== undefined }
+  available(agent: Agent): boolean { return this.ready(agent) && ownerConfirmationAvailable(agent) }
 
   install(agent: Agent): () => void {
-    if (!nativeProjectQuestions(agent.ctx)) return () => {}
+    if (!ownerConfirmationAvailable(agent)) return () => {}
     return agent.ctx.tools.register({ name: PROPOSE_PROJECT,
       description: 'Show an owner-only confirmation for an explicit new project request. A proposal alone does not create a project or start work.',
       parameters: z.toJSONSchema(proposalArgs), timeoutMs: TIMEOUT_MS + 10_000,
@@ -69,19 +56,14 @@ export class StudioProjectIntake {
         const signal = AbortSignal.any([exec.signal, this.stopping, AbortSignal.timeout(TIMEOUT_MS)])
         let committed = false
         try {
-          const questions = nativeProjectQuestions(agent.ctx)
-          if (!questions || !this.available(agent)) throw new Error('PROJECT_CONFIRMATION_UNAVAILABLE')
-          const answer = await questions.ask({ agent, signal, questions: [{ id: proposal.proposalId,
+          if (!this.available(agent)) throw new Error('PROJECT_CONFIRMATION_UNAVAILABLE')
+          const confirmed = await confirmWithOwner(agent, signal, { id: proposal.proposalId, approve: 'Create project',
             question: `Create the ongoing project “${proposal.name}”?`,
             detail: `Owner's words: ${proposal.intentQuote}\n\nObjective: ${proposal.objective}\n\n${proposal.originTaskId
               ? `Carry forward completed task ${proposal.originTaskId} without rerunning it.` : 'No earlier task is linked.'}\n${proposal.leaderBotId
               ? `Use existing Leader Bot ${proposal.leaderBotId}.` : 'Create a separate Leader Bot.'}\nThis creates a project record and a Leader Session, not a work assignment.`,
-            options: [{ label: DECLINE }, { label: APPROVE }], intent: { kind: 'approval', approve: APPROVE, reject: DECLINE },
-          }] })
-          signal.throwIfAborted()
-          const choice = answer.answers[0]
-          if (answer.answers.length !== 1 || choice?.id !== proposal.proposalId || choice.custom !== undefined
-            || choice.selected.length !== 1 || choice.selected[0] !== APPROVE) return { text: 'Project not created. The owner did not confirm this proposal.' }
+          })
+          if (!confirmed) return { text: 'Project not created. The owner did not confirm this proposal.' }
           if (!this.available(agent)) throw new Error('PROJECT_CONFIRMATION_UNAVAILABLE')
 
           // A passive Leader Session must exist durably before its ID becomes the current management binding.
