@@ -10,6 +10,21 @@
     - id: dsh-superagent-feishu
       name: dsh-superagent/feishu-watch
       disabled: true
+    # The managed document Worker starts without GitHub setup. Its preset is also off by default and separate from the legacy Executor.
+    - id: dsh-superagent-managed-worker
+      name: dsh-superagent/managed-worker
+      disabled: true
+    - id: dsh-superagent-managed-worker-preset
+      name: '@deepseek-ai/dsh-agent-preset'
+      disabled: true
+      config:
+        id: dsh-superagent-managed-worker
+        name: SuperAgent managed document Worker
+        description: For managed document tasks only. No shell, filesystem writes, or agent delegation.
+        order: 92
+        plugins:
+          - id: tool-executor-native
+            name: '@deepseek-ai/dsh-tool-executor-native'
     # The agent preset of every Executor Session (WORKER_PRESET in src/app/sessions.ts); the main Session has its own, below.
     # It is DSH's `standard` preset with only what a worker needs, and a shell whose foreground command moves to a background job
     # after 5 seconds, so a long command does not hold back a person's message, which the Session takes at its next step. Left

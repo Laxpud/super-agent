@@ -16,6 +16,10 @@
     "./client": "./lib/client.js",
     "./github-watch": "./lib/github-watch.js",
     "./feishu-watch": "./lib/feishu-watch.js",
+    "./managed-worker": {
+      "types": "./lib/managed-worker.d.ts",
+      "default": "./lib/managed-worker.js"
+    },
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
   },
