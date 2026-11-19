@@ -356,6 +356,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/index.ts` | The opt-in Studio host: keeps its roles read-only, registers Web commands, and guards the one allowed managed document action without running GitHub setup |
 | `src/managed-worker/assistant.ts` | Delegates Assistant requests and runs restricted text Workers for both roles; captures the exact admitted turn's final text and drains the source Session before delivery |
 | `src/managed-worker/project.ts` | Owner project commands and Leader tools to register, dispatch and read project work; rechecks current management at the Worker's first step |
+| `src/managed-worker/project-intake.ts` | Presents a source-bound Assistant proposal to the native Web answerer; only a positive owner answer can establish the project and its Leader Session |
 | `src/managed-worker/project-store.ts` | Persists project identities, management history and Worker attempts; only the current management epoch can reserve and begin an execution |
 | `src/managed-worker/instructions.ts` | Records Web inputs before model reads, handles Web and Feishu instruction review, and sends the current approved text to the bound Worker for a fresh guarded write |
 | `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot and accepts messages only from the configured owner chat; sends receipts independently of ledger registration |

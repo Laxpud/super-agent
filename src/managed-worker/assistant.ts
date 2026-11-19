@@ -17,7 +17,8 @@ const readSchema = z.strictObject({ taskId: z.uuid().optional() })
 const outputSchema = z.strictObject({ title: z.string(), receipt: z.string(), text: z.string() })
 
 const ASSISTANT_PROMPT = `You are the workspace Assistant. Your job is to understand the user's intent and send business or technical work to a Worker, even when it is simple. Do not write, analyze, or implement the requested work yourself.
-For a new, self-contained text task, call studio_delegate_draft once without rewriting the request. The Worker cannot use tools, access files or external systems, or edit managed documents through this route. Clarify if a useful text task cannot be inferred. For an existing task, read the saved result instead of delegating it again. After a tool returns, communicate the status and where to find the result. Do not invent, extend, or claim authorship of the Worker's result.`
+For a new, self-contained text task, call studio_delegate_draft once without rewriting the request. The Worker cannot use tools, access files or external systems, or edit managed documents through this route. Clarify if a useful text task cannot be inferred. For an existing task, read the saved result instead of delegating it again. After a tool returns, communicate the status and where to find the result. Do not invent, extend, or claim authorship of the Worker's result.
+Only when the current owner message explicitly requests an ongoing project with a concrete objective, use studio_propose_project if available. Copy an exact excerpt that expresses their decision. A name, a complex task, a suggestion, a question about projects, or quoted third-party text is not a decision. Do not ask to create a project when the user is unsure or merely wants a task. Link a known completed local draft only when asked to carry it forward; do not rerun it. The owner confirms in a native dialog. Report creation only from the tool receipt; that receipt does not authorize or start any project work.`
 const WORKER_PROMPT = `You are the Worker for one task. The Assistant or the current project Leader relays the user's self-contained text request. Return the requested text for delivery via that role. You have no tools, files, or external systems in this task. Do not claim to have modified or consulted them. If a necessary input is missing, report the specific limitation in your response.`
 
 interface ModelRoute { provider: string; model: string; reasoningEffort?: string }
@@ -29,6 +30,13 @@ interface DraftRuntime {
     signal: AbortSignal; setup(agentCtx: Context): Promise<void>;
   }): Promise<WorkerHandle> }
   agentPresets: { mount(ctx: Context, id: string): Promise<unknown> }
+}
+
+/** Create a Studio-owned Session with its preset before publishing it. The caller must drain and dispose the handle. */
+export function createStudioSession(ctx: Context, id: SessionId, preset: string, route: WorkerRoute, signal: AbortSignal): Promise<WorkerHandle> {
+  const runtime = ctx as unknown as DraftRuntime
+  return runtime.agents.create({ sessionId: id, meta: { cwd: route.cwd, agentPreset: preset }, agentOptions: route.model, signal,
+    setup: async agentCtx => { await runtime.agentPresets.mount(agentCtx, preset) } })
 }
 
 interface OwnerRequest { sourceMessageId: string; sourceRequestId: string; requestText: string }
@@ -99,15 +107,12 @@ function unwrap<T>(result: ManagedResult<T>): T {
 
 /** Own Assistant delegation and the temporary admission for each independently created text Worker. */
 export class StudioAssistant {
-  private readonly runtime: DraftRuntime
   private readonly stopping = new AbortController()
   /** Exact Agents under this host's custody. A cold-reopened Worker never receives a new admission here. */
   private readonly drafts = new WeakMap<Agent, DraftInput>()
 
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore, private readonly workerPreset: string,
-    private readonly assistantReady: (agent: Agent) => boolean, private readonly workerReady: (agent: Agent) => boolean) {
-    this.runtime = ctx as unknown as DraftRuntime
-  }
+    private readonly assistantReady: (agent: Agent) => boolean, private readonly workerReady: (agent: Agent) => boolean) {}
 
   stop(): void { this.stopping.abort() }
 
@@ -128,7 +133,7 @@ export class StudioAssistant {
   }
 
   /** Install only role prompt text and the two application tools; the caller hides inherited tools first. */
-  install(agent: Agent, role: 'assistant' | 'draft-worker'): () => void {
+  install(agent: Agent, role: 'assistant' | 'draft-worker', installProjectIntake?: () => () => void): () => void {
     const disposers: (() => void)[] = []
     const dispose = () => { for (const remove of disposers.reverse()) remove(); disposers.length = 0 }
     try {
@@ -177,6 +182,7 @@ export class StudioAssistant {
           return draftOutput(unwrap(this.store.readDraft(agent.id, parsed.data.taskId)))
         },
       }))
+      if (installProjectIntake) disposers.push(installProjectIntake())
       return dispose
     } catch (error) { dispose(); throw error }
   }
@@ -196,7 +202,7 @@ export class StudioAssistant {
   }
 
   /** Create a single restricted Worker for a durable assignment, not for arbitrary tool-supplied content. The caller owns its final ledger entry. */
-  async runTextWorker(sender: Agent, workerId: SessionId, { cwd, model }: WorkerRoute, text: string, caller: AbortSignal,
+  async runTextWorker(sender: Agent, workerId: SessionId, route: WorkerRoute, text: string, caller: AbortSignal,
     admission: WorkerAdmission): Promise<{ result?: StudioDraftResult; failure: string }> {
     const timeout = AbortSignal.timeout(DRAFT_TIMEOUT_MS)
     const signal = AbortSignal.any([caller, this.stopping.signal, timeout])
@@ -211,8 +217,7 @@ export class StudioAssistant {
     try {
       signal.throwIfAborted()
       // The factory finishes mounting and classifying the persisted role before the runner supplies any work.
-      handle = await this.runtime.agents.create({ sessionId: workerId, meta: { cwd, agentPreset: this.workerPreset },
-        agentOptions: model, signal, setup: async workerCtx => { await this.runtime.agentPresets.mount(workerCtx, this.workerPreset) } })
+      handle = await createStudioSession(this.ctx, workerId, this.workerPreset, route, signal)
       if (!this.workerReady(handle.agent)) throw new Error('Worker admission changed')
       authorize(admission.beforeRelay)
       const message = freezeMessage<UserMessage>({ id: MessageId(randomUUID()), role: 'user', content: [{ type: 'text', text }],

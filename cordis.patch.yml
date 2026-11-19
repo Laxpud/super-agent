@@ -37,14 +37,14 @@
         plugins:
           - id: tool-executor-native
             name: '@deepseek-ai/dsh-tool-executor-native'
-    # The Studio Leader can read its project and register pending work only while it manages that project.
+    # The Studio Leader may change the backlog and dispatch work only while it manages the project.
     - id: dsh-superagent-studio-leader-preset
       name: '@deepseek-ai/dsh-agent-preset'
       disabled: true
       config:
         id: dsh-superagent-studio-leader
         name: SuperAgent Studio Leader
-        description: Manages a Studio project and registers pending work without launching workers. Requires the Studio host entry.
+        description: Manages a Studio project, dispatches restricted text Workers, and retrieves their results. Requires the Studio host entry.
         order: 94
         plugins:
           - id: tool-executor-native

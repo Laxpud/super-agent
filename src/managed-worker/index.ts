@@ -13,6 +13,7 @@ import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool } from 
 import { documentStartArgs, sharedDocumentCommand, sharedDocumentCoordinates, sharedDocumentError } from './document-command.ts'
 import { FeishuDocumentInboxConfig, StudioFeishuInbox, validateFeishuInbox } from './feishu-inbox.ts'
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, validateDocumentRelays } from './instructions.ts'
+import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
 import { LEADER_PRESET, StudioProjectControl, isLeaderTool } from './project.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
 
@@ -114,6 +115,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
     && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
   const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), agent => ready(agent, 'draft-worker'))
   const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts)
+  const intake = new StudioProjectIntake(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal)
   const delivery = new AgentDelivery(ctx)
   const feishu = feishuDocumentInbox && new StudioFeishuInbox(ctx, store, stateDir, feishuDocumentInbox, () => available && controlReady(ctx))
 
@@ -163,7 +165,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
         if (!bound.ok) throw new Error(`Cannot bind Studio Assistant: ${bound.reason}`)
       }
       const unregister = role === 'leader' ? projects.install(agent)
-        : role !== 'document-worker' ? drafts.install(agent, role) : agent.ctx.tools.register({
+        : role !== 'document-worker' ? drafts.install(agent, role, role === 'assistant' ? () => intake.install(agent) : undefined) : agent.ctx.tools.register({
         name: TOOL,
         description: 'Replace the text of the managed document bound to this worker, using its approved text and version.',
         parameters: z.toJSONSchema(writeSchema),
@@ -192,10 +194,10 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
     let role: StudioRole | undefined
     try { role = agent && (scopes.get(agent)?.role ?? roleOf(agent)) }
     catch { return 'Studio tool denied: STORAGE_ERROR' }
-    if (!role || !agent) return exec.name === TOOL || isAssistantTool(exec.name) || isLeaderTool(exec.name)
+    if (!role || !agent) return exec.name === TOOL || exec.name === PROPOSE_PROJECT || isAssistantTool(exec.name) || isLeaderTool(exec.name)
       ? 'Studio tool denied: INVALID_EXECUTION' : undefined
     if (!ready(agent, role) || exec.parent !== undefined) return 'Studio tool denied: INVALID_EXECUTION'
-    if (role === 'assistant' && isAssistantTool(exec.name)) return undefined
+    if (role === 'assistant' && (isAssistantTool(exec.name) || (exec.name === PROPOSE_PROJECT && intake.available(agent)))) return undefined
     if (role === 'leader') return projects.guard(agent, exec.name)
     if (role !== 'document-worker' || exec.name !== TOOL) return 'Studio tool denied: INVALID_EXECUTION'
     const result = store.authorize(agent.id, exec.arguments, exec.callId)
@@ -296,11 +298,21 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
   ctx.effect(() => ctx.commands.register({
     name: 'studio-project',
     description: 'Create or transfer a project as the owner, or read the current management state.',
-    input: { hint: 'create <JSON> | status [project-id] | take <project-id> <epoch> [leader-bot-id|new] | work [work-id]' },
+    input: { hint: 'create <JSON> | status [project-id] | take <project-id> <epoch> [leader-bot-id|new] | work [work-id] | proposal [proposal-id]' },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()
-      return projects.command(agent, commandId, rawInput, ready(agent, 'assistant') || ready(agent, 'leader'))
+      const assistant = ready(agent, 'assistant')
+      const proposal = /^proposal(?:\s+(\S+))?$/.exec(rawInput.trim())
+      if (proposal) {
+        if (!assistant || (proposal[1] && !z.uuid().safeParse(proposal[1]).success)) {
+          return { kind: 'error', text: 'Use /studio-project proposal [proposal-id] in the original Studio Assistant Session.' }
+        }
+        const result = store.projects.readProposal(agent.id, proposal[1])
+        return result.ok ? { kind: 'success', text: intake.describe(agent, result.value) }
+          : { kind: 'error', text: `Cannot read project proposal: ${result.reason}.` }
+      }
+      return projects.command(agent, commandId, rawInput, assistant || ready(agent, 'leader'))
     },
   }))
   if (feishu) channelRun = feishu.run(channelStop.signal)

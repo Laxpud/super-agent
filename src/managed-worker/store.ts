@@ -329,6 +329,12 @@ export class ManagedWorkerStore {
         if (this.db.prepare("SELECT 1 FROM studio_project_dispatch WHERE state IN ('reserved', 'running') LIMIT 1").get()) {
           throw new Error('Cannot recover previous Studio project dispatches')
         }
+        // Native confirmation prompts belong to the previous run. Retain their evidence but do not recover consent.
+        this.db.prepare(`UPDATE studio_project_proposal SET state = 'closed', decided_at = ? WHERE state = 'pending'`)
+          .run(new Date().toISOString())
+        if (this.db.prepare("SELECT 1 FROM studio_project_proposal WHERE state = 'pending' LIMIT 1").get()) {
+          throw new Error('Cannot close previous Studio project proposals')
+        }
         requireWrite(this.db.prepare(`INSERT INTO managed_host_run VALUES (1, ?, 0)
           ON CONFLICT (singleton) DO UPDATE SET run_id = excluded.run_id, clean = 0`).run(this.#runId).changes)
         return accept(recoveredTasks)
@@ -340,6 +346,7 @@ export class ManagedWorkerStore {
         write: operation => this.write(operation),
         ownsRun: () => this.ownsRun(),
         runId: this.#runId,
+        assistantBinding: sessionId => this.assistantBinding(sessionId),
         nonProjectSessionBound: sessionId => this.nonProjectSessionBound(sessionId),
       })
     } catch (error) {

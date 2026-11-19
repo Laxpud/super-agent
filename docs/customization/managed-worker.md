@@ -41,7 +41,11 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 ## 建立项目与移交管理权
 
-已接入项目创建、管理权移交和文字待办派工。立项仍使用所有者命令；不会把复杂任务自动升级为项目。
+已接入项目创建、管理权移交和文字待办派工。不会把复杂任务自动升级为项目。
+
+在 **SuperAgent Studio Assistant** 会话中，可以直接用普通话说明这是要长期推进的项目，以及要达到什么目标，例如「把刚完成的资料对照接着做成长期项目，维护每月的差异记录」。不需要固定句式或命令。先核对原生确认框里的项目名称、目标和关联成果，然后选择 **Create project**。Assistant 的建议本身不创建项目；拒绝、跳过或等待超时都不立项。确认后会建立独立的 Leader 会话，不启动 Worker。关联成果目前限原 Assistant 会话里已完成的文字任务，不重做。用 `/studio-project proposal` 或带上回执中的建议 ID，可在该 Assistant 会话查看决定；宿主重启不会继续等待旧问答。
+
+也可以直接在 Leader 会话中操作：
 
 1. 在未绑定项目的 **SuperAgent Studio Leader** 会话中提交 `/studio-project create {"name":"资料整理","objective":"持续整理研究记录"}`。回执给出项目 ID、Leader Bot、当前会话及管理轮次 `1`。可用 `leaderBotId` 复用已有 Leader Bot，用 `originTaskId` 引用一个已经完成的文字任务；引用原成果不重新派工。
 2. 在当前 Leader 会话中用普通消息要求登记一项自包含的文字待办，将所需材料放在同一条消息里。登记保留原文与来源，不会启动 Worker。用 `/studio-project work` 可查看最近 20 项。需要执行时，让当前 Leader 派工指定待办 ID；Worker 沿用 Leader 当时选择的模型和思考深度，只接收该待办的原文，不能用工具或修改文档。

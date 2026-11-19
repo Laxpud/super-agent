@@ -49,7 +49,7 @@ function workText(view: StudioProjectWorkView, includeRequest = false): string {
 }
 
 /** Show the Bot separately from the currently authorized Session and management epoch. */
-function projectText(project: StudioProject): string {
+export function projectText(project: StudioProject): string {
   return `Project ${project.projectId}: ${project.name}\nLeader Bot ${project.leaderBotId}; Leader Session ${project.leaderSessionId}; management epoch ${project.managementEpoch}.\n`
     + `Pending work items: ${project.pendingCount}.\n${project.originTaskId ? `Prior result: /studio-result ${project.originTaskId} in a Studio Assistant Session.\n` : ''}`
     + `Objective: ${project.objective}`

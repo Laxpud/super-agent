@@ -24,6 +24,22 @@ export interface StudioProject extends StudioProjectBinding {
   pendingCount: number
 }
 
+/** An Assistant's original proposal and the decision recorded by the Host, if any. */
+export interface StudioProjectProposal {
+  proposalId: string
+  assistantSessionId: string
+  sourceMessageId: string
+  sourceRequestId: string
+  requestText: string
+  intentQuote: string
+  name: string
+  objective: string
+  originTaskId?: string
+  leaderBotId?: string
+  state: 'pending' | 'closed' | 'created'
+  projectId?: string
+}
+
 /** Work retains the original Leader binding and source coordinates across handoffs. */
 export interface StudioProjectWork extends StudioProjectBinding {
   workId: string
@@ -76,6 +92,30 @@ export const PROJECT_SCHEMA = `
     bound_at TEXT NOT NULL,
     UNIQUE (project_id, management_epoch)
   ) STRICT;
+  CREATE TABLE IF NOT EXISTS studio_project_proposal (
+    seq INTEGER PRIMARY KEY,
+    proposal_id TEXT NOT NULL UNIQUE,
+    assistant_session_id TEXT NOT NULL REFERENCES studio_assistant_binding (session_id),
+    source_message_id TEXT NOT NULL,
+    source_request_id TEXT NOT NULL,
+    request_text TEXT NOT NULL,
+    intent_quote TEXT NOT NULL,
+    name TEXT NOT NULL,
+    objective TEXT NOT NULL,
+    origin_task_id TEXT REFERENCES studio_draft_task (task_id),
+    leader_bot_id TEXT REFERENCES studio_leader_bot (bot_id),
+    run_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'closed', 'created')),
+    project_id TEXT UNIQUE REFERENCES studio_project (project_id),
+    proposed_at TEXT NOT NULL,
+    decided_at TEXT,
+    UNIQUE (assistant_session_id, source_request_id),
+    CHECK ((state = 'pending' AND project_id IS NULL AND decided_at IS NULL)
+      OR (state = 'closed' AND project_id IS NULL AND decided_at IS NOT NULL)
+      OR (state = 'created' AND project_id IS NOT NULL AND decided_at IS NOT NULL))
+  ) STRICT;
+  CREATE INDEX IF NOT EXISTS studio_project_proposal_session_latest
+    ON studio_project_proposal (assistant_session_id, seq DESC);
   CREATE TABLE IF NOT EXISTS studio_project_work (
     work_id TEXT NOT NULL PRIMARY KEY,
     leader_session_id TEXT NOT NULL REFERENCES studio_project_binding (leader_session_id),
@@ -115,6 +155,7 @@ interface ProjectStoreAccess {
   write<T>(operation: () => ManagedResult<T>): ManagedResult<T>
   ownsRun(): boolean
   readonly runId: string
+  assistantBinding(sessionId: string): string | undefined
   nonProjectSessionBound(sessionId: string): boolean
 }
 
@@ -190,6 +231,22 @@ function readBinding(row: Record<string, SQLOutputValue>): StudioProjectBinding 
     throw new Error('Invalid Studio project binding')
   }
   return { projectId, leaderBotId, leaderSessionId, managementEpoch }
+}
+
+/** Decode the original proposal; only a created decision has a project link. */
+function readProposalRow(row: Record<string, SQLOutputValue>): StudioProjectProposal {
+  const { proposal_id: proposalId, assistant_session_id: assistantSessionId, source_message_id: sourceMessageId,
+    source_request_id: sourceRequestId, request_text: requestText, intent_quote: intentQuote, name, objective,
+    origin_task_id: originTaskId, leader_bot_id: leaderBotId, state, project_id: projectId } = row
+  if (!isId(proposalId) || !isId(assistantSessionId) || !isId(sourceMessageId) || !isId(sourceRequestId)
+    || !isText(requestText, PROJECT_TEXT_LIMIT) || !isText(intentQuote, PROJECT_TEXT_LIMIT) || !requestText.includes(intentQuote)
+    || !isText(name, PROJECT_NAME_LIMIT) || !isText(objective, PROJECT_TEXT_LIMIT)
+    || (originTaskId !== null && !isId(originTaskId)) || (leaderBotId !== null && !isId(leaderBotId))
+    || (state !== 'pending' && state !== 'closed' && state !== 'created')
+    || (state === 'created' ? !isId(projectId) : projectId !== null)) throw new Error('Invalid Studio project proposal')
+  return { proposalId, assistantSessionId, sourceMessageId, sourceRequestId, requestText, intentQuote, name, objective,
+    ...(originTaskId === null ? {} : { originTaskId }), ...(leaderBotId === null ? {} : { leaderBotId }), state,
+    ...(isId(projectId) ? { projectId } : {}) }
 }
 
 /** Decode registered work with the Leader binding that originally recorded it. */
@@ -278,24 +335,117 @@ export class ProjectStore {
       || (leaderBotId !== undefined && !isId(leaderBotId)) || (originTaskId !== undefined && !isId(originTaskId))) {
       return deny('INVALID_INPUT')
     }
-    return this.access.write(() => {
-      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
-      if (this.sessionBound(leaderSessionId)) return deny('SESSION_ALREADY_BOUND')
-      // Link the existing completed draft without taking ownership of its Session or creating a new execution.
-      if (originTaskId !== undefined) {
-        const draft = this.db.prepare('SELECT state FROM studio_draft_task WHERE task_id = ?').get(originTaskId)
-        if (!draft || draft.state !== 'completed') return deny('ORIGIN_TASK_NOT_COMPLETED')
-        if (this.db.prepare('SELECT 1 FROM studio_project WHERE origin_task_id = ?').get(originTaskId)) return deny('ORIGIN_TASK_ALREADY_LINKED')
-      }
-      const bot = this.resolveBot(leaderBotId)
-      if (!bot.ok) return bot
-      const projectId = randomUUID()
-      requireWrite(this.db.prepare(`INSERT INTO studio_project (project_id, name, objective, origin_task_id, management_epoch)
-        VALUES (?, ?, ?, ?, 1)`).run(projectId, name, objective, originTaskId ?? null).changes)
-      const binding = { projectId, leaderBotId: bot.value, leaderSessionId, managementEpoch: 1 }
-      this.insertBinding(binding, commandId)
-      return accept({ ...binding, name, objective, ...(originTaskId === undefined ? {} : { originTaskId }), pendingCount: 0 })
+    return this.access.write(() => this.createInTransaction({ leaderSessionId, commandId, name, objective, leaderBotId, originTaskId }))
+  }
+
+  /** Record one proposal for a Host-supplied source message, without allocating a project, Bot, or model run. */
+  proposeProject(input: Omit<StudioProjectProposal, 'proposalId' | 'state' | 'projectId'>):
+    ManagedResult<{ proposal: StudioProjectProposal; created: boolean }> {
+    if (!input) return deny('INVALID_INPUT')
+    const { assistantSessionId, sourceMessageId, sourceRequestId, requestText, intentQuote, name, objective, originTaskId, leaderBotId } = input
+    if (!isId(assistantSessionId) || !isId(sourceRequestId)) return deny('INVALID_INPUT')
+    return this.access.write<{ proposal: StudioProjectProposal; created: boolean }>(() => {
+      if (!this.access.assistantBinding(assistantSessionId)) return deny('SESSION_NOT_BOUND')
+      // A replay returns the first proposal and its current decision, not the replay's candidate data.
+      const existing = this.db.prepare(`SELECT * FROM studio_project_proposal WHERE assistant_session_id = ? AND source_request_id = ?`)
+        .get(assistantSessionId, sourceRequestId)
+      if (existing) return accept({ proposal: readProposalRow(existing), created: false })
+      // The Host supplies the original text. Literal occurrence is evidence, not an interpretation or authorization.
+      if (!isId(sourceMessageId) || !isText(requestText, PROJECT_TEXT_LIMIT) || !isText(intentQuote, PROJECT_TEXT_LIMIT)
+        || !requestText.includes(intentQuote) || !isText(name, PROJECT_NAME_LIMIT) || !isText(objective, PROJECT_TEXT_LIMIT)
+        || (originTaskId !== undefined && !isId(originTaskId)) || (leaderBotId !== undefined && !isId(leaderBotId))) return deny('INVALID_INPUT')
+      if (originTaskId !== undefined && !this.completedOrigin(originTaskId, assistantSessionId)) return deny('ORIGIN_TASK_NOT_COMPLETED')
+      if (leaderBotId !== undefined && !this.leaderBotExists(leaderBotId)) return deny('LEADER_BOT_NOT_FOUND')
+      const proposalId = randomUUID()
+      requireWrite(this.db.prepare(`INSERT INTO studio_project_proposal (proposal_id, assistant_session_id, source_message_id,
+        source_request_id, request_text, intent_quote, name, objective, origin_task_id, leader_bot_id, run_id, state, proposed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`).run(proposalId, assistantSessionId, sourceMessageId, sourceRequestId,
+        requestText, intentQuote, name, objective, originTaskId ?? null, leaderBotId ?? null, this.access.runId, new Date().toISOString()).changes)
+      const proposal: StudioProjectProposal = { proposalId, assistantSessionId, sourceMessageId, sourceRequestId, requestText,
+        intentQuote, name, objective, ...(originTaskId === undefined ? {} : { originTaskId }),
+        ...(leaderBotId === undefined ? {} : { leaderBotId }), state: 'pending' }
+      return accept({ proposal, created: true })
     })
+  }
+
+  /** Host-only: materialize an exact pending proposal after a native user confirmation; never register this as a model tool. */
+  confirmProposal(assistantSessionId: string, proposalId: string, leaderSessionId: string): ManagedResult<StudioProject> {
+    if (!isId(assistantSessionId) || !isId(proposalId) || !isId(leaderSessionId)) return deny('INVALID_INPUT')
+    return this.access.write(() => {
+      if (!this.access.assistantBinding(assistantSessionId)) return deny('SESSION_NOT_BOUND')
+      const row = this.proposalRow(assistantSessionId, proposalId)
+      if (!row) return deny('PROPOSAL_NOT_FOUND')
+      const proposal = readProposalRow(row)
+      if (proposal.state === 'created') {
+        // The Leader may have changed since confirmation. Return the current project without touching the new target.
+        if (proposal.projectId === undefined) throw new Error('Missing Studio proposal project ID')
+        const project = this.project(proposal.projectId)
+        if (!project) throw new Error('Missing project for created Studio proposal')
+        return accept(project)
+      }
+      if (proposal.state === 'closed') return deny('PROPOSAL_CLOSED')
+      if (row.run_id !== this.access.runId) return deny('STALE_HOST_RUN')
+      if (assistantSessionId === leaderSessionId) return deny('SESSION_ALREADY_BOUND')
+      // Revalidate the stored references while creating the project; roll everything back if recording the decision fails.
+      const { name, objective, originTaskId, leaderBotId } = proposal
+      const project = this.createInTransaction({ leaderSessionId, commandId: `studio-project-proposal:${proposalId}`,
+        name, objective, originTaskId, leaderBotId }, assistantSessionId)
+      if (!project.ok) return project
+      requireWrite(this.db.prepare(`UPDATE studio_project_proposal SET state = 'created', project_id = ?, decided_at = ?
+        WHERE assistant_session_id = ? AND proposal_id = ? AND run_id = ? AND state = 'pending'`)
+        .run(project.value.projectId, new Date().toISOString(), assistantSessionId, proposalId, this.access.runId).changes)
+      return project
+    })
+  }
+
+  /** Close an exact pending proposal without modifying the original request or an earlier decision. */
+  closeProposal(assistantSessionId: string, proposalId: string): ManagedResult<StudioProjectProposal> {
+    if (!isId(assistantSessionId) || !isId(proposalId)) return deny('INVALID_INPUT')
+    return this.access.write(() => {
+      if (!this.access.assistantBinding(assistantSessionId)) return deny('SESSION_NOT_BOUND')
+      const row = this.proposalRow(assistantSessionId, proposalId)
+      if (!row) return deny('PROPOSAL_NOT_FOUND')
+      const proposal = readProposalRow(row)
+      if (proposal.state === 'closed') return accept(proposal)
+      if (proposal.state === 'created') return deny('PROPOSAL_ALREADY_CREATED')
+      if (row.run_id !== this.access.runId) return deny('STALE_HOST_RUN')
+      requireWrite(this.db.prepare(`UPDATE studio_project_proposal SET state = 'closed', decided_at = ?
+        WHERE assistant_session_id = ? AND proposal_id = ? AND run_id = ? AND state = 'pending'`)
+        .run(new Date().toISOString(), assistantSessionId, proposalId, this.access.runId).changes)
+      return accept({ ...proposal, state: 'closed' })
+    })
+  }
+
+  /** Read a proposal by exact ID, or the last one recorded for this Assistant Session, including previous runs. */
+  readProposal(assistantSessionId: string, proposalId?: string): ManagedResult<StudioProjectProposal> {
+    if (!isId(assistantSessionId) || (proposalId !== undefined && !isId(proposalId))) return deny('INVALID_INPUT')
+    try {
+      if (!this.access.assistantBinding(assistantSessionId)) return deny('SESSION_NOT_BOUND')
+      const row = this.proposalRow(assistantSessionId, proposalId)
+      return row ? accept(readProposalRow(row)) : deny('PROPOSAL_NOT_FOUND')
+    } catch {
+      return deny('STORAGE_ERROR')
+    }
+  }
+
+  /** Create the project and its first binding inside the caller's fenced write transaction. */
+  private createInTransaction(input: CreateInput, originAssistantSessionId?: string): ManagedResult<StudioProject> {
+    const { leaderSessionId, commandId, name, objective, leaderBotId, originTaskId } = input
+    if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
+    if (this.sessionBound(leaderSessionId)) return deny('SESSION_ALREADY_BOUND')
+    // Link the existing completed draft without taking ownership of its Session or creating a new execution.
+    if (originTaskId !== undefined) {
+      if (!this.completedOrigin(originTaskId, originAssistantSessionId)) return deny('ORIGIN_TASK_NOT_COMPLETED')
+      if (this.db.prepare('SELECT 1 FROM studio_project WHERE origin_task_id = ?').get(originTaskId)) return deny('ORIGIN_TASK_ALREADY_LINKED')
+    }
+    const bot = this.resolveBot(leaderBotId)
+    if (!bot.ok) return bot
+    const projectId = randomUUID()
+    requireWrite(this.db.prepare(`INSERT INTO studio_project (project_id, name, objective, origin_task_id, management_epoch)
+      VALUES (?, ?, ?, ?, 1)`).run(projectId, name, objective, originTaskId ?? null).changes)
+    const binding = { projectId, leaderBotId: bot.value, leaderSessionId, managementEpoch: 1 }
+    this.insertBinding(binding, commandId)
+    return accept({ ...binding, name, objective, ...(originTaskId === undefined ? {} : { originTaskId }), pendingCount: 0 })
   }
 
   /** Transfer management to a never-bound Session; keep the prior binding and advance exactly one epoch. */
@@ -533,12 +683,28 @@ export class ProjectStore {
     return !!this.db.prepare('SELECT 1 FROM studio_project_binding WHERE command_id = ?').get(commandId)
   }
 
+  /** Scope exact IDs and latest lookups to the originating Session, not the shared Assistant Bot. */
+  private proposalRow(assistantSessionId: string, proposalId?: string): Record<string, SQLOutputValue> | undefined {
+    return proposalId === undefined
+      ? this.db.prepare(`SELECT * FROM studio_project_proposal WHERE assistant_session_id = ? ORDER BY seq DESC LIMIT 1`)
+        .get(assistantSessionId)
+      : this.db.prepare(`SELECT * FROM studio_project_proposal WHERE assistant_session_id = ? AND proposal_id = ?`)
+        .get(assistantSessionId, proposalId)
+  }
+
+  /** Native creation can link any completed draft; a proposal can only link its Assistant Session's draft. */
+  private completedOrigin(taskId: string, assistantSessionId?: string): boolean {
+    const draft = this.db.prepare('SELECT state, assistant_session_id FROM studio_draft_task WHERE task_id = ?').get(taskId)
+    return draft?.state === 'completed' && (assistantSessionId === undefined || draft.assistant_session_id === assistantSessionId)
+  }
+
+  private leaderBotExists(botId: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM studio_leader_bot WHERE bot_id = ?').get(botId)
+  }
+
   /** An explicit ID must already belong to a Leader Bot; only the allocation path inserts a Bot. */
   private resolveBot(botId?: string): ManagedResult<string> {
-    if (botId !== undefined) {
-      return this.db.prepare('SELECT 1 FROM studio_leader_bot WHERE bot_id = ?').get(botId)
-        ? accept(botId) : deny('LEADER_BOT_NOT_FOUND')
-    }
+    if (botId !== undefined) return this.leaderBotExists(botId) ? accept(botId) : deny('LEADER_BOT_NOT_FOUND')
     const created = randomUUID()
     requireWrite(this.db.prepare('INSERT INTO studio_leader_bot (bot_id) VALUES (?)').run(created).changes)
     return accept(created)
