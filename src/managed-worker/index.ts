@@ -9,6 +9,7 @@ import s from '@deepseek-ai/schemastery'
 import { lockSync } from 'proper-lockfile'
 import { z } from 'zod'
 import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool } from './assistant.ts'
+import { captureDocumentInstructions, documentHoldError, instructionCommand } from './instructions.ts'
 import { LEADER_PRESET, StudioProjectControl, isLeaderTool } from './project.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
 
@@ -16,6 +17,7 @@ export const name = 'dsh-superagent-managed-worker'
 export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'permissionPresets', 'sandboxPolicy', 'systemPrompt', 'tools', 'webServer']
 export const Config = s.object({
   stateDir: s.string().required().description('Absolute directory reserved for the Studio database.'),
+  guiDocumentInbox: s.boolean().default(false).description('Hold pending document writes for owner review when a new chat message arrives in the bound document Worker.'),
 })
 type Config = ReturnType<typeof Config>
 
@@ -67,17 +69,15 @@ function localOwnerHost(ctx: Context): ManagedHost {
 const rejected = (reason: string): CommandResult => ({ kind: 'error', text: `Managed document control rejected: ${reason}` })
 
 /** Report success only after the Store confirms a durable commit. Keep document text out of Session command history. */
-function receipt(operation: string, result: ManagedResult<ManagedTask>): CommandResult {
-  if (!result.ok) return result.reason === 'PAUSE_UNCONFIRMED'
-    ? { kind: 'error', text: 'Pause not saved; affected writes remain blocked in this host. Retry /studio-doc pause in the current Worker, or run /studio-doc status there after restart.' }
-    : rejected(result.reason)
+function receipt(operation: string, result: ManagedResult<ManagedTask>, showResume = true): CommandResult {
+  if (!result.ok) return documentHoldError(result.reason) ?? rejected(result.reason)
   const task = result.value
-  const resume = task.paused ? ` To allow writes again when ready, run /studio-doc resume ${task.authorizationVersion} in the current Worker.` : ''
+  const resume = task.paused && showResume ? ` To allow writes again when ready, run /studio-doc resume ${task.authorizationVersion} in the current Worker.` : ''
   return { kind: 'success', text: `${operation}: task ${task.taskId}; execution epoch ${task.executionEpoch}; authorization version ${task.authorizationVersion}; document version ${task.documentVersion}; ${task.paused ? 'paused' : 'active'}.${resume}` }
 }
 
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
-export function apply(context: Context, { stateDir }: Config): void {
+export function apply(context: Context, { stateDir, guiDocumentInbox }: Config): void {
   const ctx = localOwnerHost(context)
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
@@ -203,11 +203,18 @@ export function apply(context: Context, { stateDir }: Config): void {
   })
   for (const agent of ctx.agents.list()) configure(agent)
 
+  if (guiDocumentInbox) captureDocumentInstructions(ctx, store, session => {
+    if (!available || !controlReady(ctx)) return false
+    const agent = ctx.agents.get(session.id)
+    // Restrictions on the role's tools do not turn a message to its exact live Session into an untracked input.
+    return agent?.session === session && scopes.get(agent)?.role === 'document-worker'
+  })
+
   // DSH Web authorizes commands.execute through its native remote access checks. Document authorization stays user-only.
   ctx.effect(() => ctx.commands.register({
     name: 'studio-doc',
     description: 'Manage a document task in this managed worker Session.',
-    input: { hint: 'start <JSON> | status | pause | transfer <task-id> <epoch> | resume <authorization-version>' },
+    input: { hint: 'start <JSON> | status | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review <instruction-id> <authorization-version> <unchanged|pause>' },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()
@@ -216,6 +223,9 @@ export function apply(context: Context, { stateDir }: Config): void {
       // This command commits control state without queuing a Worker message or cancelling the turn. The action checks that state before committing.
       if (rawInput.length > TEXT_LIMIT * 12 + 128) return rejected('INPUT_TOO_LARGE')
       const [, verb, argument = ''] = /^\s*(\S+)(?:\s+([\s\S]*))?$/.exec(rawInput.trim()) ?? []
+      // Keep review available even after capture is disabled; toggling the listener must not clear a durable pending hold.
+      const instruction = instructionCommand(store, agent.id, commandId, verb, argument)
+      if (instruction) return instruction
       if (verb === 'start') {
         let json: unknown
         try { json = JSON.parse(argument) } catch { return rejected('INVALID_START_JSON') }
@@ -225,7 +235,7 @@ export function apply(context: Context, { stateDir }: Config): void {
           : rejected('INVALID_START_JSON')
       }
       if (verb === 'status' && argument === '') return receipt('Managed task status', store.status(agent.id))
-      if (verb === 'pause' && argument === '') return receipt('Pause effective', store.pause(agent.id, commandId))
+      if (verb === 'pause' && argument === '') return receipt('Pause effective', store.pause(agent.id, commandId), false)
       if (verb === 'transfer') {
         const fields = /^([a-f0-9-]{36})\s+([1-9]\d*)$/.exec(argument)
         const epoch = version.safeParse(Number(fields?.[2]))

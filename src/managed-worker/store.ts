@@ -4,6 +4,8 @@ import { chmodSync, closeSync, fchmodSync, lstatSync, mkdirSync, openSync, realp
 import { dirname, resolve } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
+import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
+  type StudioInstructionInput } from './instruction-store.js'
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
 
 /** A failure does not confirm a write. Use the reason to block the action or guide the user through a retry. */
@@ -230,6 +232,9 @@ export class ManagedWorkerStore {
   readonly #runId = randomUUID()
   private readonly frozenTasks = new Set<string>()
   private readonly frozenSessions = new Set<string>()
+  private readonly instructions = new InstructionStore(() => this.db)
+  // The failed capture may not identify a task. Keep this document-wide fence until a new run recovers the dirty marker.
+  private captureFault = false
   private closed = false
   readonly recoveredTasks: number
   /** Internal Studio project facade sharing this Store's connection and run fence. */
@@ -251,6 +256,7 @@ export class ManagedWorkerStore {
       const started = this.transaction(() => {
         this.db.exec(SCHEMA)
         this.db.exec(PROJECT_SCHEMA)
+        this.db.exec(INSTRUCTION_SCHEMA)
         const previous = this.db.prepare('SELECT clean FROM managed_host_run WHERE singleton = 1').get()
         // A failed pause may have left no task ID in durable storage. A dirty run (or a pre-fence database) cannot carry forward any pending write authorization.
         const recoveredTasks = previous?.clean === 1 ? 0 : this.pauseUnfinishedTasks()
@@ -297,9 +303,9 @@ export class ManagedWorkerStore {
     return this.#db
   }
 
-  /** Mark a normal stop only after admission is disabled and every pause is confirmed. Otherwise leave the committed dirty marker intact. */
+  /** Mark a normal stop only after admission is disabled and there is no unconfirmed pause or input capture. */
   finishRun(): void {
-    if (this.closed || this.frozenTasks.size || this.frozenSessions.size) return
+    if (this.closed || this.captureFault || this.frozenTasks.size || this.frozenSessions.size) return
     this.transaction(() => {
       if (!this.ownsRun()) return deny('STALE_HOST_RUN')
       requireWrite(this.db.prepare('UPDATE managed_host_run SET clean = 1 WHERE singleton = 1 AND run_id = ?')
@@ -449,13 +455,78 @@ export class ManagedWorkerStore {
     return !!this.binding(sessionId) || this.studioSessionBound(sessionId)
   }
 
-  /** Show the current authorization version without exposing document text or treating an unconfirmed pause as active. */
+  /** Capture a GUI delivery only for the current writable document binding. A failed capture cannot be cleared in this run. */
+  receiveGuiInstruction(sessionId: string, input: StudioInstructionInput): ManagedResult<{ recorded: boolean }> {
+    if (!isId(sessionId)) return deny('INVALID_INPUT')
+    try {
+      const { channel, sourceScope } = input ?? {}
+      if (channel !== 'gui' || sourceScope !== sessionId) return deny('INVALID_INPUT')
+      const { requestId, messageId, eventSeq, sourceTimeMs, text } = input
+      const source: StudioInstructionInput = { channel, sourceScope, requestId, messageId, eventSeq, sourceTimeMs, text }
+      const result = this.write<{ recorded: boolean }>(() => {
+        const current = this.currentTask(sessionId)
+        if (!current.ok || current.value.documentVersion !== 1) return accept({ recorded: false })
+        const { taskId, executionEpoch, authorizationVersion } = current.value
+        if (!this.instructions.record(taskId, executionEpoch, source)) return accept({ recorded: false })
+        // Preserve the approved text and pause state, but invalidate every permit issued before this input.
+        requireWrite(this.db.prepare(`UPDATE managed_task SET authorization_version = authorization_version + 1
+          WHERE task_id = ? AND execution_epoch = ? AND authorization_version = ?`)
+          .run(taskId, executionEpoch, authorizationVersion).changes)
+        return accept({ recorded: true })
+      })
+      if (result.ok) return result
+    } catch { /* Source could not be read safely. Treat it as an unconfirmed capture. */ }
+    this.captureFault = true
+    return deny('INSTRUCTION_UNCONFIRMED')
+  }
+
+  /** Read the oldest pending item and its authorization version. An incomplete ledger cannot attest that the inbox is empty. */
+  instructionInbox(sessionId: string): ManagedResult<{ task: ManagedTask; pending?: StudioDocumentInstruction; remaining: number }> {
+    if (!isId(sessionId)) return deny('INVALID_INPUT')
+    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
+    return this.write(() => {
+      const current = this.currentTask(sessionId)
+      if (!current.ok) return current
+      if (this.isFrozen(current.value)) return deny('PAUSE_UNCONFIRMED')
+      return accept({ task: current.value, ...this.instructions.inbox(current.value.taskId) })
+    })
+  }
+
+  /** Review exactly the oldest pending item without changing the approved text or lifting any prior pause. */
+  reviewInstruction(sessionId: string, instructionId: string, expectedAuthorizationVersion: number,
+    decision: InstructionDecision, commandId: string): ManagedResult<{ task: ManagedTask; remaining: number }> {
+    if (!isId(sessionId) || !isId(instructionId) || !isVersion(expectedAuthorizationVersion) || !isId(commandId)
+      || (decision !== 'unchanged' && decision !== 'pause')) return deny('INVALID_INPUT')
+    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
+    return this.write(() => {
+      const current = this.currentTask(sessionId)
+      if (!current.ok) return current
+      const task = current.value
+      if (this.isFrozen(task)) return deny('PAUSE_UNCONFIRMED')
+      if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
+      if (task.authorizationVersion !== expectedAuthorizationVersion) return deny('STALE_AUTHORIZATION')
+      const { pending, remaining } = this.instructions.inbox(task.taskId)
+      if (pending?.instructionId !== instructionId) return deny('INSTRUCTION_NOT_PENDING')
+      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
+      const next = { ...task, paused: task.paused || decision === 'pause', authorizationVersion: expectedAuthorizationVersion + 1 }
+      // Updating both rows under the write lock binds the disposition to this authorization version and epoch.
+      requireWrite(this.db.prepare(`UPDATE managed_task SET paused = ?, authorization_version = ?
+        WHERE task_id = ? AND execution_epoch = ? AND authorization_version = ?`)
+        .run(next.paused ? 1 : 0, next.authorizationVersion, task.taskId, task.executionEpoch, expectedAuthorizationVersion).changes)
+      this.instructions.review(task.taskId, task.executionEpoch, instructionId, sessionId, next.authorizationVersion, decision, commandId)
+      return accept({ task: next, remaining: remaining - 1 })
+    })
+  }
+
+  /** Show the current authorization version only if no unconfirmed instruction or pause blocks it. */
   status(sessionId: string): ManagedResult<ManagedTask> {
     if (!isId(sessionId)) return deny('INVALID_INPUT')
+    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
     try {
       if (!this.ownsRun()) return deny('STALE_HOST_RUN')
       const current = this.currentTask(sessionId)
-      return current.ok && this.isFrozen(current.value) ? deny('PAUSE_UNCONFIRMED') : current
+      if (!current.ok) return current
+      return this.authorizationBlocked(current.value) ?? current
     } catch {
       return deny('STORAGE_ERROR')
     }
@@ -464,6 +535,7 @@ export class ManagedWorkerStore {
   /** Create the version 1 document for the current Session and record the only approved replacement text. */
   create(sessionId: string, initialText: string, approvedText: string, commandId: string): ManagedResult<ManagedTask> {
     if (!isId(sessionId) || !isText(initialText) || !isText(approvedText) || !isId(commandId)) return deny('INVALID_INPUT')
+    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
     return this.write(() => {
       if (this.sessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
       if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
@@ -498,19 +570,26 @@ export class ManagedWorkerStore {
     }
     // Block writes before taking the SQLite write lock. A failed transaction leaves the local block in place and prevents a clean-stop marker.
     const { taskId, executionEpoch } = task
+    const wasFrozen = this.isFrozen(task)
     this.frozenTasks.add(taskId)
     this.frozenSessions.delete(sessionId)
     const result = this.write(() => {
       const current = this.currentTask(sessionId)
       if (!current.ok || current.value.taskId !== taskId || current.value.executionEpoch !== executionEpoch) return deny('STALE_EXECUTION')
+      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
       requireWrite(this.db.prepare('UPDATE managed_task SET paused = 1, authorization_version = authorization_version + 1 WHERE task_id = ? AND execution_epoch = ?')
         .run(taskId, executionEpoch).changes)
       const paused = { ...current.value, paused: true, authorizationVersion: current.value.authorizationVersion + 1 }
       this.audit('pause', paused, commandId, null)
       return accept(paused)
     })
-    if (!result.ok) return deny('PAUSE_UNCONFIRMED')
-    // Clear the local block only after COMMIT is confirmed and the durable pause can block writes.
+    if (!result.ok) {
+      if (result.reason === 'STORAGE_ERROR') return deny('PAUSE_UNCONFIRMED')
+      // Known rejections did not attempt a pause. Keep only a fence from an earlier unconfirmed attempt.
+      if (!wasFrozen) this.frozenTasks.delete(taskId)
+      return result
+    }
+    // A confirmed COMMIT replaces the local block with a durable pause.
     this.frozenTasks.delete(taskId)
     return result
   }
@@ -518,11 +597,13 @@ export class ManagedWorkerStore {
   /** Transfer to a previously unbound Session only if the expected epoch matches. Preserve the pause and approved text, and invalidate permits from the old epoch. */
   transfer(taskId: string, expectedEpoch: number, nextSessionId: string, commandId: string): ManagedResult<ManagedTask> {
     if (!isId(taskId) || !isVersion(expectedEpoch) || !isId(nextSessionId) || !isId(commandId)) return deny('INVALID_INPUT')
+    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
     return this.write(() => {
       const task = this.task(taskId)
       if (!task) return deny('TASK_NOT_FOUND')
       if (task.executionEpoch !== expectedEpoch) return deny('STALE_EXECUTION')
-      if (this.isFrozen(task)) return deny('PAUSE_UNCONFIRMED')
+      const blocked = this.authorizationBlocked(task)
+      if (blocked) return blocked
       if (this.sessionBound(nextSessionId)) return deny('SESSION_ALREADY_BOUND')
       if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
       const next = { ...task, workerSessionId: nextSessionId, executionEpoch: expectedEpoch + 1, authorizationVersion: task.authorizationVersion + 1 }
@@ -537,11 +618,13 @@ export class ManagedWorkerStore {
   /** Resume a durably paused task only when its authorization version matches and no unconfirmed pause remains. */
   resume(sessionId: string, expectedAuthorizationVersion: number, commandId: string): ManagedResult<ManagedTask> {
     if (!isId(sessionId) || !isVersion(expectedAuthorizationVersion) || !isId(commandId)) return deny('INVALID_INPUT')
+    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
     return this.write(() => {
       const current = this.currentTask(sessionId)
       if (!current.ok) return current
       const task = current.value
-      if (this.isFrozen(task)) return deny('PAUSE_UNCONFIRMED')
+      const blocked = this.authorizationBlocked(task)
+      if (blocked) return blocked
       if (task.authorizationVersion !== expectedAuthorizationVersion) return deny('STALE_AUTHORIZATION')
       if (!task.paused) return deny('TASK_NOT_PAUSED')
       if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
@@ -557,6 +640,7 @@ export class ManagedWorkerStore {
   /** Issue a permit for the current epoch, exact document version, and approved text without writing the document. */
   authorize(sessionId: string, action: unknown, toolCallId: string): ManagedResult<ManagedWritePermit> {
     if (!isId(sessionId) || !isId(toolCallId)) return deny('INVALID_INPUT')
+    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
     try {
       if (!this.ownsRun()) return deny('STALE_HOST_RUN')
       const current = this.currentTask(sessionId)
@@ -586,6 +670,7 @@ export class ManagedWorkerStore {
     const spent = this.#permits.get(permit)
     if (spent === undefined) return deny('INVALID_PERMIT')
     if (spent) return deny('DUPLICATE_ACTION')
+    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
     const result = this.write(() => {
       const current = this.currentTask(permit.workerSessionId)
       if (!current.ok || current.value.taskId !== permit.taskId || current.value.executionEpoch !== permit.executionEpoch) return deny('STALE_EXECUTION')
@@ -666,6 +751,7 @@ export class ManagedWorkerStore {
 
   private commandUsed(commandId: string): boolean {
     return !!this.db.prepare('SELECT 1 FROM managed_audit WHERE command_id = ?').get(commandId)
+      || this.instructions.commandUsed(commandId)
   }
 
   private actionUsed(sessionId: string, toolCallId: string): boolean {
@@ -682,8 +768,13 @@ export class ManagedWorkerStore {
     return this.frozenTasks.has(task.taskId) || this.frozenSessions.has(task.workerSessionId)
   }
 
-  private executionBlocked(task: ManagedTask): Rejection | undefined {
+  /** Check the durable inbox before the pause so callers can route pending work to the owner review command. */
+  private authorizationBlocked(task: ManagedTask): Rejection | undefined {
+    if (this.instructions.hasPending(task.taskId)) return deny('INSTRUCTION_PENDING')
     if (this.isFrozen(task)) return deny('PAUSE_UNCONFIRMED')
-    if (task.paused) return deny('TASK_PAUSED')
+  }
+
+  private executionBlocked(task: ManagedTask): Rejection | undefined {
+    return this.authorizationBlocked(task) ?? (task.paused ? deny('TASK_PAUSED') : undefined)
   }
 }
