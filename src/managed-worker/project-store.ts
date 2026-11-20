@@ -330,6 +330,27 @@ export class ProjectStore {
     }
   }
 
+  /** Internal Advisor lookup. The caller holds the run-fenced read or write transaction. */
+  adviceAuthority(sessionId: string): ManagedResult<StudioProjectBinding> {
+    return this.currentProject(sessionId)
+  }
+
+  /** Internal Advisor evidence lookup. Only completed standalone text work in this project can supply evidence. */
+  workEvidence(projectId: string, workId: string):
+    (Pick<StudioProjectRun, 'workId' | 'workerSessionId' | 'workerBotId' | 'executionEpoch'> & { result: StudioDraftResult }) | undefined {
+    // Filter by both the registered project and dispatch project before reading any result. Do not open document or job records.
+    const row = this.db.prepare(`SELECT d.* FROM studio_project_dispatch d
+      JOIN studio_project_work w ON w.work_id = d.work_id
+      JOIN studio_project_binding b ON b.leader_session_id = w.leader_session_id
+      WHERE d.work_id = ? AND b.project_id = ? AND d.project_id = b.project_id AND d.state = 'completed'
+        AND NOT EXISTS (SELECT 1 FROM studio_project_document WHERE work_id = w.work_id)
+        AND NOT EXISTS (SELECT 1 FROM studio_project_job WHERE work_id = w.work_id)`).get(workId, projectId)
+    if (!row) return
+    const { workerSessionId, workerBotId, executionEpoch, result } = readRunRow(row)
+    if (!result) throw new Error('Missing completed Studio text result')
+    return { workId, workerSessionId, workerBotId, executionEpoch, result }
+  }
+
   /** Show current project state by ID or by the caller's durable Leader role. The Host authorizes this read. */
   status(sessionId: string, projectId?: string): ManagedResult<StudioProject> {
     if (!isId(sessionId) || (projectId !== undefined && !isId(projectId))) return deny('INVALID_INPUT')
@@ -511,6 +532,11 @@ export class ProjectStore {
       if (!current.ok) return current
       const { projectId, leaderBotId, managementEpoch } = current.value
       const binding = { projectId, leaderBotId, leaderSessionId, managementEpoch }
+      // Reject either coordinate claimed by advice, even if the other matches an earlier work registration.
+      if (this.db.prepare(`SELECT 1 FROM studio_advice WHERE role = 'leader' AND requester_session_id = ?
+        AND (source_message_id = ? OR source_request_id = ?) LIMIT 1`).get(leaderSessionId, sourceMessageId, sourceRequestId)) {
+        return deny('SOURCE_ALREADY_USED')
+      }
       const existing = this.db.prepare(`SELECT work_id, source_message_id, request_text FROM studio_project_work
         WHERE leader_session_id = ? AND source_request_id = ?`).get(leaderSessionId, sourceRequestId)
       if (existing) {

@@ -9,7 +9,9 @@ import s from '@deepseek-ai/schemastery'
 import { lockSync } from 'proper-lockfile'
 import { z } from 'zod'
 import { AgentDelivery } from '../app/delivery.ts'
-import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool } from './assistant.ts'
+import type { AdvisorRoute } from './advisor-store.ts'
+import { AdvisorConfig, StudioAdvisor, advisorSelection, isAdvisorTool } from './advisor.ts'
+import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool, type RestrictedTextRole } from './assistant.ts'
 import { documentStartArgs, sharedDocumentCommand, sharedDocumentCoordinates, sharedDocumentError } from './document-command.ts'
 import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, feishuSourceScope, validateFeishuInbox } from './feishu-inbox.ts'
 import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './feishu-text.ts'
@@ -28,6 +30,8 @@ export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'perm
 export const Config = s.object({
   stateDir: s.string().required().description('Absolute directory reserved for the Studio database.'),
   guiDocumentInbox: s.boolean().default(false).description('Hold pending document writes for owner review when a new chat message arrives in the bound document Worker.'),
+  advisor: s.union([s.const(null), AdvisorConfig]).default(null)
+    .description('Opt-in route for independent, tool-free Advisor consultations; null disables new consultations.'),
   feishuDocumentInbox: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
     .description('Optional, separately configured single-owner Feishu inbox for a managed document.'),
   feishuTextInbox: s.union([s.const(null), FeishuTextInboxConfig]).default(null)
@@ -51,7 +55,7 @@ const writeSchema = z.strictObject({ expectedVersion: version.describe('The docu
 
 interface CommandResult { kind: 'success' | 'error'; text: string }
 interface CommandInput { agent: Agent; commandId: string; rawInput: string; signal: AbortSignal }
-type StudioRole = 'assistant' | 'leader' | 'draft-worker' | 'document-worker'
+type StudioRole = 'assistant' | 'leader' | 'document-worker' | RestrictedTextRole
 interface StudioScope { role: StudioRole; dispose(): void }
 
 /** Only the rc.3 additions used here are declared. The running host provides the services; no second Cordis or DSH runtime is loaded. */
@@ -102,9 +106,11 @@ function receipt(operation: string, result: ManagedResult<ManagedTask>, showResu
 
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
 export function apply(context: Context, config: Config): void {
-  const { stateDir, guiDocumentInbox, feishuDocumentInbox, feishuTextInbox, quotaPools, quotaFeishuAlerts, systemdJobInbox, systemdJobPollSeconds } = config
+  const { stateDir, guiDocumentInbox, advisor, feishuDocumentInbox, feishuTextInbox, quotaPools, quotaFeishuAlerts,
+    systemdJobInbox, systemdJobPollSeconds } = config
   const ctx = localOwnerHost(context)
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
+  const advisoryModel = advisor ? advisorSelection(advisor) : undefined
   if (systemdJobPollSeconds !== 0 && (!systemdJobInbox || !Number.isInteger(systemdJobPollSeconds) || systemdJobPollSeconds < 5 || systemdJobPollSeconds > 300)) {
     throw new Error('Studio job watcher requires systemdJobInbox and a polling interval of 5–300 seconds')
   }
@@ -150,8 +156,8 @@ export function apply(context: Context, config: Config): void {
     && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
   const channelReady = () => available && controlReady(ctx)
   const quota = new StudioQuotaControl(ctx, store, quotaPools, providerPool, quotaFeishuAlerts)
-  const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), agent => ready(agent, 'draft-worker'),
-    provider => quota.denial(provider))
+  const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), ready, provider => quota.denial(provider))
+  const advisors = new StudioAdvisor(ctx, store, drafts, advisoryModel, ready, channelStop.signal)
   const studies = new StudioStudy(store, drafts, agent => ready(agent, 'assistant'), channelStop.signal)
   const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts, provider => providerPool.get(provider))
   const jobMonitor = systemdJobPollSeconds ? new StudioProjectJobMonitor(store, systemdJobPollSeconds * 1000, channelReady, (permit, signal) => {
@@ -169,6 +175,7 @@ export function apply(context: Context, config: Config): void {
 
   /** A persisted binding wins over the picker, so a retired or finished Worker cannot become a different role on resume. */
   function roleOf(agent: Agent): StudioRole | undefined {
+    if (store.advice.binding(agent.id)) return 'advisor'
     if (store.draftBinding(agent.id) || store.studies.binding(agent.id) || store.feishuDraftBinding(agent.id) || store.projects.workerBound(agent.id)) {
       return 'draft-worker'
     }
@@ -192,6 +199,7 @@ export function apply(context: Context, config: Config): void {
       if (channelRun) await channelRun
       if (quotaNoticeRun) await quotaNoticeRun
       await feishuText?.drain()
+      await advisors.drain()
       await studies.drain()
       await projectJobs?.drain()
       if (projectJobRun) await projectJobRun
@@ -219,9 +227,9 @@ export function apply(context: Context, config: Config): void {
         const bound = store.bindAssistant(agent.id)
         if (!bound.ok) throw new Error(`Cannot bind Studio Assistant: ${bound.reason}`)
       }
-      const unregister = role === 'leader' ? projects.install(agent)
-        : role === 'assistant' ? drafts.install(agent, role, () => intake.install(agent), () => studies.install(agent))
-          : role === 'draft-worker' ? drafts.install(agent, role) : agent.ctx.tools.register({
+      const unregister = role === 'leader' ? projects.install(agent, () => advisors.install(agent, role))
+        : role === 'assistant' ? drafts.install(agent, role, () => intake.install(agent), () => studies.install(agent), () => advisors.install(agent, role))
+          : role !== 'document-worker' ? drafts.install(agent, role) : agent.ctx.tools.register({
         name: TOOL,
         description: 'Replace the text of the managed document bound to this worker, using its approved text and version.',
         parameters: z.toJSONSchema(writeSchema),
@@ -251,8 +259,9 @@ export function apply(context: Context, config: Config): void {
     try { role = agent && (scopes.get(agent)?.role ?? roleOf(agent)) }
     catch { return 'Studio tool denied: STORAGE_ERROR' }
     if (!role || !agent) return exec.name === TOOL || exec.name === PROPOSE_PROJECT || isAssistantTool(exec.name)
-      || isStudyTool(exec.name) || isLeaderTool(exec.name) ? 'Studio tool denied: INVALID_EXECUTION' : undefined
+      || isStudyTool(exec.name) || isLeaderTool(exec.name) || isAdvisorTool(exec.name) ? 'Studio tool denied: INVALID_EXECUTION' : undefined
     if (!ready(agent, role) || exec.parent !== undefined) return 'Studio tool denied: INVALID_EXECUTION'
+    if (isAdvisorTool(exec.name)) return advisors.guard(agent, exec.name, role)
     if (role === 'assistant' && (isAssistantTool(exec.name) || isStudyTool(exec.name)
       || (exec.name === PROPOSE_PROJECT && intake.available(agent)))) return undefined
     if (role === 'leader') return projects.guard(agent, exec.name)
@@ -270,10 +279,15 @@ export function apply(context: Context, config: Config): void {
     const agent = ctx.agents.get(id as SessionId)
     if (agent) configure(agent)
   })
-  ctx.on('agent/pre-step', async ({ agent, turn, messages }, next) => {
+  ctx.on('agent/pre-step', async (step, next) => {
+    const { agent, turn, messages } = step
     const role = scopes.get(agent)?.role
     if ((role === 'assistant' || role === 'leader') && !ready(agent, role)) return { kind: 'reject' }
-    if (role === 'draft-worker' && !drafts.admit(agent, messages, turn)) return { kind: 'reject' }
+    if (role === 'draft-worker' || role === 'advisor') {
+      // The installed Host captures the exact selection for this step, including later native retries.
+      const selection = (step as typeof step & { modelSelection?: AdvisorRoute }).modelSelection
+      if (!drafts.admit(agent, messages, turn, selection)) return { kind: 'reject' }
+    }
     if (!validateDocumentRelays(store, agent, messages, () => ready(agent, 'document-worker'))) return { kind: 'reject' }
     return next()
   })
@@ -360,6 +374,16 @@ export function apply(context: Context, config: Config): void {
         return { kind: 'error', text: `Cannot read Studio result: ${external.reason}.` }
       }
       return { kind: 'error', text: `Cannot read Studio result: ${result.reason}.` }
+    },
+  }))
+  ctx.effect(() => ctx.commands.register({
+    name: 'studio-advice',
+    description: 'Read the recorded opinion and the Advisor’s provenance without running a model.',
+    input: { hint: '<advice-id>' },
+    recordInput: false,
+    handler({ agent, rawInput, signal }) {
+      signal.throwIfAborted()
+      return advisors.command(agent, rawInput)
     },
   }))
   ctx.effect(() => ctx.commands.register({

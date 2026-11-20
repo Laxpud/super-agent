@@ -1,9 +1,10 @@
-/** Durable execution authority for managed document Workers and Studio drafts, studies, and projects. */
+/** Durable execution authority for managed document Workers and Studio drafts, studies, projects, and advice. */
 import { randomUUID } from 'node:crypto'
 import { chmodSync, closeSync, fchmodSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
+import { ADVISOR_SCHEMA, AdvisorStore, interruptAdvice } from './advisor-store.js'
 import { FEISHU_DELIVERY_SCHEMA, FeishuDeliveryStore, feishuDeliveryCoordinates } from './feishu-delivery-store.js'
 import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFeishuDraftTask } from './feishu-draft-store.js'
 import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
@@ -311,9 +312,10 @@ export class ManagedWorkerStore {
   private captureFault = false
   private closed = false
   readonly recoveredTasks: number
-  /** Internal Studio project and study facades share this Store's connection and run fence. */
+  /** Internal Studio facets share this Store's connection and run fence. */
   readonly projects: ProjectStore
   readonly studies: StudyStore
+  readonly advice: AdvisorStore
 
   /** Open the database under the host directory lock. Do not enable actions until the recovery transaction has committed. */
   constructor(path: string, quotaPoolIds: readonly string[] = [], private readonly quotaNoticeScope?: string,
@@ -336,6 +338,7 @@ export class ManagedWorkerStore {
         this.db.exec(SCHEMA)
         this.db.exec(PROJECT_SCHEMA)
         this.db.exec(STUDY_SCHEMA)
+        this.db.exec(ADVISOR_SCHEMA)
         this.db.exec(PROJECT_DOCUMENT_SCHEMA)
         this.db.exec(PROJECT_JOB_SCHEMA)
         this.db.exec(PROJECT_JOB_AUTO_SCHEMA)
@@ -358,6 +361,7 @@ export class ManagedWorkerStore {
         }
         this.feishuDrafts.interruptRunning()
         interruptStudies(this.db)
+        interruptAdvice(this.db)
         // A restart frees only reservations that never entered the model. Running attempts remain terminal.
         // Releasing a reservation never unspends its automatic grant; grants not yet tried survive the restart.
         this.db.exec(`UPDATE studio_project_dispatch SET
@@ -397,6 +401,17 @@ export class ManagedWorkerStore {
         runId: this.#runId,
         assistantBinding: sessionId => this.assistantBinding(sessionId),
         sessionBound: sessionId => this.sessionBound(sessionId),
+      })
+      this.advice = new AdvisorStore({
+        db: () => this.db,
+        write: operation => this.write(operation),
+        snapshot: operation => this.snapshot(operation),
+        runId: this.#runId,
+        sessionBound: sessionId => this.sessionBound(sessionId),
+        assistantBinding: sessionId => this.adviceAssistantBinding(sessionId),
+        leaderBinding: sessionId => this.nonProjectSessionBound(sessionId) ? undefined : this.projects.binding(sessionId),
+        adviceAuthority: sessionId => this.projects.adviceAuthority(sessionId),
+        workEvidence: (projectId, workId) => this.projects.workEvidence(projectId, workId),
       })
     } catch (error) {
       try { this.close() } catch { /* Preserve the initialization error. */ }
@@ -714,15 +729,26 @@ export class ManagedWorkerStore {
     return result.ok && result.value
   }
 
-  /** Check roles other than project Leader; the permanent project Worker lookup does not call back into the Store. */
+  /** Check permanent secondary roles without reentering any facade's transaction. */
+  private studioExecutionSessionBound(sessionId: string): boolean {
+    return !!(this.draftBinding(sessionId) || this.feishuDraftBinding(sessionId) || this.studies.binding(sessionId)
+      || this.advice.binding(sessionId) || this.projects.workerBound(sessionId))
+  }
+
+  /** Advice can use an Assistant binding only when the same Session has no other permanent role. */
+  private adviceAssistantBinding(sessionId: string): string | undefined {
+    const bot = this.assistantBinding(sessionId)
+    return bot && !this.binding(sessionId) && !this.projects.binding(sessionId) && !this.studioExecutionSessionBound(sessionId)
+      ? bot : undefined
+  }
+
+  /** Check roles other than the permanent project Leader binding. */
   private nonProjectSessionBound(sessionId: string): boolean {
-    return !!(this.binding(sessionId) || this.assistantBinding(sessionId) || this.draftBinding(sessionId)
-      || this.feishuDraftBinding(sessionId) || this.studies.binding(sessionId) || this.projects.workerBound(sessionId))
+    return !!(this.binding(sessionId) || this.assistantBinding(sessionId) || this.studioExecutionSessionBound(sessionId))
   }
 
   private studioSessionBound(sessionId: string): boolean {
-    return !!(this.assistantBinding(sessionId) || this.draftBinding(sessionId) || this.feishuDraftBinding(sessionId)
-      || this.studies.binding(sessionId) || this.projects.binding(sessionId) || this.projects.workerBound(sessionId))
+    return !!(this.assistantBinding(sessionId) || this.projects.binding(sessionId) || this.studioExecutionSessionBound(sessionId))
   }
 
   private sessionBound(sessionId: string): boolean {

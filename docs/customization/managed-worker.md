@@ -68,6 +68,23 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 更正、暂停和继续仍由当前文档 Worker 的命令处理，包括[从白名单飞书私聊收取更正](<#飞书私聊登记>)。项目在 `/studio-project work <待办ID>` 显示原请求、文档状态和当前 Worker；提交后还能用同一命令取回原正文、提交会话和工具调用出处，不调用模型。共享文档后来有新修订时，项目仍展示这项工作提交的版本。换 Leader 只移交项目管理权，不会改动文档已授的权限。
 
+## 按需咨询 Advisor
+
+咨询默认关闭。要开启，在 Studio 宿主的 `config` 中配置一个已注册的路由；示例的标识须换成该 profile 实际可用的值：
+
+```yaml
+advisor:
+  provider: configured-provider
+  model: configured-model
+  # reasoningEffort: supported-effort
+```
+
+Studio 在咨询前核对路由及思考深度；未指定深度时使用该适配器的默认值。模型组合不从消息中选择，不支持时不换模型或账号。咨询同样受[额度停止](<#共享额度停止与恢复>)约束。
+
+- 未立项时，在 **Studio Assistant** 会话明确提出要请 Advisor 判断的问题，可在同一条消息附上可用的原文证据。项目内在**现任 Leader** 会话直接提出，不经 Assistant。如需引用本项目一项已完成、未关联文档或外部作业的文字待办，将它的准确待办 ID 写入消息；Studio 会取出该待办已保存的 Worker 结果，而不是让 Advisor 访问文档、作业输出或别的项目。
+- 展开 **Advisor opinion** 卡片，或用 `/studio-advice <咨询ID>` 取回原问题、引用和意见出处。未立项意见由同一 Assistant Bot 取回；项目意见可在本项目的现任或历史 Leader 会话查阅，但移交后旧 Leader 不能再发起咨询。取回不调用模型，关掉咨询配置也不影响已有意见。
+- Advisor 在独立会话中只提出建议，没有工具或派工权。保存意见不会新增待办、启动 Worker、修改文档或授予任何执行权限。同一请求不会重做，宿主重启也不重放中断的咨询。
+
 ## 文档写入控制
 
 要替换已明确授权的文档，请在新的普通会话中选择 **SuperAgent managed document Worker**。不要在 Assistant、受托起草文字的 Worker、旧执行器或 DSH 子代理会话中登记这项授权。文档 Worker 使用只读沙箱，写入只能通过宿主注册的 `studio_write_document` 动作。
