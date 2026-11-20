@@ -19,6 +19,7 @@ import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, fe
 import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './feishu-text.ts'
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
 import { MEMORY_COMMAND, MEMORY_HINT, memoryCommand } from './memory.ts'
+import { PROJECT_ARCHIVE_HINT } from './project-archive.ts'
 import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
 import { StudioProjectJobMonitor } from './project-job-monitor.ts'
 import { StudioProjectJobControl } from './project-job.ts'
@@ -37,7 +38,7 @@ export const Config = s.object({
   advisor: s.union([s.const(null), AdvisorConfig]).default(null)
     .description('Opt-in route for independent, tool-free Advisor consultations; null disables new consultations.'),
   memory: s.boolean().default(false)
-    .description('Enable owner-only Studio preference commands; never inject these records into model context.'),
+    .description('Enable owner-only preference and project archive commands; do not inject these records into model context.'),
   feishuDocumentInbox: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
     .description('Optional, separately configured single-owner Feishu inbox for a managed document.'),
   feishuTextInbox: s.union([s.const(null), FeishuTextInboxConfig]).default(null)
@@ -184,7 +185,7 @@ export function apply(context: Context, config: Config): void {
   const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), ready, provider => quota.denial(provider))
   const advisors = new StudioAdvisor(ctx, store, drafts, advisoryModel, ready, channelStop.signal)
   const studies = new StudioStudy(store, drafts, agent => ready(agent, 'assistant'), channelStop.signal)
-  const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts, provider => providerPool.get(provider))
+  const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts, provider => providerPool.get(provider), memory)
   const jobMonitor = systemdJobPollSeconds ? new StudioProjectJobMonitor(store, systemdJobPollSeconds * 1000, channelReady, (permit, signal) => {
     const leader = ctx.agents.get(permit.leaderSessionId as SessionId)
     return leader ? projects.continueJob(leader, permit, signal) : undefined
@@ -444,7 +445,8 @@ export function apply(context: Context, config: Config): void {
   ctx.effect(() => ctx.commands.register({
     name: 'studio-project',
     description: 'Read project work, or create, transfer, or link an approved document task as the owner.',
-    input: { hint: 'create <JSON> | status [project-id] | take <project-id> <epoch> [leader-bot-id|new] | work [work-id] | attach-document <work-id> <task-id> <authorization-version> | proposal [proposal-id]' },
+    input: { hint: 'create <JSON> | status [project-id] | take <project-id> <epoch> [leader-bot-id|new] | work [work-id] | attach-document <work-id> <task-id> <authorization-version> | proposal [proposal-id]'
+      + (memory ? ` | ${PROJECT_ARCHIVE_HINT}` : '') },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()

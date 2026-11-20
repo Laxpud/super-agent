@@ -6,6 +6,7 @@ import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { z } from 'zod'
 import { DRAFT_TIMEOUT_MS, draftWorkerRoute, ownerRequest, type StudioAssistant } from './assistant.ts'
 import { sharedDocumentCoordinates } from './document-command.ts'
+import { projectArchiveCommand } from './project-archive.ts'
 import { projectJobContext, projectJobText } from './project-job.ts'
 import { PROJECT_NAME_LIMIT, PROJECT_TEXT_LIMIT, sameJobRoute, type StudioJobAuto, type StudioJobRoute, type StudioProject,
   type StudioProjectDocument, type StudioProjectWorkView } from './project-store.ts'
@@ -84,7 +85,8 @@ function projectReceipt(label: string, result: ManagedResult<StudioProject>): Co
 /** Make project writes in the Store after checking the exact caller, not by interpreting model-provided authority statements. */
 export class StudioProjectControl {
   constructor(private readonly store: ManagedWorkerStore, private readonly leaderReady: (agent: Agent) => boolean,
-    private readonly workers: StudioAssistant, private readonly quotaPool: (provider: string) => string | undefined) {}
+    private readonly workers: StudioAssistant, private readonly quotaPool: (provider: string) => string | undefined,
+    private readonly archiveEnabled = false) {}
 
   /** Pin the Leader's selected workspace, model and quota pool; owner commands do not accept an alternate route. */
   jobRoute(agent: Agent): StudioJobRoute {
@@ -247,6 +249,10 @@ export class StudioProjectControl {
       return projectReceipt('Project status', this.store.projects.status(agent.id, argument || undefined))
     }
     if (!this.leaderReady(agent)) return denied('LEADER_SESSION_REQUIRED')
+    if (this.archiveEnabled && agent.session.header.origin !== 'subagent') {
+      const result = projectArchiveCommand(this.store.projectArchive, agent.id, commandId, verb, argument)
+      if (result) return result
+    }
     if (verb === 'work') {
       if (argument) {
         if (!id.safeParse(argument).success) return denied('INVALID_WORK_ID')

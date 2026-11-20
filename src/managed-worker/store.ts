@@ -1,4 +1,4 @@
-/** Durable execution authority for managed document Workers and Studio drafts, studies, projects, advice, and preferences. */
+/** Durable execution authority and records for managed document Workers and Studio. */
 import { randomUUID } from 'node:crypto'
 import { chmodSync, closeSync, fchmodSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
@@ -13,6 +13,7 @@ import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type St
   type StudioFeishuInstruction, type StudioInstructionInput } from './instruction-store.js'
 import { MEMORY_CITATION_SCHEMA } from './memory-citation-store.js'
 import { MEMORY_SCHEMA, MemoryStore } from './memory-store.js'
+import { PROJECT_ARCHIVE_SCHEMA, ProjectArchiveStore } from './project-archive-store.js'
 import { PROJECT_DOCUMENT_SCHEMA, projectDocumentCommandUsed } from './project-document-store.js'
 import { PROJECT_JOB_AUTO_SCHEMA } from './project-job-auto-store.js'
 import { PROJECT_JOB_SCHEMA } from './project-job-store.js'
@@ -31,6 +32,7 @@ export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
 export type { StudioFeishuInstruction } from './instruction-store.js'
 export { MEMORY_TEXT_LIMIT, isMemoryKey, isPreferenceText, type MemoryChange, type MemorySource,
   type PreferenceCitation, type StudioPreference } from './memory-store.js'
+export { PROJECT_FACT_QUOTE_LIMIT, isProjectFactKey, isProjectFactQuote, type ProjectFact } from './project-archive-store.js'
 export type { StudioQuotaNotice } from './quota-notice-store.js'
 export type { StudioQuotaIncident, StudioQuotaReason } from './quota-store.js'
 export type { SharedDocumentRevision } from './shared-document-store.js'
@@ -339,6 +341,7 @@ export class ManagedWorkerStore {
   readonly recoveredTasks: number
   /** Internal Studio facets share this Store's connection and run fence. */
   readonly projects: ProjectStore
+  readonly projectArchive: ProjectArchiveStore
   readonly studies: StudyStore
   readonly advice: AdvisorStore
   readonly memory: MemoryStore
@@ -364,6 +367,7 @@ export class ManagedWorkerStore {
       const started = this.transaction(() => {
         this.db.exec(SCHEMA)
         this.db.exec(PROJECT_SCHEMA)
+        this.db.exec(PROJECT_ARCHIVE_SCHEMA)
         this.db.exec(MEMORY_SCHEMA)
         this.db.exec(MEMORY_CITATION_SCHEMA)
         this.db.exec(STUDY_SCHEMA)
@@ -426,6 +430,13 @@ export class ManagedWorkerStore {
         documentTask: taskId => this.task(taskId),
         documentHold: task => this.projectDocumentHold(task),
         documentCommandUsed: commandId => this.commandUsed(commandId),
+      })
+      this.projectArchive = new ProjectArchiveStore({
+        db: () => this.db,
+        write: operation => this.write(operation),
+        snapshot: operation => this.snapshot(operation),
+        authority: sessionId => this.projects.adviceAuthority(sessionId),
+        workEvidence: (projectId, workId) => this.projects.workEvidence(projectId, workId),
       })
       this.memory = new MemoryStore({
         db: () => this.db,

@@ -58,7 +58,7 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 1. 在未绑定项目的 **SuperAgent Studio Leader** 会话中提交 `/studio-project create {"name":"资料整理","objective":"持续整理研究记录"}`。回执给出项目 ID、Leader Bot、当前会话及管理轮次 `1`。可用 `leaderBotId` 复用已有 Leader Bot，用 `originTaskId` 引用一个已经完成的文字任务；引用原成果不重新派工。
 2. 在当前 Leader 会话中用普通消息要求登记一项自包含的文字待办，将所需材料放在同一条消息里。登记保留原文与来源，不会启动 Worker。用 `/studio-project work` 可查看最近 20 项。需要执行时，让当前 Leader 派工指定待办 ID；Worker 沿用 Leader 当时选择的模型和思考深度，只接收该待办的原文，不能用工具或修改文档。
 3. 用 `/studio-project work <待办ID>` 查看原请求、状态和 Worker 的原始结果，不调用模型。在同一项目的 Leader 会话中，Worker 结束或宿主重启后仍可取回已保存结果。已经开始的工作中断后会留下状态，不会自动重跑。
-4. 要换管理会话，在从未绑定项目的 Leader 会话中提交 `/studio-project take <项目ID> <当前管理轮次>`。默认保留 Leader Bot；末尾可追加已有 Leader Bot ID 或 `new` 以换负责人。旧会话仍可读本项目记录，但不能再登记或派工。移交前尚未开始的保留名额会释放，由当前 Leader 决定是否继续原待办；已经开始的 Worker 可保存原出处的结果。
+4. 要换管理会话，在从未绑定项目的 Leader 会话中提交 `/studio-project take <项目ID> <当前管理轮次>`。默认保留 Leader Bot；末尾可追加已有 Leader Bot ID 或 `new` 以换负责人。旧会话仍可用 `work` 查询本项目的工作记录，但不能再登记或派工。移交前尚未开始的保留名额会释放，由当前 Leader 决定是否继续原待办；已经开始的 Worker 可保存原出处的结果。
 
 如果移交报轮次过时、命令重复，或回执不明，先在原 Leader 会话用 `/studio-project status` 核对当前会话和轮次，也可在新的 Leader 或 Studio Assistant 会话用 `/studio-project status <项目ID>` 查询。不要原样重发旧的移交命令。
 
@@ -67,6 +67,20 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 先登记项目待办但不要派工，再在独立的文档 Worker 会话[登记确切写入授权](<#文档写入控制>)。在当前 Leader 会话用 `/studio-project attach-document <待办ID> <文档任务ID> <授权版本>` 关联两者。一个待办只能关联一个任务，关联后不再作为文字待办派工，也不能同时关联外部作业。关联不批准写入、不改变 Worker 或授权版本。
 
 更正、暂停和继续仍由当前文档 Worker 的命令处理，包括[从白名单飞书私聊收取更正](<#飞书私聊登记>)。项目在 `/studio-project work <待办ID>` 显示原请求、文档状态和当前 Worker；提交后还能用同一命令取回原正文、提交会话和工具调用出处，不调用模型。共享文档后来有新修订时，项目仍展示这项工作提交的版本。换 Leader 只移交项目管理权，不会改动文档已授的权限。
+
+### 从已完成的成果登记项目事实
+
+在 Studio 宿主配置启用 `memory: true` 后，所有者可以在**现任 Leader 的普通 Web 会话**把本项目已完成的独立文字成果选入档案。选择一段不含秘密的原文，先用 `/studio-project work <待办ID>` 核对，再登记：
+
+```text
+/studio-project record-fact {"key":"format-result","expectedEpoch":1,"expectedRevision":0,"workId":"<待办ID>","quote":"成果中原样出现的一段话"}
+```
+
+`expectedEpoch` 用 `/studio-project status` 显示的当前管理轮次；新键的 `expectedRevision` 填 `0`，更正时填 `/studio-project fact <键>` 显示的当前修订。键由小写字母开头，可含小写字母、数字和连字符，最多 64 个字符。引用必须与已保存成果逐字匹配；未完成工作、文档写入、外部作业和其他项目的成果不作为这个入口的来源。
+
+用 `/studio-project facts` 列出当前条目，`/studio-project fact <键>` 可取回选定原文及 Worker、结果消息和登记出处。`/studio-project fact-history <键> <修订>` 只查那次登记的出处，不返回旧原文。档案按项目保存，移交后从新 Leader 会话继续查询和更正；旧管理会话不能访问此档案入口，原 `work` 查询不变。
+
+这些记录说明所有者选用了哪一段成果，不等于 Studio 独立核实了其中的结论。登记和查看不调用模型、不派工、不写文档，也不会把项目事实变为全局偏好。
 
 ## 按需咨询 Advisor
 
@@ -93,7 +107,7 @@ Studio 在咨询前核对路由及思考深度；未指定深度时使用该适�
 - **纠正或限域。** `/studio-memory correct {"key":"report-format","expectedRevision":1,"text":"短报告使用编号小标题"}` 只更新指定的当前修订，不改变作用范围。`/studio-memory restrict report-format 2 <项目ID>` 将全局偏好限到一个项目；成功后再从全局查询就不会读到该条目。后续操作使用回执里的新修订号；遇到过期版本，先查当前记录，不要照抄旧命令重发。
 - **忘记与查出处。** `/studio-memory forget <键> <当前修订>` 停用条目。同一个键不会被旧命令或重新登记激活。`/studio-memory trace <键> [修订号]` 仅显示登记、纠正或停用时的来源会话、原生命令和事件编号，不返回旧正文。忘记不删除原始对话或历史记录，也不暂停任务。
 
-Studio 目前不从历史聊天提炼偏好，也未接入 Bot 经验和项目档案；已有旧资料不会因为打开这个入口而成为当前记忆。
+Studio 不从历史聊天提炼偏好，已有旧资料不会因为打开这个入口而成为当前记忆。项目事实另存于[项目档案](<#从已完成的成果登记项目事实>)；Bot 经验尚未接入。
 
 ### 引用一条偏好的指定修订
 
