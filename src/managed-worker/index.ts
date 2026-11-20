@@ -12,6 +12,7 @@ import { AgentDelivery } from '../app/delivery.ts'
 import type { AdvisorRoute } from './advisor-store.ts'
 import { AdvisorConfig, StudioAdvisor, advisorSelection, isAdvisorTool } from './advisor.ts'
 import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool, type RestrictedTextRole } from './assistant.ts'
+import { BOT_EXPERIENCE_HINT } from './bot-experience.ts'
 import { documentStartArgs, sharedDocumentCommand, sharedDocumentCoordinates, sharedDocumentError } from './document-command.ts'
 import { StudioDocumentFailureNotices } from './document-failure-notices.ts'
 import { StudioDocumentRecovery } from './document-recovery.ts'
@@ -38,7 +39,7 @@ export const Config = s.object({
   advisor: s.union([s.const(null), AdvisorConfig]).default(null)
     .description('Opt-in route for independent, tool-free Advisor consultations; null disables new consultations.'),
   memory: s.boolean().default(false)
-    .description('Enable owner-only preference and project archive commands; do not inject these records into model context.'),
+    .description('Enable owner-only preference, project archive and Bot experience commands without model injection.'),
   feishuDocumentInbox: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
     .description('Optional, separately configured single-owner Feishu inbox for a managed document.'),
   feishuTextInbox: s.union([s.const(null), FeishuTextInboxConfig]).default(null)
@@ -446,7 +447,7 @@ export function apply(context: Context, config: Config): void {
     name: 'studio-project',
     description: 'Read project work, or create, transfer, or link an approved document task as the owner.',
     input: { hint: 'create <JSON> | status [project-id] | take <project-id> <epoch> [leader-bot-id|new] | work [work-id] | attach-document <work-id> <task-id> <authorization-version> | proposal [proposal-id]'
-      + (memory ? ` | ${PROJECT_ARCHIVE_HINT}` : '') },
+      + (memory ? ` | ${PROJECT_ARCHIVE_HINT} | ${BOT_EXPERIENCE_HINT}` : '') },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()

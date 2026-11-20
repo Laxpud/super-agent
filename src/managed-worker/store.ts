@@ -5,6 +5,7 @@ import { dirname, resolve } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
 import { ADVISOR_SCHEMA, AdvisorStore, interruptAdvice } from './advisor-store.js'
+import { BOT_EXPERIENCE_SCHEMA, BotExperienceStore } from './bot-experience-store.js'
 import { DOCUMENT_FAILURE_NOTICE_SCHEMA, DocumentFailureNoticeStore, type DocumentFailureNotice } from './document-failure-notice-store.js'
 import { DOCUMENT_RECOVERY_SCHEMA, DocumentRecoveryStore, type DocumentFailure, type DocumentFailureInput } from './document-recovery-store.js'
 import { FEISHU_DELIVERY_SCHEMA, FeishuDeliveryStore, feishuDeliveryCoordinates } from './feishu-delivery-store.js'
@@ -26,6 +27,7 @@ import { STUDY_SCHEMA, StudyStore, assistantSourceUsed, interruptStudies } from 
 import { WATCHDOG_INDEXES, readWatchdogEntries, readWatchdogTarget,
   type WatchdogQuota, type WatchdogSnapshot, type WatchdogTarget } from './watchdog-store.js'
 
+export { EXPERIENCE_TEXT_LIMIT, isExperienceText, type BotExperience } from './bot-experience-store.js'
 export type { DocumentFailureNotice } from './document-failure-notice-store.js'
 export type { DocumentFailure, DocumentFailureInput } from './document-recovery-store.js'
 export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
@@ -342,6 +344,7 @@ export class ManagedWorkerStore {
   /** Internal Studio facets share this Store's connection and run fence. */
   readonly projects: ProjectStore
   readonly projectArchive: ProjectArchiveStore
+  readonly botExperience: BotExperienceStore
   readonly studies: StudyStore
   readonly advice: AdvisorStore
   readonly memory: MemoryStore
@@ -368,6 +371,7 @@ export class ManagedWorkerStore {
         this.db.exec(SCHEMA)
         this.db.exec(PROJECT_SCHEMA)
         this.db.exec(PROJECT_ARCHIVE_SCHEMA)
+        this.db.exec(BOT_EXPERIENCE_SCHEMA)
         this.db.exec(MEMORY_SCHEMA)
         this.db.exec(MEMORY_CITATION_SCHEMA)
         this.db.exec(STUDY_SCHEMA)
@@ -437,6 +441,13 @@ export class ManagedWorkerStore {
         snapshot: operation => this.snapshot(operation),
         authority: sessionId => this.projects.adviceAuthority(sessionId),
         workEvidence: (projectId, workId) => this.projects.workEvidence(projectId, workId),
+      })
+      this.botExperience = new BotExperienceStore({
+        db: () => this.db,
+        write: operation => this.write(operation),
+        snapshot: operation => this.snapshot(operation),
+        authority: sessionId => this.projects.adviceAuthority(sessionId),
+        sourceCurrent: (projectId, key, revision) => this.projectArchive.sourceCurrent(projectId, key, revision),
       })
       this.memory = new MemoryStore({
         db: () => this.db,

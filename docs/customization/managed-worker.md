@@ -82,6 +82,19 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 这些记录说明所有者选用了哪一段成果，不等于 Studio 独立核实了其中的结论。登记和查看不调用模型、不派工、不写文档，也不会把项目事实变为全局偏好。
 
+### 保存同一 Bot 可复用的经验
+
+启用 `memory: true` 后，可以在现任 Leader 的普通 Web 会话为该 Bot 登记一条通用方法。先用 `/studio-project fact <键>` 核对本项目的来源事实及当前修订，再把方法和适用条件分别填入 `method` 和 `conditions`。不要把项目正文、专属参数或授权复制进方法：
+
+```text
+/studio-project record-experience {"key":"report-method","expectedEpoch":1,"expectedRevision":0,"method":"用编号小标题便于查阅。","conditions":"适用于按顺序组织的短报告。","factKey":"format-result","factRevision":1}
+```
+
+- `/studio-project experiences` 列出该 Bot 的最新经验修订并标明来源是否仍有效；`/studio-project experience <键>` 取回有效方法、适用条件和出处。同一 Bot 负责其他项目时也可查用；不同 Bot 不会继承。回执只提供来源坐标，不开放来源项目的档案正文。
+- 改写经验时用当前管理轮次和经验修订，再选择本项目的一条当前事实作为来源。来源事实修订或原成果无法核验后，旧经验不再返回方法；`/studio-project experience-history <键> <修订>` 仍可查出处。
+
+当前入口只记录所有者明确提交的方法，不自动提炼、调用模型、转送项目事实或授予动作权限。
+
 ## 按需咨询 Advisor
 
 咨询默认关闭。要开启，在 Studio 宿主的 `config` 中配置一个已注册的路由；示例的标识须换成该 profile 实际可用的值：
@@ -107,7 +120,7 @@ Studio 在咨询前核对路由及思考深度；未指定深度时使用该适�
 - **纠正或限域。** `/studio-memory correct {"key":"report-format","expectedRevision":1,"text":"短报告使用编号小标题"}` 只更新指定的当前修订，不改变作用范围。`/studio-memory restrict report-format 2 <项目ID>` 将全局偏好限到一个项目；成功后再从全局查询就不会读到该条目。后续操作使用回执里的新修订号；遇到过期版本，先查当前记录，不要照抄旧命令重发。
 - **忘记与查出处。** `/studio-memory forget <键> <当前修订>` 停用条目。同一个键不会被旧命令或重新登记激活。`/studio-memory trace <键> [修订号]` 仅显示登记、纠正或停用时的来源会话、原生命令和事件编号，不返回旧正文。忘记不删除原始对话或历史记录，也不暂停任务。
 
-Studio 不从历史聊天提炼偏好，已有旧资料不会因为打开这个入口而成为当前记忆。项目事实另存于[项目档案](<#从已完成的成果登记项目事实>)；Bot 经验尚未接入。
+Studio 不从历史聊天提炼偏好，已有旧资料不会因为打开这个入口而成为当前记忆。[项目事实](<#从已完成的成果登记项目事实>)与 [Bot 经验](<#保存同一-bot-可复用的经验>)分别存放，不会被当成全局偏好。
 
 ### 引用一条偏好的指定修订
 

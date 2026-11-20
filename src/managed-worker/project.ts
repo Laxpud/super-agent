@@ -5,6 +5,7 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { z } from 'zod'
 import { DRAFT_TIMEOUT_MS, draftWorkerRoute, ownerRequest, type StudioAssistant } from './assistant.ts'
+import { botExperienceCommand } from './bot-experience.ts'
 import { sharedDocumentCoordinates } from './document-command.ts'
 import { projectArchiveCommand } from './project-archive.ts'
 import { projectJobContext, projectJobText } from './project-job.ts'
@@ -86,7 +87,7 @@ function projectReceipt(label: string, result: ManagedResult<StudioProject>): Co
 export class StudioProjectControl {
   constructor(private readonly store: ManagedWorkerStore, private readonly leaderReady: (agent: Agent) => boolean,
     private readonly workers: StudioAssistant, private readonly quotaPool: (provider: string) => string | undefined,
-    private readonly archiveEnabled = false) {}
+    private readonly memoryEnabled = false) {}
 
   /** Pin the Leader's selected workspace, model and quota pool; owner commands do not accept an alternate route. */
   jobRoute(agent: Agent): StudioJobRoute {
@@ -249,8 +250,9 @@ export class StudioProjectControl {
       return projectReceipt('Project status', this.store.projects.status(agent.id, argument || undefined))
     }
     if (!this.leaderReady(agent)) return denied('LEADER_SESSION_REQUIRED')
-    if (this.archiveEnabled && agent.session.header.origin !== 'subagent') {
+    if (this.memoryEnabled && agent.session.header.origin !== 'subagent') {
       const result = projectArchiveCommand(this.store.projectArchive, agent.id, commandId, verb, argument)
+        ?? botExperienceCommand(this.store.botExperience, agent.id, commandId, verb, argument)
       if (result) return result
     }
     if (verb === 'work') {

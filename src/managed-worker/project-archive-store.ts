@@ -208,23 +208,39 @@ export class ProjectArchiveStore {
     return this.access.snapshot(() => {
       const current = this.access.authority(leaderSessionId)
       if (!current.ok) return current
-      const row = this.db.prepare(`SELECT ${FACT_METADATA}, quote_offset, quote_length, result_digest FROM studio_project_fact
-        WHERE project_id = ? AND key = ? ORDER BY revision DESC LIMIT 1`).get(current.value.projectId, key)
+      const row = this.factHead(current.value.projectId, key)
       if (!row) return deny('FACT_NOT_FOUND')
       const fact = readFact(row)
-      const evidence = this.access.workEvidence(fact.projectId, fact.workId)
-      if (!evidence || evidence.executionEpoch !== fact.executionEpoch || evidence.workerSessionId !== fact.workerSessionId
-        || evidence.workerBotId !== fact.workerBotId) return deny('FACT_EVIDENCE_UNAVAILABLE')
-      const { text, messageId, turn, eventSeq } = evidence.result
-      // Check the entire exact result, not just the range: a changed prefix or suffix must invalidate the reference too.
-      if (messageId !== fact.messageId || turn !== fact.turn || eventSeq !== fact.eventSeq
-        || resultDigest(text) !== row.result_digest) return deny('FACT_EVIDENCE_UNAVAILABLE')
-      const { quote_offset: offset, quote_length: length } = row
-      if (!isNonnegativeInteger(offset) || !isPositiveInteger(length) || length > PROJECT_FACT_QUOTE_LIMIT
-        || offset > text.length - length) return deny('FACT_EVIDENCE_UNAVAILABLE')
-      const quote = text.slice(offset, offset + length)
-      return isProjectFactQuote(quote) ? accept({ ...fact, quote }) : deny('FACT_EVIDENCE_UNAVAILABLE')
+      const quote = this.verifiedQuote(row, fact)
+      return quote === undefined ? deny('FACT_EVIDENCE_UNAVAILABLE') : accept({ ...fact, quote })
     })
+  }
+
+  /** Check a pinned revision in the caller's transaction. Return only validity, never the Worker excerpt. */
+  sourceCurrent(projectId: string, key: string, revision: number): boolean {
+    const row = this.factHead(projectId, key)
+    if (!row || row.revision !== revision) return false
+    return this.verifiedQuote(row, readFact(row)) !== undefined
+  }
+
+  private factHead(projectId: string, key: string): Row | undefined {
+    return this.db.prepare(`SELECT ${FACT_METADATA}, quote_offset, quote_length, result_digest FROM studio_project_fact
+      WHERE project_id = ? AND key = ? ORDER BY revision DESC LIMIT 1`).get(projectId, key)
+  }
+
+  /** Check the original result coordinates, digest, and quote range before using any excerpt. */
+  private verifiedQuote(row: Row, fact: ProjectFact): string | undefined {
+    const evidence = this.access.workEvidence(fact.projectId, fact.workId)
+    if (!evidence || evidence.executionEpoch !== fact.executionEpoch || evidence.workerSessionId !== fact.workerSessionId
+      || evidence.workerBotId !== fact.workerBotId) return
+    const { text, messageId, turn, eventSeq } = evidence.result
+    // Check the entire exact result, not just the range: a changed prefix or suffix must invalidate the reference too.
+    if (messageId !== fact.messageId || turn !== fact.turn || eventSeq !== fact.eventSeq || resultDigest(text) !== row.result_digest) return
+    const { quote_offset: offset, quote_length: length } = row
+    if (!isNonnegativeInteger(offset) || !isPositiveInteger(length) || length > PROJECT_FACT_QUOTE_LIMIT
+      || offset > text.length - length) return
+    const quote = text.slice(offset, offset + length)
+    return isProjectFactQuote(quote) ? quote : undefined
   }
 
   /** Return one exact revision's provenance, without opening or exposing the Worker result. */
