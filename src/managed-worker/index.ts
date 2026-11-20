@@ -30,7 +30,7 @@ export const Config = s.object({
   feishuDocumentInbox: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
     .description('Optional, separately configured single-owner Feishu inbox for a managed document.'),
   feishuTextInbox: s.union([s.const(null), FeishuTextInboxConfig]).default(null)
-    .description('Optional single-owner Feishu inbox for explicit text tasks. Do not enable it together with the document inbox.'),
+    .description('Optional single-owner Feishu inbox for explicit text tasks and opt-in document review. Do not enable a second inbox.'),
   quotaPools: s.array(QuotaPoolConfig).default([])
     .description('Explicit provider IDs that share each inference quota pool; empty disables the quota gate.'),
   quotaFeishuAlerts: s.boolean().default(false)
@@ -108,10 +108,12 @@ export function apply(context: Context, config: Config): void {
     throw new Error('Studio job watcher requires systemdJobInbox and a polling interval of 5–300 seconds')
   }
   const providerPool = quotaProviderMap(quotaPools)
-  if (feishuDocumentInbox && feishuTextInbox) throw new Error('Choose either the Studio Feishu document or text inbox, not both')
+  if (feishuDocumentInbox && feishuTextInbox) throw new Error('Choose one Studio Feishu inbox; use feishuTextInbox.documentCorrections for both routes')
   const feishuConfig = feishuDocumentInbox ?? feishuTextInbox
   if (feishuConfig) validateFeishuInbox(feishuConfig)
   if (feishuTextInbox) validateFeishuTextRoute(feishuTextInbox)
+  const combinedFeishu = feishuTextInbox?.documentCorrections === true
+  const combinedFeishuScope = feishuTextInbox && combinedFeishu ? feishuSourceScope(feishuTextInbox) : undefined
   if (quotaFeishuAlerts && (!feishuConfig || !quotaPools.length)) throw new Error('Studio quota notices require a dedicated Feishu inbox and quota pools')
   const quotaNoticeScope = quotaFeishuAlerts && feishuConfig ? feishuSourceScope(feishuConfig) : undefined
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
@@ -127,12 +129,12 @@ export function apply(context: Context, config: Config): void {
     ctx.logger.error('Managed Worker lost its state directory lock: %s', String(error))
   } })
   let store: ManagedWorkerStore
-  try { store = new ManagedWorkerStore(join(stateDir, 'managed-worker.sqlite'), quotaPools.map(pool => pool.id), quotaNoticeScope) }
+  try { store = new ManagedWorkerStore(join(stateDir, 'managed-worker.sqlite'), quotaPools.map(pool => pool.id), quotaNoticeScope, combinedFeishuScope) }
   catch (error) { unlock(); throw error }
   if (feishuTextInbox && !store.feishuDraftScopeAvailable(feishuSourceScope(feishuTextInbox))) {
-    // Do not reinterpret messages from a chat previously bound to a document.
+    // Only the explicit combined configuration can share an existing document chat.
     try { store.finishRun() } finally { try { store.close() } finally { unlock() } }
-    throw new Error('Studio Feishu text requires a private chat not bound to a document')
+    throw new Error('Studio Feishu text requires an unbound chat or an available combined inbox')
   }
   if (store.recoveredTasks) ctx.logger.warn('Managed Worker paused %d unfinished tasks after an unconfirmed run', store.recoveredTasks)
 
@@ -158,8 +160,8 @@ export function apply(context: Context, config: Config): void {
     jobMonitor ? agent => projects.jobRoute(agent) : undefined) : undefined
   const intake = new StudioProjectIntake(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal)
   const delivery = new AgentDelivery(ctx)
-  const feishuText = feishuTextInbox ? new StudioFeishuText(store, drafts, feishuTextInbox, channelStop.signal, channelReady) : undefined
-  const feishu = feishuConfig && new StudioFeishuInbox(ctx, store, stateDir, feishuConfig, channelReady, feishuText)
+  const feishuText = feishuTextInbox ? new StudioFeishuText(store, drafts, feishuTextInbox, channelStop.signal, channelReady, combinedFeishu) : undefined
+  const feishu = feishuConfig && new StudioFeishuInbox(ctx, store, stateDir, feishuConfig, channelReady, feishuText, !!feishuDocumentInbox || combinedFeishu)
   const quotaNotices = quotaFeishuAlerts && feishu ? new StudioQuotaNotices(store, quotaPools, () => feishu.noticeDestination(),
     () => ctx.logger.warn('Studio Feishu quota notice delivery was not confirmed; check /studio-quota status')) : undefined
 

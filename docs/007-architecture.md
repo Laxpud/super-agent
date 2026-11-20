@@ -367,9 +367,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/instructions.ts` | Records Web inputs before model reads, reviews Web and Feishu corrections against their exact versions, and sends current approved text to the bound Worker |
 | `src/managed-worker/document-intent.ts` | Recognizes a small grammar of unambiguous pause or line-subset requests; it has no authority to change them into actions |
 | `src/managed-worker/owner-confirmation.ts` | Checks the explicit answer to a live native Web owner question; timeout and delayed or mismatched replies cannot confirm a change |
-| `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot, routes the configured owner's private chat to either document review or text tasks, and sends best-effort receipts |
-| `src/managed-worker/feishu-text.ts` | Routes explicit single-message text tasks to a restricted Worker and retrieves exact results without rerunning them |
+| `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot, routes the configured owner's private chat to enabled text or document-review paths, and sends best-effort plain-text receipts |
+| `src/managed-worker/feishu-text.ts` | Routes explicit single-message text commands to a restricted Worker or exact result retrieval without rerunning completed work |
 | `src/managed-worker/feishu-draft-store.ts` | Preserves Feishu input, task and Worker identities, and result provenance; deduplicates deliveries under the shared SQLite run fence |
+| `src/managed-worker/feishu-delivery-store.ts` | Fixes the first route for each combined-inbox delivery and retains those claims across restarts and mode changes |
 | `src/managed-worker/instruction-store.ts` | Preserves Feishu task links, original deliveries and review receipts, including replacements narrowed to a subset of approved changes; pending inputs hold writes even when the listeners are off |
 | `src/managed-worker/document-command.ts` | Owner-only commands for inspecting, creating and editing a shared document, and for selecting a task's exact base revision |
 | `src/managed-worker/shared-document-store.ts` | Immutable shared document revisions, exact task base links, and provenance for owner and Worker writes; a shared commit cannot update only a task's private snapshot |

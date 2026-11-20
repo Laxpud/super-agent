@@ -33,29 +33,42 @@ function resultReply(task: StudioFeishuDraftTask): string {
 }
 
 type Reply = (text: string, phase?: 'accepted' | 'final') => void
+type FeishuTextCommand = { kind: 'draft' | 'result'; argument: string }
+
+/** Reserve the explicit namespaces even for malformed arguments; they must not fall through as corrections. */
+export function feishuTextCommand(text: string): FeishuTextCommand | undefined {
+  const draft = /^(?:draft:|起草：)[ \t]*/u.exec(text)
+  if (draft) return { kind: 'draft', argument: text.slice(draft[0].length) }
+  if (/^result(?=\s|$)/u.test(text)) return { kind: 'result', argument: text.slice('result'.length).trim() }
+}
 
 /** A disconnected transport cannot erase running work or cause it to be relaunched. All work drains before the Store closes. */
 export class StudioFeishuText {
   private readonly work = new Set<Promise<void>>()
 
   constructor(private readonly store: ManagedWorkerStore, private readonly workers: StudioAssistant,
-    private readonly config: FeishuTextRoute, private readonly stopping: AbortSignal, private readonly allowed: () => boolean) {}
+    private readonly config: FeishuTextRoute, private readonly stopping: AbortSignal, private readonly allowed: () => boolean,
+    private readonly combined: boolean) {}
 
   async drain(): Promise<void> { await Promise.all(this.work) }
 
   /** Accept only the explicit text route, never a document correction or a guessed task. */
-  receive(source: StudioFeishuInstruction, reply: Reply): void {
+  receive(source: StudioFeishuInstruction, command: FeishuTextCommand | undefined, reply: Reply): void {
     if (this.stopping.aborted || !this.allowed() || !this.store.feishuDraftScopeAvailable(source.sourceScope)) return
-    const text = source.text
-    const result = text === null ? undefined : /^result[ \t]+(\S+)\s*$/u.exec(text)
-    if (result) {
-      const id = taskId.safeParse(result[1])
-      if (!id.success) { reply('Expected result <task-id>.'); return }
+    if (this.combined && command) {
+      // Pin the accepted route before processing its arguments. A rejected command cannot become a later correction or dispatch.
+      const claim = this.store.claimFeishuTextDelivery(source, command.kind)
+      if (!claim.ok) { reply('Studio could not confirm this message route. No text action was started.'); return }
+      if (!claim.value.claimed) return
+    }
+    if (command?.kind === 'result') {
+      const id = taskId.safeParse(source.text === null ? undefined : command.argument)
+      if (!id.success) { reply('Expected result <task-id>. This message did not change a document.'); return }
       const saved = this.store.readFeishuDraft(id.data, source.sourceScope)
       reply(saved.ok ? resultReply(saved.value) : `Could not retrieve this task: ${saved.reason}.`)
       return
     }
-    const request = text === null ? undefined : /^(?:draft:|起草：)[ \t]*([\s\S]+)$/u.exec(text)?.[1]
+    const request = command?.kind === 'draft' && source.text !== null ? command.argument : undefined
     if (!request || !request.trim() || request.length > DRAFT_TEXT_LIMIT) {
       reply('No task was started. Send draft: followed by a self-contained text request, or result <task-id>.')
       return

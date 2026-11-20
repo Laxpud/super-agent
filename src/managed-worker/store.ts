@@ -4,6 +4,7 @@ import { chmodSync, closeSync, fchmodSync, lstatSync, mkdirSync, openSync, realp
 import { dirname, resolve } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
+import { FEISHU_DELIVERY_SCHEMA, FeishuDeliveryStore, feishuDeliveryCoordinates } from './feishu-delivery-store.js'
 import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFeishuDraftTask } from './feishu-draft-store.js'
 import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
   type StudioFeishuInstruction, type StudioInstructionInput } from './instruction-store.js'
@@ -298,6 +299,9 @@ export class ManagedWorkerStore {
   private readonly frozenTasks = new Set<string>()
   private readonly frozenSessions = new Set<string>()
   private readonly feishuDrafts = new FeishuDraftStore(() => this.db, this.#runId, isDraftText)
+  private readonly feishuDeliveries = new FeishuDeliveryStore(() => this.db, this.#runId)
+  // Only fresh draft claims grant a synchronous start attempt. Unused grants expire, but the SQLite claims remain.
+  private readonly pendingFeishuDraftClaims = new Map<string, number>()
   private readonly instructions = new InstructionStore(() => this.db)
   private readonly quota: QuotaStore
   private readonly quotaNotices = new QuotaNoticeStore(() => this.db, this.#runId)
@@ -309,9 +313,11 @@ export class ManagedWorkerStore {
   readonly projects: ProjectStore
 
   /** Open the database under the host directory lock. Do not enable actions until the recovery transaction has committed. */
-  constructor(path: string, quotaPoolIds: readonly string[] = [], private readonly quotaNoticeScope?: string) {
+  constructor(path: string, quotaPoolIds: readonly string[] = [], private readonly quotaNoticeScope?: string,
+    private readonly feishuCombinedScope?: string) {
     if (!isId(path) || path === ':memory:') throw new Error('Managed Worker requires a persistent SQLite path')
     if (quotaNoticeScope !== undefined && !isId(quotaNoticeScope)) throw new Error('Invalid Studio quota notice scope')
+    if (feishuCombinedScope !== undefined && !isId(feishuCombinedScope)) throw new Error('Invalid Studio Feishu combined scope')
     this.quota = new QuotaStore(quotaPoolIds, () => this.db, operation => this.write(operation), operation => this.snapshot(operation))
     const file = resolve(path)
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
@@ -331,6 +337,7 @@ export class ManagedWorkerStore {
         this.db.exec(PROJECT_JOB_AUTO_SCHEMA)
         this.db.exec(INSTRUCTION_SCHEMA)
         this.db.exec(FEISHU_DRAFT_SCHEMA)
+        this.db.exec(FEISHU_DELIVERY_SCHEMA)
         this.db.exec(SHARED_DOCUMENT_SCHEMA)
         this.db.exec(QUOTA_SCHEMA)
         this.db.exec(QUOTA_NOTICE_SCHEMA)
@@ -585,17 +592,53 @@ export class ManagedWorkerStore {
     }
   }
 
+  /** Claim a combined-scope text route before parsing or checking quota. A duplicate never grants another attempt. */
+  claimFeishuTextDelivery(source: StudioFeishuInstruction, route: 'draft' | 'result'): ManagedResult<{ claimed: boolean }> {
+    const result = this.write<ReturnType<typeof feishuDeliveryCoordinates>>(() => {
+      const delivery = feishuDeliveryCoordinates(source)
+      if (!delivery || (route !== 'draft' && route !== 'result')) return deny('INVALID_INPUT')
+      const { sourceScope, requestId } = delivery
+      if (sourceScope !== this.feishuCombinedScope) return deny('FEISHU_COMBINED_SCOPE_REQUIRED')
+      if (this.feishuDeliverySeen(sourceScope, requestId)) return accept(undefined)
+      this.feishuDeliveries.insert(delivery, route)
+      return accept(delivery)
+    })
+    if (!result.ok) return result
+    if (result.value && route === 'draft') {
+      // Grant a start only after the claim commits, and only to the synchronous dispatch that won it.
+      const { requestId, sourceTimeMs } = result.value
+      this.pendingFeishuDraftClaims.set(requestId, sourceTimeMs)
+      queueMicrotask(() => { this.pendingFeishuDraftClaims.delete(requestId) })
+    }
+    return accept({ claimed: result.value !== undefined })
+  }
+
   /** Reserve one execution for an authenticated Feishu text delivery before launching a Worker. */
   startFeishuDraft(input: StudioFeishuInstruction, requestText: string, workerSessionId: string):
     ManagedResult<{ task: StudioFeishuDraftTask; created: boolean }> {
+    const delivery = input?.sourceScope === this.feishuCombinedScope ? feishuDeliveryCoordinates(input) : undefined
+    // Consume the opportunity before checking the body, busy state, or Worker binding; a refusal must not be retryable.
+    const freshClaim = !!delivery && this.pendingFeishuDraftClaims.get(delivery.requestId) === delivery.sourceTimeMs
+    if (freshClaim) this.pendingFeishuDraftClaims.delete(delivery.requestId)
     const source = feishuDraftSource(input, isDraftText)
     if (!source) return deny('INVALID_INPUT')
     return this.write<{ task: StudioFeishuDraftTask; created: boolean }>(() => {
       const scope = source.sourceScope
-      // A redelivery must return its original task before checking the current scope state or proposed Worker.
+      // A redelivery can return its original task without starting anything, even after a routing change.
       const existing = this.feishuDrafts.duplicate(scope, source.requestId)
       if (existing) return accept({ task: existing, created: false })
-      if (this.instructions.feishuTask(scope) !== undefined) return deny('FEISHU_DOCUMENT_BOUND')
+      const combined = scope === this.feishuCombinedScope
+      if (combined) {
+        if (!freshClaim || delivery.requestId !== source.requestId || delivery.sourceTimeMs !== source.sourceTimeMs
+          || !this.feishuDeliveries.currentDraft(source)) return deny('FEISHU_DELIVERY_ALREADY_ROUTED')
+        if (this.instructions.feishuLate(scope, source.sourceTimeMs) || this.feishuDeliveries.actionLate(scope, source.sourceTimeMs)) {
+          return deny('FEISHU_MESSAGE_LATE')
+        }
+      } else {
+        // A first route chosen in combined mode still owns the ID after reverting to a legacy configuration.
+        if (this.feishuDeliveries.has(scope, source.requestId)) return deny('FEISHU_DELIVERY_ALREADY_ROUTED')
+        if (this.instructions.feishuTask(scope) !== undefined) return deny('FEISHU_DOCUMENT_BOUND')
+      }
       if (this.feishuDrafts.late(scope, source.sourceTimeMs)) return deny('FEISHU_MESSAGE_LATE')
       if (this.feishuDrafts.busy(scope)) return deny('FEISHU_TEXT_BUSY')
       if (!isId(workerSessionId) || !isDraftText(requestText) || requestText.includes('\0')) return deny('INVALID_INPUT')
@@ -651,10 +694,10 @@ export class ManagedWorkerStore {
     return this.feishuDrafts.binding(sessionId)
   }
 
-  /** Fail closed for text routing if the Host does not own this run or the scope is linked to a document. */
+  /** Only the configured combined scope may route text when bound to a document; the Host must own this run. */
   feishuDraftScopeAvailable(scope: string): boolean {
     if (!isId(scope)) return false
-    const result = this.snapshot(() => accept(this.instructions.feishuTask(scope) === undefined))
+    const result = this.snapshot(() => accept(scope === this.feishuCombinedScope || this.instructions.feishuTask(scope) === undefined))
     return result.ok && result.value
   }
 
@@ -704,8 +747,8 @@ export class ManagedWorkerStore {
       if (!current.ok) return current
       const task = current.value
       if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
-      // A registered text task permanently claims this scope, even if it no longer has a running Worker.
-      if (this.feishuDrafts.scopeBound(sourceScope)) return deny('FEISHU_TEXT_BOUND')
+      // Outside the exact configured combined scope, a past text task still bars a document binding.
+      if (sourceScope !== this.feishuCombinedScope && this.feishuDrafts.scopeBound(sourceScope)) return deny('FEISHU_TEXT_BOUND')
       const boundTask = this.instructions.feishuTask(sourceScope)
       // The first binding remains the audit record, even if the current session has since changed.
       if (boundTask === task.taskId) return current
@@ -717,19 +760,35 @@ export class ManagedWorkerStore {
     })
   }
 
+  /** Check both legacy ledgers as well as the route table without rewriting historic records. */
+  private feishuDeliverySeen(scope: string, requestId: string): boolean {
+    return this.feishuDeliveries.has(scope, requestId) || this.instructions.feishuDuplicate(scope, requestId)
+      || this.feishuDrafts.duplicate(scope, requestId) !== undefined
+  }
+
   /** Capture an authenticated Feishu delivery at the fixed target's current epoch, including while paused. */
   receiveFeishuInstruction(input: StudioFeishuInstruction): ManagedResult<FeishuInstructionReceipt> {
     return this.captureInstruction<FeishuInstructionReceipt>(() => {
       const { channel, sourceScope } = input
       if (channel !== 'feishu' || !isId(sourceScope)) throw new Error('Invalid Studio Feishu scope')
+      const { requestId, messageId, eventSeq, sourceTimeMs } = input
+      const coordinates = { channel, sourceScope, requestId, messageId, eventSeq, sourceTimeMs }
+      const combined = sourceScope === this.feishuCombinedScope
+      const delivery = combined ? feishuDeliveryCoordinates(coordinates) : undefined
+      if (combined && !delivery) throw new Error('Invalid Studio Feishu source coordinates')
       const taskId = this.instructions.feishuTask(sourceScope)
+      if (isId(requestId) && messageId === requestId && eventSeq === null && this.feishuDeliverySeen(sourceScope, requestId)) {
+        return accept({ disposition: 'duplicate', ...(taskId === undefined ? {} : { taskId }) })
+      }
+      // Fix the document route even with no writable target. On a capture failure, the claim rolls back with the other writes.
+      if (delivery) this.feishuDeliveries.insert(delivery, 'document')
       if (taskId === undefined) return accept({ disposition: 'unbound' })
       const task = this.task(taskId)
       if (!task) throw new Error('Missing task or document for Studio Feishu binding')
       if (task.documentVersion !== 1) return accept({ disposition: 'finished', taskId })
-      const { requestId, messageId, eventSeq, sourceTimeMs, text, senderId, parentId, rootId, threadId } = input
+      const { text, senderId, parentId, rootId, threadId } = input
       const recorded = this.instructions.recordFeishu(taskId, task.executionEpoch,
-        { channel, sourceScope, requestId, messageId, eventSeq, sourceTimeMs, text, senderId, parentId, rootId, threadId })
+        { ...coordinates, text, senderId, parentId, rootId, threadId })
       if (!recorded) return accept({ disposition: 'duplicate', taskId })
       this.invalidatePriorPermits(task)
       return accept({ disposition: 'recorded', taskId, late: recorded.late })

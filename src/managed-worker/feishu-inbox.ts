@@ -1,4 +1,4 @@
-/** Feed the owner's configured Feishu direct chat into the same document instruction ledger as Web. */
+/** Route the owner's verified direct chat to document review, text tasks, or both in an explicit composition. */
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { isAbsolute } from 'node:path'
@@ -10,7 +10,7 @@ import { z } from 'zod'
 import { resolveFeishuBot, type FeishuBot } from '../deployment.ts'
 import { consumeFeishuEvents, consumerRetry } from '../sources/feishu-events.ts'
 import { FeishuEventSchema } from '../sources/feishu-trigger.ts'
-import type { FeishuTextRoute, StudioFeishuText } from './feishu-text.ts'
+import { feishuTextCommand, type FeishuTextRoute, type StudioFeishuText } from './feishu-text.ts'
 import type { ManagedResult, ManagedTask, ManagedWorkerStore, StudioFeishuInstruction } from './store.ts'
 
 const appId = /^cli_[a-zA-Z0-9]+$/
@@ -47,12 +47,13 @@ const inboxFields = {
   chatId: s.string().pattern(chatId).required(),
 }
 export const FeishuDocumentInboxConfig: s<FeishuInboxConfig> = s.object(inboxFields)
-export const FeishuTextInboxConfig: s<FeishuInboxConfig & FeishuTextRoute> = s.object({
+export const FeishuTextInboxConfig: s<FeishuInboxConfig & FeishuTextRoute & { documentCorrections: boolean }> = s.object({
   ...inboxFields,
   cwd: s.string().required(),
   provider: s.string().required(),
   model: s.string().required(),
   reasoningEffort: s.string().default(''),
+  documentCorrections: s.boolean().default(false).description('Also route ordinary messages to the one explicitly linked document task for review.'),
 })
 
 export function feishuSourceScope(config: FeishuInboxConfig): string {
@@ -81,11 +82,15 @@ export class StudioFeishuInbox {
   private noticeChannel: { bot: FeishuBot; signal: AbortSignal } | undefined
 
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore, private readonly stateDir: string,
-    private readonly config: FeishuInboxConfig, private readonly allowed: () => boolean, private readonly text?: StudioFeishuText) {
+    private readonly config: FeishuInboxConfig, private readonly allowed: () => boolean, private readonly text: StudioFeishuText | undefined,
+    private readonly documentCorrections: boolean) {
     this.scope = feishuSourceScope(config)
   }
 
-  status(): string { return `Studio Feishu inbox: ${this.state}. Mode: ${this.text ? 'text tasks' : 'document review'}.` }
+  status(): string {
+    const mode = this.text ? (this.documentCorrections ? 'text tasks and document review' : 'text tasks') : 'document review'
+    return `Studio Feishu inbox: ${this.state}. Mode: ${mode}.`
+  }
 
   /** Notices are DM-only, use the configured owner's open_id, and cannot inherit a recipient from the inbox. */
   noticeDestination(): StudioFeishuNoticeDestination | undefined {
@@ -102,7 +107,7 @@ export class StudioFeishuInbox {
 
   /** The command authorizes one link, not a change to the task or permission to send another action. */
   bind(sessionId: string, commandId: string): ManagedResult<ManagedTask> {
-    if (this.text) return { ok: false, reason: 'FEISHU_TEXT_MODE' }
+    if (this.text && !this.documentCorrections) return { ok: false, reason: 'FEISHU_TEXT_MODE' }
     if (!this.listening || !this.allowed()) return { ok: false, reason: 'FEISHU_NOT_READY' }
     return this.store.linkFeishuDocument(sessionId, this.scope, commandId)
   }
@@ -177,9 +182,10 @@ export class StudioFeishuInbox {
       ...(data.root_id && messageId.test(data.root_id) ? { rootId: data.root_id } : {}),
       ...(data.thread_id && threadId.test(data.thread_id) ? { threadId: data.thread_id } : {}),
     }
-    // Both modes share identity checks. A fixed composition never treats a document input as fresh work.
-    if (this.text) {
-      this.text.receive(source, (message, phase) => this.reply(bot, data.message_id, message, signal, phase))
+    // Classify the reserved namespace even if the body is too large to retain. Never turn a malformed command into a correction.
+    const command = this.text ? feishuTextCommand(data.content) : undefined
+    if (this.text && (command || !this.documentCorrections)) {
+      this.text.receive(source, command, (message, phase) => this.reply(bot, data.message_id, message, signal, phase))
       return
     }
     const result = this.store.receiveFeishuInstruction(source)
@@ -206,7 +212,8 @@ export class StudioFeishuInbox {
     const hash = createHash('sha256').update(this.scope).update('\0').update(target)
     if (phase) hash.update('\0').update(phase)
     const key = hash.digest('hex').slice(0, 32)
-    const pending = runCli(bot.cli, ['im', '+messages-reply', '--message-id', target, '--markdown', text,
+    // Plain text preserves the worker's output and cannot make the CLI fetch a Markdown image URL.
+    const pending = runCli(bot.cli, ['im', '+messages-reply', '--message-id', target, '--text', text,
       '--reply-in-thread', '--idempotency-key', `studio-${key}`, '--as', 'bot', '--format', 'json'], signal).then(output => {
       if (!z.object({ ok: z.literal(true) }).safeParse(JSON.parse(output)).success) throw new Error('Feishu reply was not confirmed')
     }).catch(() => { if (!signal.aborted) this.ctx.logger.warn('Studio Feishu receipt was not confirmed; consult the Web inbox') })

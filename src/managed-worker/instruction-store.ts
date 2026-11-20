@@ -148,6 +148,17 @@ export class InstructionStore {
     return !!this.database().prepare('SELECT 1 FROM studio_document_feishu_binding WHERE task_id = ?').get(taskId)
   }
 
+  /** Retain deduplication for every recorded instruction, including reviewed rows from before route claims. */
+  feishuDuplicate(scope: string, requestId: string): boolean {
+    return this.sourceRecorded('feishu', scope, requestId)
+  }
+
+  /** Compare document deliveries only; a new text task must not alter the document review ordering. */
+  feishuLate(scope: string, sourceTimeMs: number): boolean {
+    return !!this.database().prepare(`SELECT 1 FROM studio_document_instruction
+      WHERE channel = 'feishu' AND source_scope = ? AND source_time_ms > ? LIMIT 1`).get(scope, sourceTimeMs)
+  }
+
   /** Record the original binding command without changing any authorization or pending instruction. */
   linkFeishu(taskId: string, sessionId: string, sourceScope: string, commandId: string): void {
     requireWrite(this.database().prepare(`INSERT INTO studio_document_feishu_binding
@@ -172,8 +183,7 @@ export class InstructionStore {
     }
     const db = this.database()
     // Include already reviewed deliveries; the newly inserted row cannot satisfy the strict comparison against its own time.
-    const late = !!db.prepare(`SELECT 1 FROM studio_document_instruction
-      WHERE channel = 'feishu' AND source_scope = ? AND source_time_ms > ? LIMIT 1`).get(source.sourceScope, source.sourceTimeMs)
+    const late = this.feishuLate(source.sourceScope, source.sourceTimeMs)
     requireWrite(db.prepare(`INSERT INTO studio_document_feishu_instruction
       (instruction_id, sender_id, parent_id, root_id, thread_id, late) VALUES (?, ?, ?, ?, ?, ?)`)
       .run(instructionId, senderId, parentId ?? null, rootId ?? null, threadId ?? null, late ? 1 : 0).changes)
@@ -185,8 +195,7 @@ export class InstructionStore {
     const db = this.database()
     const { channel, sourceScope, requestId, messageId, eventSeq, sourceTimeMs, text } = source
     if (!isId(requestId)) throw new Error('Invalid Studio instruction request ID')
-    if (db.prepare(`SELECT 1 FROM studio_document_instruction WHERE channel = ? AND source_scope = ? AND request_id = ?`)
-      .get(channel, sourceScope, requestId)) return
+    if (this.sourceRecorded(channel, sourceScope, requestId)) return
     if (!isSource(source)) throw new Error('Invalid Studio instruction source')
     // An explicit lookup distinguishes a known duplicate from an insert suppressed by a trigger.
     const instructionId = randomUUID()
@@ -196,6 +205,11 @@ export class InstructionStore {
       .run(instructionId, taskId, epoch, channel, sourceScope, requestId, messageId, eventSeq, sourceTimeMs, text,
         new Date().toISOString()).changes)
     return instructionId
+  }
+
+  private sourceRecorded(channel: StudioInstructionInput['channel'], scope: string, requestId: string): boolean {
+    return !!this.database().prepare(`SELECT 1 FROM studio_document_instruction WHERE channel = ? AND source_scope = ? AND request_id = ?`)
+      .get(channel, scope, requestId)
   }
 
   /** Pending work is task-wide; neither runtime config nor historic source scope controls the gate. */
