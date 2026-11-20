@@ -15,6 +15,7 @@ import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, fe
 import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './feishu-text.ts'
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
 import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
+import { StudioProjectJobControl } from './project-job.ts'
 import { LEADER_PRESET, StudioProjectControl, isLeaderTool } from './project.ts'
 import { QuotaPoolConfig, StudioQuotaControl, quotaProviderMap } from './quota.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
@@ -30,6 +31,8 @@ export const Config = s.object({
     .description('Optional single-owner Feishu inbox for explicit text tasks. Do not enable it together with the document inbox.'),
   quotaPools: s.array(QuotaPoolConfig).default([])
     .description('Explicit provider IDs that share each inference quota pool; empty disables the quota gate.'),
+  systemdJobInbox: s.boolean().default(false)
+    .description('Allow the owner to attach and check existing local systemd user jobs in a Studio project.'),
 })
 type Config = ReturnType<typeof Config>
 
@@ -91,7 +94,7 @@ function receipt(operation: string, result: ManagedResult<ManagedTask>, showResu
 }
 
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
-export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocumentInbox, feishuTextInbox, quotaPools }: Config): void {
+export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocumentInbox, feishuTextInbox, quotaPools, systemdJobInbox }: Config): void {
   const ctx = localOwnerHost(context)
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
   const providerPool = quotaProviderMap(quotaPools)
@@ -132,6 +135,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
   const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), agent => ready(agent, 'draft-worker'),
     provider => quota.denial(provider))
   const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts)
+  const projectJobs = systemdJobInbox ? new StudioProjectJobControl(store, agent => ready(agent, 'leader'), channelStop.signal) : undefined
   const intake = new StudioProjectIntake(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal)
   const delivery = new AgentDelivery(ctx)
   const channelReady = () => available && controlReady(ctx)
@@ -157,9 +161,10 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
     drafts.stop()
     permits.clear()
     try {
-      // Drain the transport and any text Worker it reserved before closing the Store.
+      // Drain pending lookups and text work before closing the Store. External jobs are not owned by this Host.
       if (channelRun) await channelRun
       await feishuText?.drain()
+      await projectJobs?.drain()
       for (const scope of scopes.values()) scope.dispose()
       scopes.clear()
       // Admit no work after marking the run clean. A lost lock or failed shutdown leaves recovery to the next run.
@@ -341,6 +346,13 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
       }
       return projects.command(agent, commandId, rawInput, assistant || ready(agent, 'leader'))
     },
+  }))
+  if (projectJobs) ctx.effect(() => ctx.commands.register({
+    name: 'studio-job',
+    description: 'Attach or observe an existing external job, or pause its project work without stopping the job.',
+    input: { hint: 'attach <work-id> <unit> <invocation-id> | status/check <work-id> | pause/resume <work-id> <authorization-version>' },
+    recordInput: false,
+    handler: ({ agent, commandId, rawInput, signal }) => projectJobs.command(agent, commandId, rawInput, signal),
   }))
   quota.install()
   if (quotaPools.length) ctx.effect(() => ctx.commands.register({

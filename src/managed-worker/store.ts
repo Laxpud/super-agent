@@ -7,6 +7,7 @@ import { types } from 'node:util'
 import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFeishuDraftTask } from './feishu-draft-store.js'
 import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
   type StudioFeishuInstruction, type StudioInstructionInput } from './instruction-store.js'
+import { PROJECT_JOB_SCHEMA } from './project-job-store.js'
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
 import { QUOTA_SCHEMA, QuotaStore, type StudioQuotaIncident } from './quota-store.js'
 import { SHARED_DOCUMENT_SCHEMA, appendSharedRevision, readSharedRevision,
@@ -319,6 +320,7 @@ export class ManagedWorkerStore {
       const started = this.transaction(() => {
         this.db.exec(SCHEMA)
         this.db.exec(PROJECT_SCHEMA)
+        this.db.exec(PROJECT_JOB_SCHEMA)
         this.db.exec(INSTRUCTION_SCHEMA)
         this.db.exec(FEISHU_DRAFT_SCHEMA)
         this.db.exec(SHARED_DOCUMENT_SCHEMA)
@@ -356,6 +358,7 @@ export class ManagedWorkerStore {
       this.projects = new ProjectStore({
         db: () => this.db,
         write: operation => this.write(operation),
+        snapshot: operation => this.snapshot(operation),
         ownsRun: () => this.ownsRun(),
         runId: this.#runId,
         assistantBinding: sessionId => this.assistantBinding(sessionId),

@@ -1,7 +1,12 @@
 /** Durable Studio project identity, management history, and work dispatch. */
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
+import { attachProjectJob, isConfirmedJobState, isJobState, observeProjectJob, projectJobCommandUsed,
+  readProjectJob, setProjectJobPaused, type StudioProjectJob } from './project-job-store.js'
 import type { ManagedResult, StudioDraftResult } from './store.ts'
+import { validSystemdJob, type SystemdJobRef, type SystemdJobState } from './systemd-job.js'
+
+export type { StudioProjectJob } from './project-job-store.js'
 
 /** Maximum project name length in UTF-16 code units. */
 export const PROJECT_NAME_LIMIT = 160
@@ -16,7 +21,7 @@ export interface StudioProjectBinding {
   managementEpoch: number
 }
 
-/** Project snapshot with the current Leader and the number of work items still eligible for dispatch. */
+/** Project snapshot with the current Leader and the number of unclaimed work items, including jobs still waiting. */
 export interface StudioProject extends StudioProjectBinding {
   name: string
   objective: string
@@ -62,10 +67,11 @@ export interface StudioProjectRun {
   failure?: string
 }
 
-/** Registered work and its latest dispatch, including a release if nothing has started. */
+/** Registered work, its latest dispatch (including a release), and any pinned external job. */
 export interface StudioProjectWorkView {
   work: StudioProjectWork
   run?: StudioProjectRun
+  job?: StudioProjectJob
 }
 
 // The current epoch points to an immutable binding. Each binding also records the native command that created it.
@@ -153,6 +159,7 @@ export const PROJECT_SCHEMA = `
 interface ProjectStoreAccess {
   db(): DatabaseSync
   write<T>(operation: () => ManagedResult<T>): ManagedResult<T>
+  snapshot<T>(operation: () => ManagedResult<T>): ManagedResult<T>
   ownsRun(): boolean
   readonly runId: string
   assistantBinding(sessionId: string): string | undefined
@@ -506,19 +513,75 @@ export class ProjectStore {
     })
   }
 
+  /** Pin only an already observed invocation, without creating or controlling the external job. */
+  attachJob(leaderSessionId: string, workId: string, commandId: string, ref: SystemdJobRef,
+    state: Exclude<SystemdJobState, 'unknown'>): ManagedResult<StudioProjectJob> {
+    if (!isId(leaderSessionId) || !isId(workId) || !isId(commandId) || !isConfirmedJobState(state)
+      || !ref || typeof ref !== 'object') return deny('INVALID_INPUT')
+    const { unit, invocationId } = ref
+    if (!isId(unit) || !isId(invocationId) || !validSystemdJob({ unit, invocationId })) return deny('INVALID_INPUT')
+    return this.withCurrentJobWork(leaderSessionId, workId, actor =>
+      attachProjectJob(this.db, actor, workId, commandId, { unit, invocationId }, state, () => this.commandUsed(commandId)))
+  }
+
+  /** Read a pinned invocation for a current or historical Leader without granting control. */
+  readJob(leaderSessionId: string, workId: string): ManagedResult<StudioProjectJob | undefined> {
+    if (!isId(leaderSessionId) || !isId(workId)) return deny('INVALID_INPUT')
+    try {
+      const binding = this.binding(leaderSessionId)
+      if (!binding) return deny('SESSION_NOT_BOUND')
+      const work = this.work(binding.projectId, workId)
+      return work ? accept(readProjectJob(this.db, work.projectId, workId)) : deny('WORK_NOT_FOUND')
+    } catch {
+      return deny('STORAGE_ERROR')
+    }
+  }
+
+  /** Merge the Host's versioned observation; this does not grant or withdraw permission to continue. */
+  observeJob(leaderSessionId: string, workId: string, expectedObservationVersion: number, state: SystemdJobState): ManagedResult<StudioProjectJob> {
+    if (!isId(leaderSessionId) || !isId(workId) || !isEpoch(expectedObservationVersion) || !isJobState(state)) return deny('INVALID_INPUT')
+    return this.withCurrentJobWork(leaderSessionId, workId, actor =>
+      observeProjectJob(this.db, actor.projectId, workId, expectedObservationVersion, state))
+  }
+
+  /** Set the owner pause independently of observation; resuming does not dispatch a Worker. */
+  setJobPaused(leaderSessionId: string, workId: string, commandId: string, expectedAuthorizationVersion: number,
+    paused: boolean): ManagedResult<StudioProjectJob> {
+    if (!isId(leaderSessionId) || !isId(workId) || !isId(commandId) || !isEpoch(expectedAuthorizationVersion)
+      || typeof paused !== 'boolean') return deny('INVALID_INPUT')
+    return this.withCurrentJobWork(leaderSessionId, workId, actor =>
+      setProjectJobPaused(this.db, actor, workId, commandId, expectedAuthorizationVersion, paused, () => this.commandUsed(commandId)))
+  }
+
+  /** Resolve current management and work membership under the same write lock as the job mutation. */
+  private withCurrentJobWork(leaderSessionId: string, workId: string,
+    operation: (actor: StudioProjectBinding) => ManagedResult<StudioProjectJob>): ManagedResult<StudioProjectJob> {
+    return this.access.write(() => {
+      const current = this.currentProject(leaderSessionId)
+      if (!current.ok) return current
+      if (!this.work(current.value.projectId, workId)) return deny('WORK_NOT_FOUND')
+      return operation(current.value)
+    })
+  }
+
   /** Reserve a fresh Worker only for eligible work in the current Leader's project. */
   reserveWork(leaderSessionId: string, workId: string, workerSessionId: string):
-    ManagedResult<{ work: StudioProjectWork; run: StudioProjectRun; created: boolean }> {
+    ManagedResult<StudioProjectWorkView & { run: StudioProjectRun; created: boolean }> {
     if (!isId(leaderSessionId) || !isId(workId) || !isId(workerSessionId)) return deny('INVALID_INPUT')
-    return this.access.write<{ work: StudioProjectWork; run: StudioProjectRun; created: boolean }>(() => {
+    return this.access.write<StudioProjectWorkView & { run: StudioProjectRun; created: boolean }>(() => {
       const current = this.currentProject(leaderSessionId)
       if (!current.ok) return current
       const { projectId, managementEpoch } = current.value
       const work = this.work(projectId, workId)
       if (!work) return deny('WORK_NOT_FOUND')
-      // Return the original attempt for any claimed work. A release permits a new epoch, never reuse of that Worker Session.
+      // Keep existing attempts readable even if an owner pauses after reservation or start.
       const previous = this.latestRun(work)
-      if (previous && previous.state !== 'released') return accept({ work, run: previous, created: false })
+      const job = readProjectJob(this.db, projectId, workId)
+      const view = job ? { work, job } : { work }
+      if (previous && previous.state !== 'released') return accept({ ...view, run: previous, created: false })
+      // Only an eligible job can claim fresh work. A release permits a new epoch, not reuse of the Worker Session.
+      const blocked = this.jobDispatchBlock(job)
+      if (blocked) return blocked
       if (this.sessionBound(workerSessionId)) return deny('SESSION_ALREADY_BOUND')
       const executionEpoch = (previous?.executionEpoch ?? 0) + 1
       if (!isEpoch(executionEpoch)) return deny('INVALID_INPUT')
@@ -527,21 +590,16 @@ export class ProjectStore {
       requireWrite(this.db.prepare(`INSERT INTO studio_project_dispatch (work_id, execution_epoch, project_id, leader_session_id,
         management_epoch, worker_session_id, worker_bot_id, run_id, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reserved')`)
         .run(...this.dispatchKeys(run)).changes)
-      return accept({ work, run, created: true })
+      return accept({ ...view, run, created: true })
     })
   }
 
-  /** Check whether this exact attempt can start now, without consuming its reservation. */
+  /** Check the exact reservation and job in one read snapshot, without consuming the reservation. */
   canStartWork(run: StudioProjectRun): ManagedResult<StudioProjectRun> {
     const identity = dispatchIdentity(run)
     if (!identity) return deny('INVALID_INPUT')
-    try {
-      if (!this.access.ownsRun()) return deny('STALE_HOST_RUN')
-      const reservation = this.startableReservation(identity)
-      return this.access.ownsRun() ? reservation : deny('STALE_HOST_RUN')
-    } catch {
-      return deny('STORAGE_ERROR')
-    }
+    // Unlike this preflight, beginWork also takes the write lock and consumes the reservation.
+    return this.access.snapshot(() => this.startableReservation(identity))
   }
 
   /** Consume the exact reservation before the Host lets the Worker enter the model. */
@@ -609,7 +667,14 @@ export class ProjectStore {
 
   private workView(work: StudioProjectWork): StudioProjectWorkView {
     const run = this.latestRun(work)
-    return run ? { work, run } : { work }
+    const job = readProjectJob(this.db, work.projectId, work.workId)
+    return { work, ...(run ? { run } : {}), ...(job ? { job } : {}) }
+  }
+
+  /** Pause takes precedence over observation; unpinned work follows the existing dispatch path. */
+  private jobDispatchBlock(job: StudioProjectJob | undefined): Extract<ManagedResult<never>, { ok: false }> | undefined {
+    if (job?.paused) return deny('EXTERNAL_JOB_PAUSED')
+    if (job && job.state !== 'completed') return deny('EXTERNAL_JOB_NOT_COMPLETE')
   }
 
   private latestRun(work: StudioProjectWork): StudioProjectRun | undefined {
@@ -637,7 +702,10 @@ export class ProjectStore {
     if (current.value.projectId !== identity.projectId || current.value.managementEpoch !== identity.managementEpoch) return deny('STALE_MANAGEMENT')
     const stored = this.exactRun(identity)
     if (!stored) return deny('STALE_EXECUTION')
-    return stored.state === 'reserved' ? accept(stored) : deny('WORK_NOT_RESERVED')
+    if (stored.state !== 'reserved') return deny('WORK_NOT_RESERVED')
+    if (!this.work(stored.projectId, stored.workId)) return deny('WORK_NOT_FOUND')
+    const job = readProjectJob(this.db, stored.projectId, stored.workId)
+    return this.jobDispatchBlock(job) ?? accept(stored)
   }
 
   private currentProject(sessionId: string): ManagedResult<StudioProject> {
@@ -681,6 +749,7 @@ export class ProjectStore {
 
   private commandUsed(commandId: string): boolean {
     return !!this.db.prepare('SELECT 1 FROM studio_project_binding WHERE command_id = ?').get(commandId)
+      || projectJobCommandUsed(this.db, commandId)
   }
 
   /** Scope exact IDs and latest lookups to the originating Session, not the shared Assistant Bot. */

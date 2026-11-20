@@ -118,6 +118,16 @@ feishuDocumentInbox:
 2. Worker 仅收到前缀后的文字，没有工具，不获得文档或外部操作权限。结束后，Studio 保存原文和结果出处，再尝试回复原消息；超出飞书回复限制时给出取回方式。飞书回执是尽力发送，不是唯一结果存储。
 3. 在同一私聊发 `result <任务ID>`，或在任何 **SuperAgent Studio Assistant** 会话用 `/studio-result <任务ID>`，无需再次调用模型。会话结束或宿主重启后仍可取回已保存结果；中断的任务不会自动重做。
 
+## 等待已提交的外部长作业
+
+Linux 上可以让项目待办等待一项**已经由外部工具提交**的 systemd 用户服务。在独立 Studio profile 的宿主 `config` 中设置 `systemdJobInbox: true`（默认关闭）。目前只读取本机当前用户管理器中的 `studio-job-*.service` 临时服务，要求 `Type=oneshot`、`RemainAfterExit=yes`、`Restart=no`；Studio 不提交、重启或取消服务。
+
+1. 先在项目中登记后处理待办，不要派工。在当前 Leader 会话用 `/studio-job attach <工作ID> <服务名> <InvocationID>` 关联作业。`InvocationID` 可从 `systemctl --user show --property=InvocationID --value -- <服务名>` 查看。必须能核实这一轮运行；同名服务不是同一个作业。
+2. `/studio-job status <工作ID>` 读取已保存的状态和日志引用；`/studio-job check <工作ID>` 核对状态，不调用模型。若服务暂不可查、消失或同名重建，未确认的状态显示为未知，不视为成功或重新提交。已经保存的明确终态保留。等待期间不分配 Worker。
+3. `/studio-job pause <工作ID> <授权版本>` 阻止后续派工并撤销尚未开始的派工预留，不停止外部服务或已开始的步骤。观察到作业完成不会解除暂停。核对状态后，用 `/studio-job resume <工作ID> <授权版本>` 清除暂停，再明确让现任 Leader 派发原待办。Worker 取得原文字和作业引用，不读取外部日志、不获得工具。
+
+当前由所有者发起状态核对与后续派工。宿主重启不会主动接续，也不会影响由用户管理器托管的服务。只有日志服务确实保留了该次运行的记录时，才能凭回执中的 `_SYSTEMD_INVOCATION_ID` 查阅外部日志。
+
 ## 共享额度停止与恢复
 
 额度停止默认关闭。只在专用 Studio profile 的宿主 `config` 中开启，并将确实共用同一账户额度的 **provider ID** 列在同一个池里。不要按模型名猜池，也不要为绕过停止重命名 provider 或改配账号。未列入的 provider 不受这些池影响。
