@@ -3,7 +3,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import { z } from 'zod'
-import { isMemoryKey, isPreferenceText, MEMORY_TEXT_LIMIT, type MemorySource, type PreferenceCitation, type StudioPreference } from './memory-store.ts'
+import { isMemoryKey, isPreferenceText, MEMORY_TEXT_LIMIT, PREFERENCE_PROPOSAL_RECEIPT_PREFIX,
+  type MemorySource, type PreferenceCitation, type StudioPreference } from './memory-store.ts'
 import type { ManagedResult, ManagedWorkerStore } from './store.ts'
 
 export const MEMORY_COMMAND = 'studio-memory'
@@ -45,6 +46,10 @@ function citationScope(entry: PreferenceCitation): string {
 
 function origin(entry: Pick<StudioPreference, 'source' | 'at'>): string {
   const { sessionId, commandId, eventSeq } = entry.source
+  if (commandId.startsWith(PREFERENCE_PROPOSAL_RECEIPT_PREFIX)) {
+    const proposalId = commandId.slice(PREFERENCE_PROPOSAL_RECEIPT_PREFIX.length)
+    return `Owner-confirmed preference proposal ${proposalId}; original owner message in Session ${sessionId}, event ${eventSeq}. Recorded at ${entry.at}.`
+  }
   return `Owner command ${commandId} in Session ${sessionId}, event ${eventSeq}. Recorded at ${entry.at}.`
 }
 

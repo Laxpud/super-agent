@@ -1,11 +1,17 @@
-/** Owner-controlled Studio preferences. Native Host guards authenticate the owner and persist the command before writing here. */
+/** Owner-controlled Studio preferences. The Host verifies the persisted native source and its authorization before writing here. */
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
 import { appendCitation, citationRow } from './memory-citation-store.js'
+import { PREFERENCE_PROPOSAL_INTENT_LIMIT, decidePreferenceProposal, insertPreferenceProposal, preferenceProposalById,
+  preferenceProposalBySource, preferenceProposalReceiptId, type PreferenceProposal, type PreferenceProposalInput } from './preference-proposal-store.js'
 import type { ManagedResult } from './store.js'
+import { assistantSourceUsed } from './study-store.js'
 
-/** Exact coordinates of a native command in a persisted Assistant Session, not proof of owner authority. */
+export { PREFERENCE_PROPOSAL_INTENT_LIMIT, PREFERENCE_PROPOSAL_RECEIPT_PREFIX, preferenceProposalReceiptId,
+  type PreferenceProposal, type PreferenceProposalInput } from './preference-proposal-store.js'
+
+/** Exact coordinates of a persisted Assistant event. The opaque audit key identifies a command or a confirmed proposal. */
 export interface MemorySource {
   sessionId: string
   commandId: string
@@ -178,6 +184,30 @@ function readChange(value: unknown): MemoryChange | undefined {
   if (kind === 'forget' && Object.keys(fields).length === 1) return { kind }
 }
 
+/** Check the exact body against the complete Host-supplied intent without normalizing either string. */
+function proposalInput(fields: Record<string, unknown>): PreferenceProposalInput | undefined {
+  const { assistantSessionId, sourceRequestId, sourceMessageId, sourceEventSeq, turn, toolCallId, key, intentText, text } = fields
+  if (isId(assistantSessionId) && isId(sourceRequestId) && isId(sourceMessageId) && isEventSeq(sourceEventSeq)
+    && isRevision(turn) && isId(toolCallId) && isMemoryKey(key) && isId(intentText) && intentText.length <= PREFERENCE_PROPOSAL_INTENT_LIMIT
+    && isPreferenceText(text) && intentText.includes(text)) {
+    return { assistantSessionId, sourceRequestId, sourceMessageId, sourceEventSeq, turn, toolCallId, key, intentText, text }
+  }
+}
+
+/** Decode persisted intent and provenance, keeping the run and binding metadata internal. */
+function readProposal(row: Row): PreferenceProposal {
+  const input = proposalInput(row)
+  const { proposalId, assistantBotId, runId, state, proposedAt, decidedAt } = row
+  if (!input || !isId(proposalId) || !isId(assistantBotId) || !isId(runId) || !isId(proposedAt)
+    || (state !== 'pending' && state !== 'confirmed' && state !== 'closed')
+    || (state === 'pending' ? decidedAt !== null : !isId(decidedAt))) throw new Error('Invalid Studio memory proposal')
+  return { ...input, proposalId, state }
+}
+
+function sameProposalInput(input: PreferenceProposalInput, proposal: PreferenceProposal): boolean {
+  return (Object.keys(input) as (keyof PreferenceProposalInput)[]).every(key => input[key] === proposal[key])
+}
+
 const METADATA = 'r.key, r.revision, r.state, r.operation, r.project_id, r.source_session_id, r.command_id, r.source_event_seq, r.at'
 const HEAD = `FROM studio_memory_head h JOIN studio_memory_revision r ON r.key = h.key AND r.revision = h.revision`
 
@@ -210,11 +240,93 @@ interface MemoryStoreAccess {
   write<T>(operation: () => ManagedResult<T>): ManagedResult<T>
   snapshot<T>(operation: () => ManagedResult<T>): ManagedResult<T>
   assistantBinding(sessionId: string): string | undefined
+  ordinaryAssistantBinding(sessionId: string): string | undefined
+  runId: string
 }
 
 /** Internal preference facet. Host call sites must enforce owner authorization, including for metadata-only trace. */
 export class MemoryStore {
   constructor(private readonly access: MemoryStoreAccess) {}
+
+  /** Reserve one exact current owner source. Only `created: true` may open a new confirmation question. */
+  propose(input: PreferenceProposalInput): ManagedResult<{ proposal: PreferenceProposal; created: boolean }> {
+    const fields = plainData(input, 9)
+    if (!fields || !isId(fields.assistantSessionId)) return deny('INVALID_INPUT')
+    const { assistantSessionId, sourceRequestId, sourceMessageId, sourceEventSeq, toolCallId } = fields
+    const exact = proposalInput(fields)
+    return this.access.write<{ proposal: PreferenceProposal; created: boolean }>(() => {
+      const assistantBotId = this.access.ordinaryAssistantBinding(assistantSessionId)
+      if (!assistantBotId) return deny('SESSION_NOT_BOUND')
+      const db = this.access.db()
+      // Any one matching source coordinate is consumed. Return the earlier receipt only if every input field agrees.
+      const previous = preferenceProposalBySource(db, assistantSessionId, isId(sourceRequestId) ? sourceRequestId : null,
+        isId(sourceMessageId) ? sourceMessageId : null, isEventSeq(sourceEventSeq) ? sourceEventSeq : null,
+        isId(toolCallId) ? toolCallId : null)
+      if (previous) {
+        const proposal = readProposal(previous)
+        return exact && previous.assistantBotId === assistantBotId && sameProposalInput(exact, proposal)
+          ? accept({ proposal, created: false }) : deny('SOURCE_ALREADY_USED')
+      }
+      if (!exact) return deny('INVALID_INPUT')
+      if (this.proposalSourceUsed(exact)) return deny('SOURCE_ALREADY_USED')
+      if (this.head(exact.key)) return deny('MEMORY_KEY_EXISTS')
+      const proposalId = randomUUID()
+      const at = new Date().toISOString()
+      insertPreferenceProposal(db, exact, proposalId, assistantBotId, this.access.runId, at)
+      const row = preferenceProposalById(db, assistantSessionId, proposalId)
+      if (!row || row.assistantBotId !== assistantBotId || row.runId !== this.access.runId || row.proposedAt !== at) {
+        throw new Error('Studio memory proposal insert was not retained')
+      }
+      const proposal = readProposal(row)
+      if (proposal.state !== 'pending' || !sameProposalInput(exact, proposal)) {
+        throw new Error('Studio memory proposal insert did not retain exact input')
+      }
+      return accept({ proposal, created: true })
+    })
+  }
+
+  /** Host-only: call after direct native owner consent for this exact proposal ID. Never expose this as a model tool. */
+  confirmProposal(assistantSessionId: string, proposalId: string): ManagedResult<StudioPreference> {
+    if (!isId(assistantSessionId) || !isId(proposalId)) return deny('INVALID_INPUT')
+    return this.access.write(() => {
+      const assistantBotId = this.access.ordinaryAssistantBinding(assistantSessionId)
+      if (!assistantBotId) return deny('SESSION_NOT_BOUND')
+      const db = this.access.db()
+      const row = preferenceProposalById(db, assistantSessionId, proposalId)
+      if (!row || row.assistantBotId !== assistantBotId) return deny('PROPOSAL_NOT_FOUND')
+      const proposal = readProposal(row)
+      if (proposal.state === 'closed') return deny('PROPOSAL_CLOSED')
+      if (proposal.state === 'confirmed') return deny('PROPOSAL_ALREADY_CONFIRMED')
+      if (row.runId !== this.access.runId) return deny('STALE_HOST_RUN')
+      // Recheck the key and source in the same fenced transaction as both writes; another route may have acted meanwhile.
+      if (this.head(proposal.key)) return deny('MEMORY_KEY_EXISTS')
+      if (this.proposalSourceUsed(proposal)) return deny('SOURCE_ALREADY_USED')
+      const source = { sessionId: assistantSessionId, commandId: preferenceProposalReceiptId(proposalId), eventSeq: proposal.sourceEventSeq }
+      if (this.commandUsed(source.commandId)) return deny('DUPLICATE_COMMAND')
+      const preference = this.append(proposal.key, 1, 'remember', undefined, proposal.text, source)
+      decidePreferenceProposal(db, assistantSessionId, proposalId, this.access.runId, 'confirmed')
+      return accept(preference)
+    })
+  }
+
+  /** Record a refusal or an abandoned question. A repeated close returns metadata without any content write. */
+  closeProposal(assistantSessionId: string, proposalId: string): ManagedResult<{ proposalId: string; state: 'closed' }> {
+    if (!isId(assistantSessionId) || !isId(proposalId)) return deny('INVALID_INPUT')
+    return this.access.write(() => {
+      const assistantBotId = this.access.ordinaryAssistantBinding(assistantSessionId)
+      if (!assistantBotId) return deny('SESSION_NOT_BOUND')
+      const db = this.access.db()
+      const row = preferenceProposalById(db, assistantSessionId, proposalId)
+      if (!row || row.assistantBotId !== assistantBotId) return deny('PROPOSAL_NOT_FOUND')
+      const proposal = readProposal(row)
+      if (proposal.state === 'confirmed') return deny('PROPOSAL_ALREADY_CONFIRMED')
+      if (proposal.state === 'pending') {
+        if (row.runId !== this.access.runId) return deny('STALE_HOST_RUN')
+        decidePreferenceProposal(db, assistantSessionId, proposalId, this.access.runId, 'closed')
+      }
+      return accept({ proposalId, state: 'closed' })
+    })
+  }
 
   /** Create a never-before-used key, optionally scoped to one exact Studio project. */
   remember(key: string, text: string, projectId: string | undefined, source: MemorySource): ManagedResult<StudioPreference> {
@@ -375,9 +487,18 @@ export class MemoryStore {
   private checkSource(source: MemorySource): Rejection | undefined {
     if (!this.access.assistantBinding(source.sessionId)) return deny('SESSION_NOT_BOUND')
     if (this.commandUsed(source.commandId)) return deny('DUPLICATE_COMMAND')
-    if (this.access.db().prepare(`SELECT 1 FROM studio_memory_revision WHERE source_session_id = ? AND source_event_seq = ?
+    if (this.sourceEventUsed(source.sessionId, source.eventSeq)) return deny('SOURCE_ALREADY_USED')
+  }
+
+  private sourceEventUsed(sessionId: string, eventSeq: number): boolean {
+    return !!this.access.db().prepare(`SELECT 1 FROM studio_memory_revision WHERE source_session_id = ? AND source_event_seq = ?
       UNION ALL SELECT 1 FROM studio_memory_citation WHERE source_session_id = ? AND source_event_seq = ? LIMIT 1`)
-      .get(source.sessionId, source.eventSeq, source.sessionId, source.eventSeq)) return deny('SOURCE_ALREADY_USED')
+      .get(sessionId, eventSeq, sessionId, eventSeq)
+  }
+
+  /** A source consumed by an existing Assistant route or memory operation cannot materialize a proposal. */
+  private proposalSourceUsed(input: PreferenceProposalInput): boolean {
+    return this.sourceEventUsed(input.assistantSessionId, input.sourceEventSeq) || assistantSourceUsed(this.access.db(), input)
   }
 
   /** Check both the journal row and its projected head before the parent transaction can commit. */

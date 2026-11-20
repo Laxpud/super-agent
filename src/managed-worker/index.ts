@@ -20,6 +20,7 @@ import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, fe
 import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './feishu-text.ts'
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
 import { MEMORY_COMMAND, MEMORY_HINT, memoryCommand } from './memory.ts'
+import { PROPOSE_PREFERENCE, StudioPreferenceIntake } from './preference-intake.ts'
 import { PROJECT_ARCHIVE_HINT } from './project-archive.ts'
 import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
 import { StudioProjectJobMonitor } from './project-job-monitor.ts'
@@ -39,7 +40,7 @@ export const Config = s.object({
   advisor: s.union([s.const(null), AdvisorConfig]).default(null)
     .description('Opt-in route for independent, tool-free Advisor consultations; null disables new consultations.'),
   memory: s.boolean().default(false)
-    .description('Enable owner-only preference, project archive and Bot experience commands without model injection.'),
+    .description('Enable owner-confirmed preference intake, preference commands, project archives and Bot experiences without injecting saved records into model context.'),
   feishuDocumentInbox: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
     .description('Optional, separately configured single-owner Feishu inbox for a managed document.'),
   feishuTextInbox: s.union([s.const(null), FeishuTextInboxConfig]).default(null)
@@ -194,6 +195,7 @@ export function apply(context: Context, config: Config): void {
   const projectJobs = systemdJobInbox ? new StudioProjectJobControl(store, agent => ready(agent, 'leader'), channelStop.signal,
     jobMonitor ? agent => projects.jobRoute(agent) : undefined) : undefined
   const intake = new StudioProjectIntake(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal)
+  const preferenceIntake = memory ? new StudioPreferenceIntake(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal) : undefined
   const delivery = new AgentDelivery(ctx)
   const feishuText = feishuTextInbox ? new StudioFeishuText(store, drafts, feishuTextInbox, channelStop.signal, channelReady, combinedFeishu) : undefined
   const feishu = feishuConfig && new StudioFeishuInbox(ctx, store, stateDir, feishuConfig, channelReady, feishuText,
@@ -262,8 +264,8 @@ export function apply(context: Context, config: Config): void {
         if (!bound.ok) throw new Error(`Cannot bind Studio Assistant: ${bound.reason}`)
       }
       const unregister = role === 'leader' ? projects.install(agent, () => advisors.install(agent, role))
-        : role === 'assistant' ? drafts.install(agent, role, () => intake.install(agent), () => studies.install(agent), () => advisors.install(agent, role))
-          : role !== 'document-worker' ? drafts.install(agent, role) : agent.ctx.tools.register({
+        : role === 'assistant' ? drafts.install(agent, role, () => intake.install(agent), () => studies.install(agent), () => advisors.install(agent, role),
+          () => preferenceIntake?.install(agent) ?? (() => {})) : role !== 'document-worker' ? drafts.install(agent, role) : agent.ctx.tools.register({
         name: TOOL,
         description: 'Replace the text of the managed document bound to this worker, using its approved text and version.',
         parameters: z.toJSONSchema(writeSchema),
@@ -292,12 +294,13 @@ export function apply(context: Context, config: Config): void {
     let role: StudioRole | undefined
     try { role = agent && (scopes.get(agent)?.role ?? roleOf(agent)) }
     catch { return 'Studio tool denied: STORAGE_ERROR' }
-    if (!role || !agent) return exec.name === TOOL || exec.name === PROPOSE_PROJECT || isAssistantTool(exec.name)
+    if (!role || !agent) return exec.name === TOOL || exec.name === PROPOSE_PROJECT || exec.name === PROPOSE_PREFERENCE || isAssistantTool(exec.name)
       || isStudyTool(exec.name) || isLeaderTool(exec.name) || isAdvisorTool(exec.name) ? 'Studio tool denied: INVALID_EXECUTION' : undefined
     if (!ready(agent, role) || exec.parent !== undefined) return 'Studio tool denied: INVALID_EXECUTION'
     if (isAdvisorTool(exec.name)) return advisors.guard(agent, exec.name, role)
     if (role === 'assistant' && (isAssistantTool(exec.name) || isStudyTool(exec.name)
-      || (exec.name === PROPOSE_PROJECT && intake.available(agent)))) return undefined
+      || (exec.name === PROPOSE_PROJECT && intake.available(agent))
+      || (exec.name === PROPOSE_PREFERENCE && preferenceIntake?.available(agent)))) return undefined
     if (role === 'leader') return projects.guard(agent, exec.name)
     if (role !== 'document-worker' || exec.name !== TOOL) return 'Studio tool denied: INVALID_EXECUTION'
     const result = store.authorize(agent.id, exec.arguments, exec.callId)
