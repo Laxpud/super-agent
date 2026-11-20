@@ -20,6 +20,8 @@ import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, fe
 import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './feishu-text.ts'
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
 import { MEMORY_COMMAND, MEMORY_HINT, memoryCommand } from './memory.ts'
+import { currentOwnerInboxInput } from './owner-inbox-input.ts'
+import { StudioPreferenceCorrection } from './preference-correction.ts'
 import { PROPOSE_PREFERENCE, StudioPreferenceIntake } from './preference-intake.ts'
 import { answerPreferenceQuery } from './preference-query.ts'
 import { PROJECT_ARCHIVE_HINT } from './project-archive.ts'
@@ -204,6 +206,7 @@ export function apply(context: Context, config: Config): void {
     jobMonitor ? agent => projects.jobRoute(agent) : undefined) : undefined
   const intake = new StudioProjectIntake(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal)
   const preferenceIntake = memory ? new StudioPreferenceIntake(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal) : undefined
+  const preferenceCorrection = memory ? new StudioPreferenceCorrection(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal) : undefined
   const delivery = new AgentDelivery(ctx)
   const feishuText = feishuTextInbox ? new StudioFeishuText(store, drafts, feishuTextInbox, channelStop.signal, channelReady, combinedFeishu) : undefined
   const feishu = feishuConfig && new StudioFeishuInbox(ctx, store, stateDir, feishuConfig, channelReady, feishuText,
@@ -243,6 +246,7 @@ export function apply(context: Context, config: Config): void {
       await feishuText?.drain()
       await advisors.drain()
       await studies.drain()
+      await preferenceCorrection?.drain()
       await recovery?.drain()
       await failureNotices?.drain()
       await projectJobs?.drain()
@@ -333,7 +337,18 @@ export function apply(context: Context, config: Config): void {
     const role = scopes.get(agent)?.role
     if ((role === 'assistant' || role === 'leader') && !ready(agent, role)) return { kind: 'reject' }
     if (!validateDocumentRelays(store, agent, messages, () => ready(agent, 'document-worker'))) return { kind: 'reject' }
-    if (memory && role === 'assistant' && answerPreferenceQuery(store, step)) return { kind: 'enter', messages: [] }
+    if (memory && role === 'assistant') {
+      const input = currentOwnerInboxInput(step)
+      if (input) {
+        step.signal.throwIfAborted()
+        if (answerPreferenceQuery(store, agent, input)) return { kind: 'enter', messages: [] }
+        const correction = preferenceCorrection?.review(step, input)
+        if (correction) {
+          await correction
+          return { kind: 'enter', messages: [] }
+        }
+      }
+    }
     const decision = await next()
     if (decision.kind === 'enter' && (role === 'draft-worker' || role === 'advisor')) {
       // Verify the messages the native loop will actually admit, after any downstream pre-step transforms.

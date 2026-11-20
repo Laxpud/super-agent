@@ -17,6 +17,7 @@ import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type St
   type StudioFeishuInstruction, type StudioInstructionInput } from './instruction-store.js'
 import { MEMORY_CITATION_SCHEMA } from './memory-citation-store.js'
 import { MEMORY_SCHEMA, MemoryStore } from './memory-store.js'
+import { PREFERENCE_CORRECTION_SCHEMA, closePreviousPreferenceCorrections } from './preference-correction-store.js'
 import { PREFERENCE_PROPOSAL_SCHEMA, closePreviousPreferenceProposals } from './preference-proposal-store.js'
 import { PROJECT_ARCHIVE_SCHEMA, ProjectArchiveStore } from './project-archive-store.js'
 import { PROJECT_DOCUMENT_SCHEMA, projectDocumentCommandUsed } from './project-document-store.js'
@@ -37,8 +38,9 @@ export type { DocumentFailure, DocumentFailureInput } from './document-recovery-
 export type { StudioDraftPreference } from './draft-preference-store.js'
 export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
 export type { StudioFeishuInstruction } from './instruction-store.js'
-export { MEMORY_TEXT_LIMIT, PREFERENCE_PROPOSAL_INTENT_LIMIT, PREFERENCE_PROPOSAL_RECEIPT_PREFIX, isMemoryKey,
-  isPreferenceText, preferenceProposalReceiptId, type MemoryChange, type MemorySource, type PreferenceCitation,
+export { MEMORY_TEXT_LIMIT, PREFERENCE_CORRECTION_RECEIPT_PREFIX, PREFERENCE_PROPOSAL_INTENT_LIMIT,
+  PREFERENCE_PROPOSAL_RECEIPT_PREFIX, isMemoryKey, isPreferenceText, preferenceCorrectionReceiptId, preferenceProposalReceiptId,
+  type MemoryChange, type MemorySource, type PreferenceCitation, type PreferenceCorrectionInput, type PreferenceCorrectionReceipt,
   type PreferenceProposal, type PreferenceProposalInput, type StudioPreference } from './memory-store.js'
 export { PROJECT_FACT_QUOTE_LIMIT, isProjectFactKey, isProjectFactQuote, type ProjectFact } from './project-archive-store.js'
 export type { StudioQuotaNotice } from './quota-notice-store.js'
@@ -389,6 +391,7 @@ export class ManagedWorkerStore {
         this.db.exec(MEMORY_CITATION_SCHEMA)
         this.db.exec(DRAFT_PREFERENCE_SCHEMA)
         this.db.exec(PREFERENCE_PROPOSAL_SCHEMA)
+        this.db.exec(PREFERENCE_CORRECTION_SCHEMA)
         this.db.exec(STUDY_SCHEMA)
         this.db.exec(ADVISOR_SCHEMA)
         this.db.exec(PROJECT_DOCUMENT_SCHEMA)
@@ -433,6 +436,7 @@ export class ManagedWorkerStore {
           throw new Error('Cannot close previous Studio project proposals')
         }
         closePreviousPreferenceProposals(this.db)
+        closePreviousPreferenceCorrections(this.db)
         requireWrite(this.db.prepare(`INSERT INTO managed_host_run VALUES (1, ?, 0)
           ON CONFLICT (singleton) DO UPDATE SET run_id = excluded.run_id, clean = 0`).run(this.#runId).changes)
         return accept(recoveredTasks)

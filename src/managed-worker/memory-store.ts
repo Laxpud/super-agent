@@ -3,11 +3,15 @@ import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
 import { appendCitation, citationRow } from './memory-citation-store.js'
+import { decidePreferenceCorrection, insertPreferenceCorrection, preferenceCorrectionById, preferenceCorrectionBySource,
+  preferenceCorrectionReceiptId, type PreferenceCorrectionInput, type PreferenceCorrectionReceipt } from './preference-correction-store.js'
 import { PREFERENCE_PROPOSAL_INTENT_LIMIT, decidePreferenceProposal, insertPreferenceProposal, preferenceProposalById,
   preferenceProposalBySource, preferenceProposalReceiptId, type PreferenceProposal, type PreferenceProposalInput } from './preference-proposal-store.js'
 import type { ManagedResult } from './store.js'
 import { assistantSourceUsed } from './study-store.js'
 
+export { PREFERENCE_CORRECTION_RECEIPT_PREFIX, preferenceCorrectionReceiptId,
+  type PreferenceCorrectionInput, type PreferenceCorrectionReceipt } from './preference-correction-store.js'
 export { PREFERENCE_PROPOSAL_INTENT_LIMIT, PREFERENCE_PROPOSAL_RECEIPT_PREFIX, preferenceProposalReceiptId,
   type PreferenceProposal, type PreferenceProposalInput } from './preference-proposal-store.js'
 
@@ -208,6 +212,37 @@ function sameProposalInput(input: PreferenceProposalInput, proposal: PreferenceP
   return (Object.keys(input) as (keyof PreferenceProposalInput)[]).every(key => input[key] === proposal[key])
 }
 
+/** Validate the exact Host-parsed binding and body without inspecting or normalizing the native message. */
+function correctionInput(fields: Record<string, unknown>): PreferenceCorrectionInput | undefined {
+  const { assistantSessionId, sourceRequestId, sourceMessageId, sourceEventSeq, turn, key, expectedRevision, projectId, text } = fields
+  if (isId(assistantSessionId) && isId(sourceRequestId) && isId(sourceMessageId) && isEventSeq(sourceEventSeq)
+    && isRevision(turn) && isMemoryKey(key) && isRevision(expectedRevision) && (projectId === undefined || isProjectId(projectId))
+    && isPreferenceText(text)) {
+    return { assistantSessionId, sourceRequestId, sourceMessageId, sourceEventSeq, turn, key, expectedRevision, projectId, text }
+  }
+}
+
+type StoredCorrection = PreferenceCorrectionInput & Pick<PreferenceCorrectionReceipt, 'proposalId' | 'state'> & {
+  assistantBotId: string
+  runId: string
+  proposedAt: string
+}
+
+/** Decode all fields for exact replay/confirmation; callers expose only the decision receipt. */
+function readCorrection(row: Row): StoredCorrection {
+  const input = correctionInput({ ...row, projectId: row.projectId === null ? undefined : row.projectId })
+  const { proposalId, assistantBotId, runId, state, proposedAt, decidedAt } = row
+  if (!input || !isId(proposalId) || !isId(assistantBotId) || !isId(runId) || !isId(proposedAt)
+    || (state !== 'pending' && state !== 'confirmed' && state !== 'closed')
+    || (state === 'pending' ? decidedAt !== null : !isId(decidedAt))) throw new Error('Invalid Studio memory correction')
+  return { ...input, proposalId, assistantBotId, runId, state, proposedAt }
+}
+
+function sameCorrectionInput(input: PreferenceCorrectionInput, previous: StoredCorrection): boolean {
+  // The validated input includes projectId even when undefined, so replay cannot change the scope.
+  return (Object.keys(input) as (keyof PreferenceCorrectionInput)[]).every(key => input[key] === previous[key])
+}
+
 const METADATA = 'r.key, r.revision, r.state, r.operation, r.project_id, r.source_session_id, r.command_id, r.source_event_seq, r.at'
 const HEAD = `FROM studio_memory_head h JOIN studio_memory_revision r ON r.key = h.key AND r.revision = h.revision`
 
@@ -323,6 +358,88 @@ export class MemoryStore {
       if (proposal.state === 'pending') {
         if (row.runId !== this.access.runId) return deny('STALE_HOST_RUN')
         decidePreferenceProposal(db, assistantSessionId, proposalId, this.access.runId, 'closed')
+      }
+      return accept({ proposalId, state: 'closed' })
+    })
+  }
+
+  /** Reserve a Host-verified native inbox source for one exact active head; only a new receipt may open a question. */
+  proposeCorrection(input: PreferenceCorrectionInput): ManagedResult<PreferenceCorrectionReceipt> {
+    const fields = plainData(input, 9)
+    if (!fields || Object.keys(fields).length !== (Object.hasOwn(fields, 'projectId') ? 9 : 8)) return deny('INVALID_INPUT')
+    const exact = correctionInput(fields)
+    if (!exact) return deny('INVALID_INPUT')
+    return this.access.write<PreferenceCorrectionReceipt>(() => {
+      const { assistantSessionId } = exact
+      const assistantBotId = this.access.ordinaryAssistantBinding(assistantSessionId)
+      if (!assistantBotId) return deny('SESSION_NOT_BOUND')
+      const db = this.access.db()
+      // Resolve a replay before checking the head: a confirmed or closed source can never ask again, even after restart.
+      const previous = preferenceCorrectionBySource(db, exact)
+      if (previous) {
+        const stored = readCorrection(previous)
+        if (stored.assistantBotId !== assistantBotId || !sameCorrectionInput(exact, stored)) return deny('SOURCE_ALREADY_USED')
+        if (stored.state === 'pending' && stored.runId !== this.access.runId) return deny('STALE_HOST_RUN')
+        return accept({ proposalId: stored.proposalId, state: stored.state, created: false })
+      }
+      if (this.correctionSourceUsed(exact)) return deny('SOURCE_ALREADY_USED')
+      const current = this.correctionHead(exact)
+      if (!current.ok) return current
+
+      const proposalId = randomUUID()
+      const at = new Date().toISOString()
+      insertPreferenceCorrection(db, exact, proposalId, assistantBotId, this.access.runId, at)
+      const row = preferenceCorrectionById(db, assistantSessionId, proposalId)
+      if (!row) throw new Error('Studio memory correction insert was not retained')
+      const stored = readCorrection(row)
+      if (stored.state !== 'pending' || stored.assistantBotId !== assistantBotId || stored.runId !== this.access.runId
+        || stored.proposedAt !== at || !sameCorrectionInput(exact, stored)) {
+        throw new Error('Studio memory correction insert did not retain exact input')
+      }
+      return accept({ proposalId, state: 'pending', created: true })
+    })
+  }
+
+  /** Host-only: after native owner confirmation, atomically append and decide the still-current exact correction. */
+  confirmCorrection(assistantSessionId: string, proposalId: string): ManagedResult<StudioPreference> {
+    if (!isId(assistantSessionId) || !isId(proposalId)) return deny('INVALID_INPUT')
+    return this.access.write(() => {
+      const assistantBotId = this.access.ordinaryAssistantBinding(assistantSessionId)
+      if (!assistantBotId) return deny('SESSION_NOT_BOUND')
+      const db = this.access.db()
+      const row = preferenceCorrectionById(db, assistantSessionId, proposalId)
+      if (!row || row.assistantBotId !== assistantBotId) return deny('PROPOSAL_NOT_FOUND')
+      const correction = readCorrection(row)
+      if (correction.state === 'closed') return deny('PROPOSAL_CLOSED')
+      if (correction.state === 'confirmed') return deny('PROPOSAL_ALREADY_CONFIRMED')
+      if (correction.runId !== this.access.runId) return deny('STALE_HOST_RUN')
+      const current = this.correctionHead(correction)
+      if (!current.ok) return current
+      if (this.correctionSourceUsed(correction)) return deny('SOURCE_ALREADY_USED')
+      const source = { sessionId: assistantSessionId, commandId: preferenceCorrectionReceiptId(proposalId), eventSeq: correction.sourceEventSeq }
+      if (this.commandUsed(source.commandId)) return deny('DUPLICATE_COMMAND')
+
+      // Reuse the journal append inside this transaction so a failed decision also rolls back the projected head.
+      const preference = this.append(correction.key, current.value.revision + 1, 'correct', current.value.projectId, correction.text, source)
+      decidePreferenceCorrection(db, assistantSessionId, assistantBotId, proposalId, this.access.runId, 'confirmed')
+      return accept(preference)
+    })
+  }
+
+  /** Close an unapproved question without changing the preference. Repeating a close returns only the retained metadata. */
+  closeCorrection(assistantSessionId: string, proposalId: string): ManagedResult<{ proposalId: string; state: 'closed' }> {
+    if (!isId(assistantSessionId) || !isId(proposalId)) return deny('INVALID_INPUT')
+    return this.access.write(() => {
+      const assistantBotId = this.access.ordinaryAssistantBinding(assistantSessionId)
+      if (!assistantBotId) return deny('SESSION_NOT_BOUND')
+      const db = this.access.db()
+      const row = preferenceCorrectionById(db, assistantSessionId, proposalId)
+      if (!row || row.assistantBotId !== assistantBotId) return deny('PROPOSAL_NOT_FOUND')
+      const correction = readCorrection(row)
+      if (correction.state === 'confirmed') return deny('PROPOSAL_ALREADY_CONFIRMED')
+      if (correction.state === 'pending') {
+        if (correction.runId !== this.access.runId) return deny('STALE_HOST_RUN')
+        decidePreferenceCorrection(db, assistantSessionId, assistantBotId, proposalId, this.access.runId, 'closed')
       }
       return accept({ proposalId, state: 'closed' })
     })
@@ -518,6 +635,26 @@ export class MemoryStore {
   /** A source consumed by an existing Assistant route or memory operation cannot materialize a proposal. */
   private proposalSourceUsed(input: PreferenceProposalInput): boolean {
     return this.sourceEventUsed(input.assistantSessionId, input.sourceEventSeq) || assistantSourceUsed(this.access.db(), input)
+  }
+
+  /** Corrections must match the exact scope; unlike a read, a project request cannot fall back to a global preference. */
+  private correctionHead({ key, expectedRevision, projectId }: PreferenceCorrectionInput): ManagedResult<StudioPreference> {
+    const row = this.access.db().prepare(`SELECT ${METADATA} ${HEAD}
+      WHERE h.key = ? AND h.state = 'active' AND r.state = h.state AND r.project_id IS h.project_id`).get(key)
+    if (!row) return deny('MEMORY_NOT_CURRENT')
+    const current = metadata(row)
+    if (current.projectId !== projectId) return deny('MEMORY_SCOPE_CONFLICT')
+    if (current.revision !== expectedRevision) return deny('STALE_MEMORY_REVISION')
+    if (!isRevision(current.revision + 1)) return deny('MEMORY_REVISION_LIMIT')
+    return accept(current)
+  }
+
+  /** An inbox event may differ from a create proposal's message event; match request and message as well as event. */
+  private correctionSourceUsed(input: PreferenceCorrectionInput): boolean {
+    const db = this.access.db()
+    return this.sourceEventUsed(input.assistantSessionId, input.sourceEventSeq)
+      || !!preferenceProposalBySource(db, input.assistantSessionId, input.sourceRequestId, input.sourceMessageId, input.sourceEventSeq, null)
+      || assistantSourceUsed(db, input)
   }
 
   /** Check both the journal row and its projected head before the parent transaction can commit. */
