@@ -1,23 +1,27 @@
 /** Owner controls for project work that depends on an already submitted systemd user job. */
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
-import type { StudioProjectJob } from './project-store.ts'
+import type { StudioJobRoute, StudioProjectJob } from './project-store.ts'
 import type { ManagedResult, ManagedWorkerStore } from './store.ts'
 import { observeSystemdJob, validSystemdJob, type SystemdJobRef } from './systemd-job.ts'
 
 interface JobReceipt { kind: 'success' | 'error'; text: string }
 const id = z.uuid()
 const denied = (reason: string): JobReceipt => ({ kind: 'error', text: `Studio external job control rejected: ${reason}.` })
-const usage = () => denied('Use /studio-job attach <work-id> <unit> <invocation-id>, status/check <work-id>, or pause/resume <work-id> <authorization-version>')
+const usage = () => denied('Use /studio-job attach <work-id> <unit> <invocation-id>, status/check <work-id>, or pause/resume/auto <work-id> <authorization-version>')
 const MAX_CONTROL_OPERATIONS = 4
 
 /** Present the pinned reference rather than the current occupant of a reusable service name. */
 export function projectJobText(job: StudioProjectJob): string {
   const { unit, invocationId } = job.ref
   const state = job.state === 'unknown' ? 'unknown (query could not confirm the pinned invocation)' : job.state
+  const { automatic } = job
+  const continuation = !automatic ? 'not authorized for the current version' : automatic.executionEpoch !== undefined
+    ? `claimed by execution epoch ${automatic.executionEpoch}`
+    : `one attempt authorized on ${automatic.route.model.provider}/${automatic.route.model.model}, subject to confirmed success and the current Leader, route and quota`
   return `Work ${job.workId}\nExternal job: ${unit}; invocation ${invocationId}.\nLast checked: ${state} at ${job.observedAt} (observation ${job.observationVersion}).\n`
-    + `Post-processing: ${job.paused ? 'paused' : job.state === 'completed' ? 'eligible for explicit Leader dispatch' : 'waiting for confirmed success'}; authorization ${job.authorizationVersion}.\n`
-    + `Journal reference: _SYSTEMD_INVOCATION_ID=${invocationId}.`
+    + `Post-processing: ${job.paused ? 'paused' : job.state === 'completed' ? 'external dependency satisfied' : 'waiting for confirmed success'}; authorization ${job.authorizationVersion}.\n`
+    + `Automatic post-processing: ${continuation}.\nJournal reference: _SYSTEMD_INVOCATION_ID=${invocationId}.`
 }
 
 function receipt(result: ManagedResult<StudioProjectJob>, label: string): JobReceipt {
@@ -34,7 +38,7 @@ export class StudioProjectJobControl {
   private readonly operations = new Set<Promise<JobReceipt>>()
 
   constructor(private readonly store: ManagedWorkerStore, private readonly ready: (agent: Agent) => boolean,
-    private readonly stopping: AbortSignal) {}
+    private readonly stopping: AbortSignal, private readonly automaticRoute?: (agent: Agent) => StudioJobRoute) {}
 
   async drain(): Promise<void> { await Promise.allSettled(this.operations) }
 
@@ -82,11 +86,26 @@ export class StudioProjectJobControl {
       const state = await observeSystemdJob(job.ref, signal)
       signal.throwIfAborted()
       if (!this.ready(agent)) return denied('LEADER_UNAVAILABLE')
-      return receipt(projects.observeJob(agent.id, workId, job.observationVersion, state), 'External status checked. No Worker was started.')
+      const observed = projects.observeJob(agent.id, workId, job.observationVersion, state)
+      if (!observed.ok && observed.reason === 'STALE_JOB_OBSERVATION') {
+        // The program watcher can win the observation CAS while the manual check is in flight.
+        const latest = projects.readJob(agent.id, workId)
+        if (latest.ok && latest.value) return { kind: 'success', text: `A newer saved observation was kept.\n${projectJobText(latest.value)}` }
+      }
+      return receipt(observed, 'External status checked. This check did not authorize dispatch.')
     }
-    if ((verb === 'pause' || verb === 'resume') && args.length === 1 && /^[1-9]\d*$/u.test(args[0]!)) {
+    if ((verb === 'pause' || verb === 'resume' || verb === 'auto') && args.length === 1 && /^[1-9]\d*$/u.test(args[0]!)) {
       const version = Number(args[0])
       if (!Number.isSafeInteger(version)) return usage()
+      if (verb === 'auto') {
+        if (!this.automaticRoute) return denied('EXTERNAL_JOB_WATCH_DISABLED')
+        let route: StudioJobRoute
+        try { route = this.automaticRoute(agent) } catch { return denied('WORKSPACE_OR_MODEL_MISSING') }
+        const armed = projects.armJob(agent.id, workId, commandId, version, route)
+        return receipt(armed, armed.ok && armed.value.authorizationVersion !== version + 1
+          ? 'Earlier automatic authorization already recorded. No authorization changed.'
+          : 'Automatic post-processing authorized for one attempt. This command did not start a Worker.')
+      }
       const paused = verb === 'pause'
       const result = projects.setJobPaused(agent.id, workId, commandId, version, paused)
       if (result.ok && result.value.authorizationVersion !== version + 1) return receipt(result, 'Earlier command already recorded. No authorization changed.')

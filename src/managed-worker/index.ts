@@ -15,6 +15,7 @@ import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, fe
 import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './feishu-text.ts'
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
 import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
+import { StudioProjectJobMonitor } from './project-job-monitor.ts'
 import { StudioProjectJobControl } from './project-job.ts'
 import { LEADER_PRESET, StudioProjectControl, isLeaderTool } from './project.ts'
 import { QuotaPoolConfig, StudioQuotaControl, quotaProviderMap } from './quota.ts'
@@ -33,6 +34,8 @@ export const Config = s.object({
     .description('Explicit provider IDs that share each inference quota pool; empty disables the quota gate.'),
   systemdJobInbox: s.boolean().default(false)
     .description('Allow the owner to attach and check existing local systemd user jobs in a Studio project.'),
+  systemdJobPollSeconds: s.number().default(0)
+    .description('Seconds between bounded checks of attached jobs, 5–300. Zero disables the watcher and automatic post-processing.'),
 })
 type Config = ReturnType<typeof Config>
 
@@ -94,9 +97,13 @@ function receipt(operation: string, result: ManagedResult<ManagedTask>, showResu
 }
 
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
-export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocumentInbox, feishuTextInbox, quotaPools, systemdJobInbox }: Config): void {
+export function apply(context: Context, config: Config): void {
+  const { stateDir, guiDocumentInbox, feishuDocumentInbox, feishuTextInbox, quotaPools, systemdJobInbox, systemdJobPollSeconds } = config
   const ctx = localOwnerHost(context)
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
+  if (systemdJobPollSeconds !== 0 && (!systemdJobInbox || !Number.isInteger(systemdJobPollSeconds) || systemdJobPollSeconds < 5 || systemdJobPollSeconds > 300)) {
+    throw new Error('Studio job watcher requires systemdJobInbox and a polling interval of 5–300 seconds')
+  }
   const providerPool = quotaProviderMap(quotaPools)
   if (feishuDocumentInbox && feishuTextInbox) throw new Error('Choose either the Studio Feishu document or text inbox, not both')
   const feishuConfig = feishuDocumentInbox ?? feishuTextInbox
@@ -106,6 +113,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
   let available = true
   const channelStop = new AbortController()
   let channelRun: Promise<void> | undefined
+  let projectJobRun: Promise<void> | undefined
   // Reserve the directory for one host. The SQLite run fence also rejects commits from a prior holder of the lock.
   const unlock = lockSync(stateDir, { stale: 30_000, onCompromised(error) {
     available = false
@@ -131,14 +139,19 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
     && ctx.sandboxPolicy.resolve({ session: agent.session }).mode === 'read-only'
   const ready = (agent: Agent, role: StudioRole): boolean => available && controlReady(ctx) && currentSession(agent)
     && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
+  const channelReady = () => available && controlReady(ctx)
   const quota = new StudioQuotaControl(ctx, store, quotaPools, providerPool)
   const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), agent => ready(agent, 'draft-worker'),
     provider => quota.denial(provider))
-  const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts)
-  const projectJobs = systemdJobInbox ? new StudioProjectJobControl(store, agent => ready(agent, 'leader'), channelStop.signal) : undefined
+  const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts, provider => providerPool.get(provider))
+  const jobMonitor = systemdJobPollSeconds ? new StudioProjectJobMonitor(store, systemdJobPollSeconds * 1000, channelReady, (permit, signal) => {
+    const leader = ctx.agents.get(permit.leaderSessionId as SessionId)
+    return leader ? projects.continueJob(leader, permit, signal) : undefined
+  }, () => ctx.logger.warn('Studio external job watcher could not confirm an operation; check /studio-job status')) : undefined
+  const projectJobs = systemdJobInbox ? new StudioProjectJobControl(store, agent => ready(agent, 'leader'), channelStop.signal,
+    jobMonitor ? agent => projects.jobRoute(agent) : undefined) : undefined
   const intake = new StudioProjectIntake(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal)
   const delivery = new AgentDelivery(ctx)
-  const channelReady = () => available && controlReady(ctx)
   const feishuText = feishuTextInbox ? new StudioFeishuText(store, drafts, feishuTextInbox, channelStop.signal, channelReady) : undefined
   const feishu = feishuConfig && new StudioFeishuInbox(ctx, store, stateDir, feishuConfig, channelReady, feishuText)
 
@@ -165,6 +178,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
       if (channelRun) await channelRun
       await feishuText?.drain()
       await projectJobs?.drain()
+      if (projectJobRun) await projectJobRun
       for (const scope of scopes.values()) scope.dispose()
       scopes.clear()
       // Admit no work after marking the run clean. A lost lock or failed shutdown leaves recovery to the next run.
@@ -350,7 +364,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
   if (projectJobs) ctx.effect(() => ctx.commands.register({
     name: 'studio-job',
     description: 'Attach or observe an existing external job, or pause its project work without stopping the job.',
-    input: { hint: 'attach <work-id> <unit> <invocation-id> | status/check <work-id> | pause/resume <work-id> <authorization-version>' },
+    input: { hint: 'attach <work-id> <unit> <invocation-id> | status/check <work-id> | pause/resume/auto <work-id> <authorization-version>' },
     recordInput: false,
     handler: ({ agent, commandId, rawInput, signal }) => projectJobs.command(agent, commandId, rawInput, signal),
   }))
@@ -368,5 +382,6 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
     },
   }))
   if (feishu) channelRun = feishu.run(channelStop.signal)
+  if (jobMonitor) projectJobRun = ctx.agents.withoutInitiator(() => jobMonitor.run(channelStop.signal))
   ctx.logger.info('SuperAgent Studio ready (no GitHub source)')
 }

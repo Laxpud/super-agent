@@ -7,6 +7,7 @@ import { types } from 'node:util'
 import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFeishuDraftTask } from './feishu-draft-store.js'
 import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
   type StudioFeishuInstruction, type StudioInstructionInput } from './instruction-store.js'
+import { PROJECT_JOB_AUTO_SCHEMA } from './project-job-auto-store.js'
 import { PROJECT_JOB_SCHEMA } from './project-job-store.js'
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
 import { QUOTA_SCHEMA, QuotaStore, type StudioQuotaIncident } from './quota-store.js'
@@ -321,6 +322,7 @@ export class ManagedWorkerStore {
         this.db.exec(SCHEMA)
         this.db.exec(PROJECT_SCHEMA)
         this.db.exec(PROJECT_JOB_SCHEMA)
+        this.db.exec(PROJECT_JOB_AUTO_SCHEMA)
         this.db.exec(INSTRUCTION_SCHEMA)
         this.db.exec(FEISHU_DRAFT_SCHEMA)
         this.db.exec(SHARED_DOCUMENT_SCHEMA)
@@ -337,6 +339,7 @@ export class ManagedWorkerStore {
         }
         this.feishuDrafts.interruptRunning()
         // A restart frees only reservations that never entered the model. Running attempts remain terminal.
+        // Releasing a reservation never unspends its automatic grant; grants not yet tried survive the restart.
         this.db.exec(`UPDATE studio_project_dispatch SET
           state = CASE state WHEN 'reserved' THEN 'released' ELSE 'interrupted' END,
           failure = 'HOST_RESTARTED' WHERE state IN ('reserved', 'running')`)

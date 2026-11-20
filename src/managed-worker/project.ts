@@ -4,9 +4,9 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { z } from 'zod'
-import { DRAFT_TIMEOUT_MS, ownerRequest, type StudioAssistant } from './assistant.ts'
+import { DRAFT_TIMEOUT_MS, draftWorkerRoute, ownerRequest, type StudioAssistant } from './assistant.ts'
 import { projectJobContext, projectJobText } from './project-job.ts'
-import { PROJECT_NAME_LIMIT, PROJECT_TEXT_LIMIT, type StudioProject, type StudioProjectWorkView } from './project-store.ts'
+import { PROJECT_NAME_LIMIT, PROJECT_TEXT_LIMIT, sameJobRoute, type StudioJobAuto, type StudioJobRoute, type StudioProject, type StudioProjectWorkView } from './project-store.ts'
 import type { ManagedResult, ManagedWorkerStore } from './store.ts'
 
 export const LEADER_PRESET = 'dsh-superagent-studio-leader'
@@ -66,7 +66,26 @@ function projectReceipt(label: string, result: ManagedResult<StudioProject>): Co
 /** Make project writes in the Store after checking the exact caller, not by interpreting model-provided authority statements. */
 export class StudioProjectControl {
   constructor(private readonly store: ManagedWorkerStore, private readonly leaderReady: (agent: Agent) => boolean,
-    private readonly workers: StudioAssistant) {}
+    private readonly workers: StudioAssistant, private readonly quotaPool: (provider: string) => string | undefined) {}
+
+  /** Pin the Leader's selected workspace, model and quota pool; owner commands do not accept an alternate route. */
+  jobRoute(agent: Agent): StudioJobRoute {
+    const { cwd, model: { provider, model, reasoningEffort } } = draftWorkerRoute(agent)
+    const quotaPool = this.quotaPool(provider)
+    return { cwd, model: { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) },
+      ...(quotaPool === undefined ? {} : { quotaPool }) }
+  }
+
+  /** Submit the previously authorized text work only through the original live Leader, without running that Leader's model. */
+  continueJob(agent: Agent, permit: StudioJobAuto, signal: AbortSignal): Promise<void> | undefined {
+    if (signal.aborted || agent.id !== permit.leaderSessionId || agent.status !== 'idle' || !this.leaderReady(agent)
+      || !this.jobRouteMatches(agent, permit.route) || this.workers.providerDenial(permit.route.model.provider)) return
+    return this.runWork(agent, permit.workId, signal, permit).then(() => undefined)
+  }
+
+  private jobRouteMatches(agent: Agent, route: StudioJobRoute): boolean {
+    try { return sameJobRoute(this.jobRoute(agent), route) } catch { return false }
+  }
 
   /** Historical Leader bindings can see their own project, but cannot register or start new work. */
   guard(agent: Agent, name: string): string | undefined {
@@ -79,11 +98,11 @@ export class StudioProjectControl {
   }
 
   /** Reserve once under current management and recheck both before the relay and at the Worker's first step. */
-  private async runWork(agent: Agent, workId: string, signal: AbortSignal): Promise<StudioProjectWorkView> {
-    const route = this.workers.checkedRoute(agent)
+  private async runWork(agent: Agent, workId: string, signal: AbortSignal, automatic?: Pick<StudioJobAuto, 'permitId' | 'route'>): Promise<StudioProjectWorkView> {
+    const route = automatic?.route ?? this.workers.checkedRoute(agent)
     signal.throwIfAborted()
     const workerId = SessionId(randomUUID())
-    const reserved = this.store.projects.reserveWork(agent.id, workId, workerId)
+    const reserved = this.store.projects.reserveWork(agent.id, workId, workerId, automatic)
     const refusal = (reason: string) => {
       const hint = reason === 'STALE_MANAGEMENT'
         ? '. This Session no longer manages the project. Run /studio-project status to find the current Leader.'
@@ -97,6 +116,7 @@ export class StudioProjectControl {
     if (!created) return view
     const check = (operation: () => ManagedResult<unknown>) => {
       if (!this.leaderReady(agent)) return 'LEADER_UNAVAILABLE'
+      if (automatic && !this.jobRouteMatches(agent, automatic.route)) return 'EXTERNAL_JOB_ROUTE_CHANGED'
       const result = operation()
       return result.ok ? undefined : result.reason
     }

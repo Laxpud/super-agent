@@ -1,11 +1,14 @@
 /** Durable Studio project identity, management history, and work dispatch. */
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
-import { attachProjectJob, isConfirmedJobState, isJobState, observeProjectJob, projectJobCommandUsed,
-  readProjectJob, setProjectJobPaused, type StudioProjectJob } from './project-job-store.js'
+import { armProjectJob, consumeJobAuto, consumedJobAuto, jobAutoPage, projectJobAutoCommandUsed, readAutoReservation,
+  readJobRoute, sameJobRoute, type StudioJobAuto, type StudioJobRoute } from './project-job-auto-store.js'
+import { attachProjectJob, isConfirmedJobState, isJobState, observeProjectJob, observeWatchedProjectJob, projectJobCommandUsed,
+  readProjectJob, setProjectJobPaused, watchedJobPage, type StudioProjectJob } from './project-job-store.js'
 import type { ManagedResult, StudioDraftResult } from './store.ts'
 import { validSystemdJob, type SystemdJobRef, type SystemdJobState } from './systemd-job.js'
 
+export { sameJobRoute, type StudioJobAuto, type StudioJobRoute } from './project-job-auto-store.js'
 export type { StudioProjectJob } from './project-job-store.js'
 
 /** Maximum project name length in UTF-16 code units. */
@@ -544,6 +547,43 @@ export class ProjectStore {
       observeProjectJob(this.db, actor.projectId, workId, expectedObservationVersion, state))
   }
 
+  /** Host-only: read one keyset page of nonterminal pinned jobs for polling, without allocating any Worker. */
+  jobWatchBatch(afterWorkId?: string): ManagedResult<StudioProjectJob[]> {
+    if (afterWorkId !== undefined && !isId(afterWorkId)) return deny('INVALID_INPUT')
+    return this.access.snapshot(() => accept(watchedJobPage(this.db, afterWorkId ?? '')))
+  }
+
+  /** Host-only: merge facts for an exact pinned invocation, even if no Leader Session is live. */
+  observeWatchedJob(workId: string, ref: SystemdJobRef, expectedObservationVersion: number,
+    state: SystemdJobState): ManagedResult<StudioProjectJob> {
+    if (!isId(workId) || !ref || typeof ref !== 'object' || !isEpoch(expectedObservationVersion) || !isJobState(state)) {
+      return deny('INVALID_INPUT')
+    }
+    const { unit, invocationId } = ref
+    if (!isId(unit) || !isId(invocationId) || !validSystemdJob({ unit, invocationId })) return deny('INVALID_INPUT')
+    return this.access.write(() => observeWatchedProjectJob(this.db, workId, { unit, invocationId }, expectedObservationVersion, state))
+  }
+
+  /** Host-only: record an explicit owner grant for one automatic continuation under the current Leader and route. */
+  armJob(leaderSessionId: string, workId: string, commandId: string, expectedAuthorizationVersion: number,
+    route: StudioJobRoute): ManagedResult<StudioProjectJob> {
+    const approvedRoute = readJobRoute(route)
+    if (!isId(leaderSessionId) || !isId(workId) || !isId(commandId) || !isEpoch(expectedAuthorizationVersion) || !approvedRoute) {
+      return deny('INVALID_INPUT')
+    }
+    return this.withCurrentJobWork(leaderSessionId, workId, actor => {
+      const job = readProjectJob(this.db, actor.projectId, workId)
+      return job ? armProjectJob(this.db, actor, job, commandId, expectedAuthorizationVersion, approvedRoute, () => this.commandUsed(commandId))
+        : deny('EXTERNAL_JOB_NOT_FOUND')
+    })
+  }
+
+  /** Host-only: read one keyset page of eligible grants; reserveWork still rechecks every authority predicate. */
+  jobAutoBatch(afterWorkId?: string): ManagedResult<StudioJobAuto[]> {
+    if (afterWorkId !== undefined && !isId(afterWorkId)) return deny('INVALID_INPUT')
+    return this.access.snapshot(() => accept(jobAutoPage(this.db, afterWorkId ?? '')))
+  }
+
   /** Set the owner pause independently of observation; resuming does not dispatch a Worker. */
   setJobPaused(leaderSessionId: string, workId: string, commandId: string, expectedAuthorizationVersion: number,
     paused: boolean): ManagedResult<StudioProjectJob> {
@@ -564,24 +604,31 @@ export class ProjectStore {
     })
   }
 
-  /** Reserve a fresh Worker only for eligible work in the current Leader's project. */
-  reserveWork(leaderSessionId: string, workId: string, workerSessionId: string):
+  /** Reserve an eligible Worker, spending the exact grant in the same transaction for automatic dispatches only. */
+  reserveWork(leaderSessionId: string, workId: string, workerSessionId: string, automatic?: { permitId: string; route: StudioJobRoute }):
     ManagedResult<StudioProjectWorkView & { run: StudioProjectRun; created: boolean }> {
-    if (!isId(leaderSessionId) || !isId(workId) || !isId(workerSessionId)) return deny('INVALID_INPUT')
+    const auto = automatic === undefined ? undefined : readAutoReservation(automatic)
+    if (!isId(leaderSessionId) || !isId(workId) || !isId(workerSessionId) || (automatic !== undefined && !auto)) return deny('INVALID_INPUT')
     return this.access.write<StudioProjectWorkView & { run: StudioProjectRun; created: boolean }>(() => {
       const current = this.currentProject(leaderSessionId)
       if (!current.ok) return current
       const { projectId, managementEpoch } = current.value
       const work = this.work(projectId, workId)
       if (!work) return deny('WORK_NOT_FOUND')
-      // Keep existing attempts readable even if an owner pauses after reservation or start.
+      // Manual callers still get the existing attempt. An automatic caller cannot claim it with a grant.
       const previous = this.latestRun(work)
       const job = readProjectJob(this.db, projectId, workId)
       const view = job ? { work, job } : { work }
-      if (previous && previous.state !== 'released') return accept({ ...view, run: previous, created: false })
-      // Only an eligible job can claim fresh work. A release permits a new epoch, not reuse of the Worker Session.
+      if (previous && previous.state !== 'released') {
+        return auto ? deny('WORK_ALREADY_DISPATCHED') : accept({ ...view, run: previous, created: false })
+      }
       const blocked = this.jobDispatchBlock(job)
       if (blocked) return blocked
+      const grant = auto ? job?.automatic : undefined
+      if (auto && (!grant || grant.permitId !== auto.permitId || grant.executionEpoch !== undefined
+        || grant.leaderSessionId !== leaderSessionId || grant.managementEpoch !== managementEpoch
+        || !sameJobRoute(grant.route, auto.route))) return deny('STALE_JOB_AUTHORIZATION')
+      // A release permits a new epoch, not reuse of the Worker Session or a spent grant.
       if (this.sessionBound(workerSessionId)) return deny('SESSION_ALREADY_BOUND')
       const executionEpoch = (previous?.executionEpoch ?? 0) + 1
       if (!isEpoch(executionEpoch)) return deny('INVALID_INPUT')
@@ -590,6 +637,10 @@ export class ProjectStore {
       requireWrite(this.db.prepare(`INSERT INTO studio_project_dispatch (work_id, execution_epoch, project_id, leader_session_id,
         management_epoch, worker_session_id, worker_bot_id, run_id, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reserved')`)
         .run(...this.dispatchKeys(run)).changes)
+      if (job && grant) {
+        consumeJobAuto(this.db, grant, projectId, executionEpoch)
+        return accept({ work, job: { ...job, automatic: { ...grant, executionEpoch } }, run, created: true })
+      }
       return accept({ ...view, run, created: true })
     })
   }
@@ -705,7 +756,15 @@ export class ProjectStore {
     if (stored.state !== 'reserved') return deny('WORK_NOT_RESERVED')
     if (!this.work(stored.projectId, stored.workId)) return deny('WORK_NOT_FOUND')
     const job = readProjectJob(this.db, stored.projectId, stored.workId)
-    return this.jobDispatchBlock(job) ?? accept(stored)
+    const blocked = this.jobDispatchBlock(job)
+    if (blocked) return blocked
+    // A spent grant identifies the original automatic attempt even when a newer authorization hides it from the job view.
+    const grant = consumedJobAuto(this.db, stored.workId, stored.executionEpoch)
+    if (grant && (job?.automatic?.permitId !== grant.permitId || grant.authorizationVersion !== job.authorizationVersion
+      || grant.leaderSessionId !== stored.leaderSessionId || grant.managementEpoch !== stored.managementEpoch)) {
+      return deny('STALE_JOB_AUTHORIZATION')
+    }
+    return accept(stored)
   }
 
   private currentProject(sessionId: string): ManagedResult<StudioProject> {
@@ -750,6 +809,7 @@ export class ProjectStore {
   private commandUsed(commandId: string): boolean {
     return !!this.db.prepare('SELECT 1 FROM studio_project_binding WHERE command_id = ?').get(commandId)
       || projectJobCommandUsed(this.db, commandId)
+      || projectJobAutoCommandUsed(this.db, commandId)
   }
 
   /** Scope exact IDs and latest lookups to the originating Session, not the shared Assistant Bot. */
