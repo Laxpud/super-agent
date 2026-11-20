@@ -24,7 +24,7 @@ export interface OwnerInboxInput {
 }
 
 interface InboxSplice { target?: unknown; removedCount?: unknown; inserted?: readonly UserMessage[] }
-type ReceiptName = 'studio-memory-query' | 'studio-memory-correction'
+type ReceiptName = 'studio-memory-query' | 'studio-memory-correction' | 'studio-memory-restrict' | 'studio-memory-forget' | 'studio-memory-scope-change'
 type ReceiptResult = { kind: 'success' | 'error'; text: string }
 interface ReceiptSource { kind: ReceiptName; messageId: string; requestId: string; sourceEventSeq: SessionSeq }
 // rc.3 adds these log-only records and atomic batch append. The development declarations predate this lifecycle.

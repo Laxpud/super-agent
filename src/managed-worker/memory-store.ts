@@ -7,6 +7,8 @@ import { decidePreferenceCorrection, insertPreferenceCorrection, preferenceCorre
   preferenceCorrectionReceiptId, type PreferenceCorrectionInput, type PreferenceCorrectionReceipt } from './preference-correction-store.js'
 import { PREFERENCE_PROPOSAL_INTENT_LIMIT, decidePreferenceProposal, insertPreferenceProposal, preferenceProposalById,
   preferenceProposalBySource, preferenceProposalReceiptId, type PreferenceProposal, type PreferenceProposalInput } from './preference-proposal-store.js'
+import { decidePreferenceScopeChange, insertPreferenceScopeChange, preferenceScopeChangeById, preferenceScopeChangeBySource,
+  preferenceScopeChangeReceiptId, type PreferenceScopeChangeInput, type PreferenceScopeChangeReceipt } from './preference-scope-change-store.js'
 import type { ManagedResult } from './store.js'
 import { assistantSourceUsed } from './study-store.js'
 
@@ -14,6 +16,8 @@ export { PREFERENCE_CORRECTION_RECEIPT_PREFIX, preferenceCorrectionReceiptId,
   type PreferenceCorrectionInput, type PreferenceCorrectionReceipt } from './preference-correction-store.js'
 export { PREFERENCE_PROPOSAL_INTENT_LIMIT, PREFERENCE_PROPOSAL_RECEIPT_PREFIX, preferenceProposalReceiptId,
   type PreferenceProposal, type PreferenceProposalInput } from './preference-proposal-store.js'
+export { PREFERENCE_SCOPE_CHANGE_RECEIPT_PREFIX, preferenceScopeChangeReceiptId,
+  type PreferenceScopeChangeInput, type PreferenceScopeChangeReceipt } from './preference-scope-change-store.js'
 
 /** Exact coordinates of a persisted Assistant event. The opaque audit key identifies a command or a confirmed proposal. */
 export interface MemorySource {
@@ -243,6 +247,46 @@ function sameCorrectionInput(input: PreferenceCorrectionInput, previous: StoredC
   return (Object.keys(input) as (keyof PreferenceCorrectionInput)[]).every(key => input[key] === previous[key])
 }
 
+/** Accept only the coordinates and scope fields for the selected operation; neither action accepts a body. */
+function scopeChangeInput(fields: Record<string, unknown>): PreferenceScopeChangeInput | undefined {
+  const { assistantSessionId, sourceRequestId, sourceMessageId, sourceEventSeq, turn, key, expectedRevision, kind, targetProjectId, projectId } = fields
+  if (!isId(assistantSessionId) || !isId(sourceRequestId) || !isId(sourceMessageId) || !isEventSeq(sourceEventSeq)
+    || !isRevision(turn) || !isMemoryKey(key) || !isRevision(expectedRevision)) return
+  const base = { assistantSessionId, sourceRequestId, sourceMessageId, sourceEventSeq, turn, key, expectedRevision }
+  if (kind === 'restrict' && Object.keys(fields).length === 9 && isProjectId(targetProjectId)) {
+    return { ...base, kind, targetProjectId }
+  }
+  if (kind === 'forget' && Object.keys(fields).length === (Object.hasOwn(fields, 'projectId') ? 9 : 8)
+    && (projectId === undefined || isProjectId(projectId))) return { ...base, kind, projectId }
+}
+
+type StoredScopeChange = PreferenceScopeChangeInput & Omit<PreferenceScopeChangeReceipt, 'created'> & {
+  assistantBotId: string
+  runId: string
+  proposedAt: string
+}
+
+/** Decode the immutable intent separately from the terminal decision. */
+function readScopeChange(row: Row): StoredScopeChange {
+  const { proposalId, assistantBotId, runId, state, proposedAt, decidedAt, expectedProjectId, targetProjectId,
+    kind, assistantSessionId, sourceRequestId, sourceMessageId, sourceEventSeq, turn, key, expectedRevision } = row
+  const base = { assistantSessionId, sourceRequestId, sourceMessageId, sourceEventSeq, turn, key, expectedRevision, kind }
+  const input = kind === 'restrict' && expectedProjectId === null ? scopeChangeInput({ ...base, targetProjectId })
+    : kind === 'forget' && targetProjectId === null ? scopeChangeInput({ ...base, projectId: expectedProjectId ?? undefined }) : undefined
+  if (!input || !isId(proposalId) || !isId(assistantBotId) || !isId(runId) || !isId(proposedAt)
+    || (state !== 'pending' && state !== 'confirmed' && state !== 'closed')
+    || (state === 'pending' ? decidedAt !== null : !isId(decidedAt))) throw new Error('Invalid Studio memory scope change')
+  return { ...input, proposalId, assistantBotId, runId, state, proposedAt }
+}
+
+function sameScopeChangeInput(input: PreferenceScopeChangeInput, previous: StoredScopeChange): boolean {
+  return input.assistantSessionId === previous.assistantSessionId && input.sourceRequestId === previous.sourceRequestId
+    && input.sourceMessageId === previous.sourceMessageId && input.sourceEventSeq === previous.sourceEventSeq && input.turn === previous.turn
+    && input.key === previous.key && input.expectedRevision === previous.expectedRevision
+    && (input.kind === 'restrict' ? previous.kind === 'restrict' && input.targetProjectId === previous.targetProjectId
+      : previous.kind === 'forget' && input.projectId === previous.projectId)
+}
+
 const METADATA = 'r.key, r.revision, r.state, r.operation, r.project_id, r.source_session_id, r.command_id, r.source_event_seq, r.at'
 const HEAD = `FROM studio_memory_head h JOIN studio_memory_revision r ON r.key = h.key AND r.revision = h.revision`
 
@@ -383,7 +427,7 @@ export class MemoryStore {
         return accept({ proposalId: stored.proposalId, state: stored.state, created: false })
       }
       if (this.correctionSourceUsed(exact)) return deny('SOURCE_ALREADY_USED')
-      const current = this.correctionHead(exact)
+      const current = this.exactChangeHead(exact.key, exact.expectedRevision, exact.projectId)
       if (!current.ok) return current
 
       const proposalId = randomUUID()
@@ -413,7 +457,7 @@ export class MemoryStore {
       if (correction.state === 'closed') return deny('PROPOSAL_CLOSED')
       if (correction.state === 'confirmed') return deny('PROPOSAL_ALREADY_CONFIRMED')
       if (correction.runId !== this.access.runId) return deny('STALE_HOST_RUN')
-      const current = this.correctionHead(correction)
+      const current = this.exactChangeHead(correction.key, correction.expectedRevision, correction.projectId)
       if (!current.ok) return current
       if (this.correctionSourceUsed(correction)) return deny('SOURCE_ALREADY_USED')
       const source = { sessionId: assistantSessionId, commandId: preferenceCorrectionReceiptId(proposalId), eventSeq: correction.sourceEventSeq }
@@ -440,6 +484,90 @@ export class MemoryStore {
       if (correction.state === 'pending') {
         if (correction.runId !== this.access.runId) return deny('STALE_HOST_RUN')
         decidePreferenceCorrection(db, assistantSessionId, assistantBotId, proposalId, this.access.runId, 'closed')
+      }
+      return accept({ proposalId, state: 'closed' })
+    })
+  }
+
+  /** Reserve one verified inbox source against the exact active revision without reading the body. */
+  proposeScopeChange(input: PreferenceScopeChangeInput): ManagedResult<PreferenceScopeChangeReceipt> {
+    const fields = plainData(input, 9)
+    const exact = fields && scopeChangeInput(fields)
+    if (!exact) return deny('INVALID_INPUT')
+    return this.access.write<PreferenceScopeChangeReceipt>(() => {
+      const { assistantSessionId, sourceRequestId, sourceMessageId, sourceEventSeq } = exact
+      const assistantBotId = this.access.ordinaryAssistantBinding(assistantSessionId)
+      if (!assistantBotId) return deny('SESSION_NOT_BOUND')
+      const db = this.access.db()
+      // Keep a terminal source consumed even if the preference itself has moved or been forgotten.
+      const previous = preferenceScopeChangeBySource(db, assistantSessionId, sourceRequestId, sourceMessageId, sourceEventSeq)
+      if (previous) {
+        const stored = readScopeChange(previous)
+        if (stored.assistantBotId !== assistantBotId || !sameScopeChangeInput(exact, stored)) return deny('SOURCE_ALREADY_USED')
+        if (stored.state === 'pending' && stored.runId !== this.access.runId) return deny('STALE_HOST_RUN')
+        return accept({ proposalId: stored.proposalId, state: stored.state, created: false })
+      }
+      if (this.scopeChangeSourceUsed(exact)) return deny('SOURCE_ALREADY_USED')
+      const current = this.exactChangeHead(exact.key, exact.expectedRevision, exact.kind === 'forget' ? exact.projectId : undefined)
+      if (!current.ok) return current
+      if (exact.kind === 'restrict' && !this.projectExists(exact.targetProjectId)) return deny('PROJECT_NOT_FOUND')
+
+      const proposalId = randomUUID()
+      const at = new Date().toISOString()
+      insertPreferenceScopeChange(db, exact, proposalId, assistantBotId, this.access.runId, at)
+      const row = preferenceScopeChangeById(db, assistantSessionId, proposalId)
+      if (!row) throw new Error('Studio memory scope change insert was not retained')
+      const stored = readScopeChange(row)
+      if (stored.state !== 'pending' || stored.assistantBotId !== assistantBotId || stored.runId !== this.access.runId
+        || stored.proposedAt !== at || !sameScopeChangeInput(exact, stored)) {
+        throw new Error('Studio memory scope change insert did not retain exact input')
+      }
+      return accept({ proposalId, state: 'pending', created: true })
+    })
+  }
+
+  /** Host-only: after native owner consent, recheck the reservation and append its decision in one transaction. */
+  confirmScopeChange(assistantSessionId: string, proposalId: string): ManagedResult<StudioPreference> {
+    if (!isId(assistantSessionId) || !isId(proposalId)) return deny('INVALID_INPUT')
+    return this.access.write(() => {
+      const assistantBotId = this.access.ordinaryAssistantBinding(assistantSessionId)
+      if (!assistantBotId) return deny('SESSION_NOT_BOUND')
+      const db = this.access.db()
+      const row = preferenceScopeChangeById(db, assistantSessionId, proposalId)
+      if (!row || row.assistantBotId !== assistantBotId) return deny('PROPOSAL_NOT_FOUND')
+      const proposal = readScopeChange(row)
+      if (proposal.state === 'closed') return deny('PROPOSAL_CLOSED')
+      if (proposal.state === 'confirmed') return deny('PROPOSAL_ALREADY_CONFIRMED')
+      if (proposal.runId !== this.access.runId) return deny('STALE_HOST_RUN')
+      const current = this.exactChangeHead(proposal.key, proposal.expectedRevision, proposal.kind === 'forget' ? proposal.projectId : undefined)
+      if (!current.ok) return current
+      if (this.scopeChangeSourceUsed(proposal)) return deny('SOURCE_ALREADY_USED')
+      const source = { sessionId: assistantSessionId, commandId: preferenceScopeChangeReceiptId(proposalId), eventSeq: proposal.sourceEventSeq }
+      if (this.commandUsed(source.commandId)) return deny('DUPLICATE_COMMAND')
+
+      // A failed decision rolls back both the journal append and its projected head.
+      const result = this.applyChange(current.value, proposal.kind === 'restrict'
+        ? { kind: 'restrict', projectId: proposal.targetProjectId } : { kind: 'forget' }, source)
+      if (!result.ok) return result
+      decidePreferenceScopeChange(db, assistantSessionId, assistantBotId, proposalId, this.access.runId, 'confirmed')
+      return result
+    })
+  }
+
+  /** Close a pending question without changing the preference; repeating a close returns the retained decision. */
+  closeScopeChange(assistantSessionId: string, proposalId: string): ManagedResult<{ proposalId: string; state: 'closed' }> {
+    if (!isId(assistantSessionId) || !isId(proposalId)) return deny('INVALID_INPUT')
+    return this.access.write(() => {
+      const assistantBotId = this.access.ordinaryAssistantBinding(assistantSessionId)
+      if (!assistantBotId) return deny('SESSION_NOT_BOUND')
+      const db = this.access.db()
+      const row = preferenceScopeChangeById(db, assistantSessionId, proposalId)
+      if (!row || row.assistantBotId !== assistantBotId) return deny('PROPOSAL_NOT_FOUND')
+      const proposal = readScopeChange(row)
+      if (proposal.state === 'confirmed') return deny('PROPOSAL_ALREADY_CONFIRMED')
+      if (proposal.state === 'pending') {
+        if (proposal.runId !== this.access.runId) return deny('STALE_HOST_RUN')
+        decidePreferenceScopeChange(db, assistantSessionId, assistantBotId, proposalId, this.access.runId, 'closed')
       }
       return accept({ proposalId, state: 'closed' })
     })
@@ -473,18 +601,7 @@ export class MemoryStore {
       const current = metadata(row)
       if (current.state !== 'active') return deny('MEMORY_NOT_CURRENT')
       if (current.revision !== expectedRevision) return deny('STALE_MEMORY_REVISION')
-      const revision = current.revision + 1
-      if (!isRevision(revision)) return deny('MEMORY_REVISION_LIMIT')
-      if (action.kind === 'correct') return accept(this.append(key, revision, action.kind, current.projectId, action.text, exact))
-      if (action.kind === 'forget') return accept(this.append(key, revision, action.kind, current.projectId, null, exact))
-
-      // Restriction only narrows visibility. Preserve the previous revision's exact text without reinterpreting it as a correction.
-      if (current.projectId !== undefined) return deny('MEMORY_SCOPE_CONFLICT')
-      if (!this.projectExists(action.projectId)) return deny('PROJECT_NOT_FOUND')
-      const text = this.access.db().prepare('SELECT text FROM studio_memory_revision WHERE key = ? AND revision = ?')
-        .get(key, current.revision)?.text
-      if (!isPreferenceText(text)) throw new Error('Invalid Studio memory text')
-      return accept(this.append(key, revision, action.kind, action.projectId, text, exact))
+      return this.applyChange(current, action, exact)
     })
   }
 
@@ -623,7 +740,8 @@ export class MemoryStore {
   private checkSource(source: MemorySource): Rejection | undefined {
     if (!this.access.assistantBinding(source.sessionId)) return deny('SESSION_NOT_BOUND')
     if (this.commandUsed(source.commandId)) return deny('DUPLICATE_COMMAND')
-    if (this.sourceEventUsed(source.sessionId, source.eventSeq)) return deny('SOURCE_ALREADY_USED')
+    if (this.sourceEventUsed(source.sessionId, source.eventSeq)
+      || preferenceScopeChangeBySource(this.access.db(), source.sessionId, null, null, source.eventSeq)) return deny('SOURCE_ALREADY_USED')
   }
 
   private sourceEventUsed(sessionId: string, eventSeq: number): boolean {
@@ -634,11 +752,14 @@ export class MemoryStore {
 
   /** A source consumed by an existing Assistant route or memory operation cannot materialize a proposal. */
   private proposalSourceUsed(input: PreferenceProposalInput): boolean {
-    return this.sourceEventUsed(input.assistantSessionId, input.sourceEventSeq) || assistantSourceUsed(this.access.db(), input)
+    const db = this.access.db()
+    return this.sourceEventUsed(input.assistantSessionId, input.sourceEventSeq)
+      || !!preferenceScopeChangeBySource(db, input.assistantSessionId, input.sourceRequestId, input.sourceMessageId, input.sourceEventSeq)
+      || assistantSourceUsed(db, input)
   }
 
-  /** Corrections must match the exact scope; unlike a read, a project request cannot fall back to a global preference. */
-  private correctionHead({ key, expectedRevision, projectId }: PreferenceCorrectionInput): ManagedResult<StudioPreference> {
+  /** Confirmed changes require the exact active scope; unlike a read, a project request cannot fall back to global. */
+  private exactChangeHead(key: string, expectedRevision: number, projectId: string | undefined): ManagedResult<StudioPreference> {
     const row = this.access.db().prepare(`SELECT ${METADATA} ${HEAD}
       WHERE h.key = ? AND h.state = 'active' AND r.state = h.state AND r.project_id IS h.project_id`).get(key)
     if (!row) return deny('MEMORY_NOT_CURRENT')
@@ -649,12 +770,36 @@ export class MemoryStore {
     return accept(current)
   }
 
-  /** An inbox event may differ from a create proposal's message event; match request and message as well as event. */
   private correctionSourceUsed(input: PreferenceCorrectionInput): boolean {
+    const { assistantSessionId, sourceRequestId, sourceMessageId, sourceEventSeq } = input
+    return this.inboxSourceUsed(input)
+      || !!preferenceScopeChangeBySource(this.access.db(), assistantSessionId, sourceRequestId, sourceMessageId, sourceEventSeq)
+  }
+
+  private scopeChangeSourceUsed(input: PreferenceScopeChangeInput): boolean {
+    return this.inboxSourceUsed(input) || !!preferenceCorrectionBySource(this.access.db(), input)
+  }
+
+  /** An inbox event may differ from a create proposal's message event; match request and message as well as event. */
+  private inboxSourceUsed(input: Pick<PreferenceScopeChangeInput, 'assistantSessionId' | 'sourceRequestId' | 'sourceMessageId' | 'sourceEventSeq'>): boolean {
     const db = this.access.db()
     return this.sourceEventUsed(input.assistantSessionId, input.sourceEventSeq)
       || !!preferenceProposalBySource(db, input.assistantSessionId, input.sourceRequestId, input.sourceMessageId, input.sourceEventSeq, null)
       || assistantSourceUsed(db, input)
+  }
+
+  /** Apply a validated change to the active head already checked in the caller's transaction. */
+  private applyChange(current: StudioPreference, action: MemoryChange, source: MemorySource): ManagedResult<StudioPreference> {
+    const { key, projectId } = current
+    const revision = current.revision + 1
+    if (!isRevision(revision)) return deny('MEMORY_REVISION_LIMIT')
+    if (action.kind === 'correct') return accept(this.append(key, revision, action.kind, projectId, action.text, source))
+    if (action.kind === 'forget') return accept(this.append(key, revision, action.kind, projectId, null, source))
+
+    // Restriction narrows global visibility only and carries the checked revision's text without changing it.
+    if (projectId !== undefined) return deny('MEMORY_SCOPE_CONFLICT')
+    if (!this.projectExists(action.projectId)) return deny('PROJECT_NOT_FOUND')
+    return accept(this.append(key, revision, action.kind, action.projectId, this.currentText(current).text, source))
   }
 
   /** Check both the journal row and its projected head before the parent transaction can commit. */
