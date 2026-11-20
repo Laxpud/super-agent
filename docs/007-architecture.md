@@ -362,6 +362,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/project.ts` | Owner controls for project work and document links, with Leader tools to register and dispatch text work and inspect saved evidence |
 | `src/managed-worker/project-intake.ts` | Presents a source-bound Assistant proposal to the native Web answerer; only a positive owner answer can establish the project and its Leader Session |
 | `src/managed-worker/project-store.ts` | Persists current management, work and dispatch; rechecks the project, work type and any job hold at reservation and start |
+| `src/managed-worker/project-handoff-store.ts` | Captures bounded work coordinates and statuses in the transfer transaction and rechecks only those IDs under the current project binding |
+| `src/managed-worker/project-handoff.ts` | Formats a read-only handoff review with historical state and current blockers or result coordinates in separate sections |
 | `src/managed-worker/project-archive.ts` | Handles owner-only commands for selecting, inspecting and tracing project facts without a model |
 | `src/managed-worker/project-archive-store.ts` | Stores fact revisions and excerpt coordinates under the stable project ID; checks management and exact saved Worker evidence before writes and reads |
 | `src/managed-worker/bot-experience.ts` | Handles owner-only commands for recording a reusable method and inspecting its applicability and provenance |

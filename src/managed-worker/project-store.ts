@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
 import { attachProjectDocument, projectDocumentAttached, projectDocumentCommandUsed, readProjectDocument,
   type ProjectDocumentAccess, type StudioProjectDocument } from './project-document-store.js'
+import { captureProjectHandoff, readProjectHandoff, type ProjectHandoffReview } from './project-handoff-store.js'
 import { armProjectJob, consumeJobAuto, consumedJobAuto, jobAutoPage, projectJobAutoCommandUsed, readAutoReservation,
   readJobRoute, sameJobRoute, type StudioJobAuto, type StudioJobRoute } from './project-job-auto-store.js'
 import { attachProjectJob, isConfirmedJobState, isJobState, observeProjectJob, observeWatchedProjectJob, projectJobCommandUsed,
@@ -488,9 +489,9 @@ export class ProjectStore {
     return accept({ ...binding, name, objective, ...(originTaskId === undefined ? {} : { originTaskId }), pendingCount: 0 })
   }
 
-  /** Transfer management to a never-bound Session; keep the prior binding and advance exactly one epoch. */
-  handoff(input: HandoffInput): ManagedResult<StudioProject> {
-    if (!input) return deny('INVALID_INPUT')
+  /** Transfer management to a never-bound Session and optionally archive the state after releasing reservations. */
+  handoff(input: HandoffInput, capture = false): ManagedResult<StudioProject> {
+    if (!input || typeof capture !== 'boolean') return deny('INVALID_INPUT')
     const { projectId, expectedEpoch, nextSessionId, commandId, leaderBotId } = input
     if (!isId(projectId) || !isEpoch(expectedEpoch) || !isId(nextSessionId) || !isId(commandId)
       || (leaderBotId !== undefined && !isId(leaderBotId))) return deny('INVALID_INPUT')
@@ -515,7 +516,25 @@ export class ProjectStore {
         WHERE project_id = ? AND management_epoch = ? AND state = 'reserved' LIMIT 1`).get(projectId, expectedEpoch)) {
         throw new Error('Cannot release Studio project reservations during handoff')
       }
-      return accept(this.boundProject(next))
+      if (capture) captureProjectHandoff(this.db, this.access, project, next, commandId)
+      const current = this.boundProject(next)
+      if (current.managementEpoch !== managementEpoch || current.leaderSessionId !== nextSessionId || current.leaderBotId !== bot.value) {
+        throw new Error('Cannot verify Studio project management after handoff')
+      }
+      return accept(current)
+    })
+  }
+
+  /** Read the selected handoff and recheck its work IDs, only for the project's exact current Leader. */
+  readHandoff(sessionId: string, managementEpoch?: number): ManagedResult<ProjectHandoffReview> {
+    if (!isId(sessionId) || (managementEpoch !== undefined && !isEpoch(managementEpoch))) return deny('INVALID_INPUT')
+    return this.access.snapshot(() => {
+      const current = this.currentProject(sessionId, true)
+      if (!current.ok) return current
+      const epoch = managementEpoch ?? current.value.managementEpoch
+      if (epoch > current.value.managementEpoch) return deny('HANDOFF_NOT_RECORDED')
+      const review = readProjectHandoff(this.db, this.access, current.value, epoch)
+      return review ? accept(review) : deny('HANDOFF_NOT_RECORDED')
     })
   }
 
@@ -819,13 +838,24 @@ export class ProjectStore {
     return accept(stored)
   }
 
-  private currentProject(sessionId: string): ManagedResult<StudioProject> {
+  private currentProject(sessionId: string): ManagedResult<StudioProject>
+  private currentProject(sessionId: string, metadataOnly: true): ManagedResult<StudioProjectBinding>
+  private currentProject(sessionId: string, metadataOnly = false): ManagedResult<StudioProjectBinding> {
     const binding = this.binding(sessionId)
     if (!binding) return deny('SESSION_NOT_BOUND')
-    const project = this.boundProject(binding)
+    // Handoff review needs the same authority check without loading the project name or objective.
+    const project = metadataOnly ? this.currentBinding(binding.projectId) : this.boundProject(binding)
     if (project.leaderSessionId !== sessionId || project.managementEpoch !== binding.managementEpoch) return deny('STALE_MANAGEMENT')
     if (this.access.nonProjectSessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
     return accept(project)
+  }
+
+  private currentBinding(projectId: string): StudioProjectBinding {
+    const row = this.db.prepare(`SELECT p.project_id, p.management_epoch, b.leader_bot_id, b.leader_session_id
+      FROM studio_project p LEFT JOIN studio_project_binding b USING (project_id, management_epoch)
+      WHERE p.project_id = ?`).get(projectId)
+    if (!row) throw new Error('Missing project for Studio Leader binding')
+    return readBinding(row)
   }
 
   private boundProject(binding: StudioProjectBinding): StudioProject {

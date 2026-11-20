@@ -23,6 +23,7 @@ import { PREFERENCE_SCOPE_CHANGE_SCHEMA, SCOPE_CHANGE_ASSISTANT_SOURCE_GUARDS, S
   closePreviousPreferenceScopeChanges } from './preference-scope-change-store.js'
 import { PROJECT_ARCHIVE_SCHEMA, ProjectArchiveStore } from './project-archive-store.js'
 import { PROJECT_DOCUMENT_SCHEMA, projectDocumentCommandUsed } from './project-document-store.js'
+import { PROJECT_HANDOFF_SCHEMA } from './project-handoff-store.js'
 import { PROJECT_JOB_AUTO_SCHEMA } from './project-job-auto-store.js'
 import { PROJECT_JOB_SCHEMA } from './project-job-store.js'
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
@@ -389,6 +390,7 @@ export class ManagedWorkerStore {
       const started = this.transaction(() => {
         this.db.exec(SCHEMA)
         this.db.exec(PROJECT_SCHEMA)
+        this.db.exec(PROJECT_HANDOFF_SCHEMA)
         this.db.exec(PROJECT_ARCHIVE_SCHEMA)
         this.db.exec(BOT_EXPERIENCE_SCHEMA)
         this.db.exec(MEMORY_SCHEMA)

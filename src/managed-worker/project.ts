@@ -8,6 +8,7 @@ import { DRAFT_TIMEOUT_MS, draftWorkerRoute, ownerRequest, type StudioAssistant 
 import { botExperienceCommand } from './bot-experience.ts'
 import { sharedDocumentCoordinates } from './document-command.ts'
 import { projectArchiveCommand } from './project-archive.ts'
+import { projectHandoffText } from './project-handoff.ts'
 import { projectJobContext, projectJobText } from './project-job.ts'
 import { PROJECT_NAME_LIMIT, PROJECT_TEXT_LIMIT, sameJobRoute, type StudioJobAuto, type StudioJobRoute, type StudioProject,
   type StudioProjectDocument, type StudioProjectWorkView } from './project-store.ts'
@@ -250,7 +251,21 @@ export class StudioProjectControl {
       return projectReceipt('Project status', this.store.projects.status(agent.id, argument || undefined))
     }
     if (!this.leaderReady(agent)) return denied('LEADER_SESSION_REQUIRED')
-    if (this.memoryEnabled && agent.session.header.origin !== 'subagent') {
+    const archiveEnabled = this.memoryEnabled && agent.session.header.origin !== 'subagent'
+    if (archiveEnabled) {
+      if (verb === 'handoff') {
+        const selected = argument ? versionArg.safeParse(argument) : undefined
+        if (selected && !selected.success) return denied('EXPECTED_MANAGEMENT_EPOCH')
+        const review = this.store.projects.readHandoff(agent.id, selected?.data)
+        if (review.ok) return { kind: 'success', text: projectHandoffText(review.value) }
+        const receipt = denied(review.reason)
+        // Do not imply an empty project or send a former Leader back to the same restricted read.
+        switch (review.reason) {
+          case 'HANDOFF_NOT_RECORDED': return { ...receipt, text: `${receipt.text} No handoff record for this epoch. Use /studio-project work to check registered work.` }
+          case 'STALE_MANAGEMENT': return { ...receipt, text: `${receipt.text} Use /studio-project status to find the current Leader Session and read the handoff there.` }
+          default: return receipt
+        }
+      }
       const result = projectArchiveCommand(this.store.projectArchive, agent.id, commandId, verb, argument)
         ?? botExperienceCommand(this.store.botExperience, agent.id, commandId, verb, argument)
       if (result) return result
@@ -287,8 +302,10 @@ export class StudioProjectControl {
       const parsed = handoffArgs.safeParse(argument.split(/\s+/))
       if (!parsed.success) return denied('EXPECTED_PROJECT_ID_EPOCH_AND_OPTIONAL_BOT')
       const [projectId, expectedEpoch, leaderBotId] = parsed.data
-      return projectReceipt('Project management transferred', this.store.projects.handoff({ projectId, expectedEpoch, nextSessionId: agent.id, commandId,
-        ...(leaderBotId === undefined ? {} : { leaderBotId }) }))
+      const receipt = projectReceipt('Project management transferred', this.store.projects.handoff({ projectId, expectedEpoch, nextSessionId: agent.id, commandId,
+        ...(leaderBotId === undefined ? {} : { leaderBotId }) }, archiveEnabled))
+      return receipt.kind === 'success' && archiveEnabled
+        ? { ...receipt, text: `${receipt.text}\n\nA handoff record was saved. View it with /studio-project handoff.` } : receipt
     }
     return denied('INVALID_CONTROL_COMMAND')
   }

@@ -25,6 +25,7 @@ import { StudioPreferenceChange } from './preference-correction.ts'
 import { PROPOSE_PREFERENCE, StudioPreferenceIntake } from './preference-intake.ts'
 import { answerPreferenceQuery } from './preference-query.ts'
 import { PROJECT_ARCHIVE_HINT } from './project-archive.ts'
+import { PROJECT_HANDOFF_HINT } from './project-handoff.ts'
 import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
 import { StudioProjectJobMonitor } from './project-job-monitor.ts'
 import { StudioProjectJobControl } from './project-job.ts'
@@ -479,7 +480,7 @@ export function apply(context: Context, config: Config): void {
     name: 'studio-project',
     description: 'Read project work, or create, transfer, or link an approved document task as the owner.',
     input: { hint: 'create <JSON> | status [project-id] | take <project-id> <epoch> [leader-bot-id|new] | work [work-id] | attach-document <work-id> <task-id> <authorization-version> | proposal [proposal-id]'
-      + (memory ? ` | ${PROJECT_ARCHIVE_HINT} | ${BOT_EXPERIENCE_HINT}` : '') },
+      + (memory ? ` | ${PROJECT_HANDOFF_HINT} | ${PROJECT_ARCHIVE_HINT} | ${BOT_EXPERIENCE_HINT}` : '') },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()
