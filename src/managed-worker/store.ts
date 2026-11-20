@@ -7,6 +7,7 @@ import { types } from 'node:util'
 import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFeishuDraftTask } from './feishu-draft-store.js'
 import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
   type StudioFeishuInstruction, type StudioInstructionInput } from './instruction-store.js'
+import { PROJECT_DOCUMENT_SCHEMA, projectDocumentCommandUsed } from './project-document-store.js'
 import { PROJECT_JOB_AUTO_SCHEMA } from './project-job-auto-store.js'
 import { PROJECT_JOB_SCHEMA } from './project-job-store.js'
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
@@ -325,6 +326,7 @@ export class ManagedWorkerStore {
       const started = this.transaction(() => {
         this.db.exec(SCHEMA)
         this.db.exec(PROJECT_SCHEMA)
+        this.db.exec(PROJECT_DOCUMENT_SCHEMA)
         this.db.exec(PROJECT_JOB_SCHEMA)
         this.db.exec(PROJECT_JOB_AUTO_SCHEMA)
         this.db.exec(INSTRUCTION_SCHEMA)
@@ -372,6 +374,9 @@ export class ManagedWorkerStore {
         runId: this.#runId,
         assistantBinding: sessionId => this.assistantBinding(sessionId),
         nonProjectSessionBound: sessionId => this.nonProjectSessionBound(sessionId),
+        documentTask: taskId => this.task(taskId),
+        documentHold: task => this.projectDocumentHold(task),
+        documentCommandUsed: commandId => this.commandUsed(commandId),
       })
     } catch (error) {
       try { this.close() } catch { /* Preserve the initialization error. */ }
@@ -1197,6 +1202,7 @@ export class ManagedWorkerStore {
     return !!this.db.prepare('SELECT 1 FROM managed_audit WHERE command_id = ?').get(commandId)
       || this.instructions.commandUsed(commandId)
       || !!this.db.prepare('SELECT 1 FROM studio_shared_document_revision WHERE command_id = ?').get(commandId)
+      || projectDocumentCommandUsed(this.db, commandId)
   }
 
   private actionUsed(sessionId: string, toolCallId: string): boolean {
@@ -1221,5 +1227,12 @@ export class ManagedWorkerStore {
 
   private executionBlocked(task: ManagedTask): Rejection | undefined {
     return this.authorizationBlocked(task) ?? (task.paused ? deny('TASK_PAUSED') : undefined)
+  }
+
+  /** Expose only the blocker code for an unfinished task, never its instructions or approved replacement. */
+  private projectDocumentHold(task: ManagedTask): string | undefined {
+    if (this.captureFault) return 'INSTRUCTION_UNCONFIRMED'
+    if (sharedDocumentConflict(task)) return 'SHARED_DOCUMENT_CONFLICT'
+    return this.executionBlocked(task)?.reason
   }
 }

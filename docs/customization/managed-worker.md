@@ -54,6 +54,12 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 如果移交报轮次过时、命令重复，或回执不明，先在原 Leader 会话用 `/studio-project status` 核对当前会话和轮次，也可在新的 Leader 或 Studio Assistant 会话用 `/studio-project status <项目ID>` 查询。不要原样重发旧的移交命令。
 
+### 项目待办关联文档任务
+
+先登记项目待办但不要派工，再在独立的文档 Worker 会话[登记确切写入授权](<#文档写入控制>)。在当前 Leader 会话用 `/studio-project attach-document <待办ID> <文档任务ID> <授权版本>` 关联两者。一个待办只能关联一个任务，关联后不再作为文字待办派工，也不能同时关联外部作业。关联不批准写入、不改变 Worker 或授权版本。
+
+更正、暂停和继续仍由当前文档 Worker 的命令处理，包括[从白名单飞书私聊收取更正](<#飞书私聊登记>)。项目在 `/studio-project work <待办ID>` 显示原请求、文档状态和当前 Worker；提交后还能用同一命令取回原正文、提交会话和工具调用出处，不调用模型。共享文档后来有新修订时，项目仍展示这项工作提交的版本。换 Leader 只移交项目管理权，不会改动文档已授的权限。
+
 ## 文档写入控制
 
 要替换已明确授权的文档，请在新的普通会话中选择 **SuperAgent managed document Worker**。不要在 Assistant、受托起草文字的 Worker、旧执行器或 DSH 子代理会话中登记这项授权。文档 Worker 使用只读沙箱，写入只能通过宿主注册的 `studio_write_document` 动作。

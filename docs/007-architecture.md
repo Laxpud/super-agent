@@ -355,9 +355,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/managed-worker/index.ts` | The opt-in Studio host: keeps its roles read-only, registers Web commands, and guards the one allowed managed document action without running GitHub setup |
 | `src/managed-worker/assistant.ts` | Delegates Assistant requests and runs restricted text Workers for Web and Feishu; captures the exact admitted turn's final text and drains the source Session before delivery |
-| `src/managed-worker/project.ts` | Owner project commands and Leader tools to register, dispatch and read project work; rechecks current management at the Worker's first step |
+| `src/managed-worker/project.ts` | Owner controls for project work and document links, with Leader tools to register and dispatch text work and inspect saved evidence |
 | `src/managed-worker/project-intake.ts` | Presents a source-bound Assistant proposal to the native Web answerer; only a positive owner answer can establish the project and its Leader Session |
-| `src/managed-worker/project-store.ts` | Persists project identities, management history and Worker attempts; rechecks the current management epoch and any external-job hold at reservation and start |
+| `src/managed-worker/project-store.ts` | Persists current management, work and dispatch; rechecks the project, work type and any job hold at reservation and start |
+| `src/managed-worker/project-document-store.ts` | Links project work to one already authorized document task and reads its exact audited commit, never a later shared head |
 | `src/managed-worker/project-job.ts` | Owner controls to pin an existing external job, observe it, and authorize or pause its post-processing without stopping the job |
 | `src/managed-worker/project-job-monitor.ts` | Checks bounded batches of pinned jobs without Agents, then defers automatic dispatch to the exact active Leader and approved model route |
 | `src/managed-worker/project-job-store.ts` | Stores one pinned invocation per work item, preserving the first confirmed terminal observation and independent authorization versions |

@@ -352,8 +352,8 @@ export function apply(context: Context, config: Config): void {
   }))
   ctx.effect(() => ctx.commands.register({
     name: 'studio-project',
-    description: 'Create or transfer a project as the owner, or read the current management state.',
-    input: { hint: 'create <JSON> | status [project-id] | take <project-id> <epoch> [leader-bot-id|new] | work [work-id] | proposal [proposal-id]' },
+    description: 'Read project work, or create, transfer, or link an approved document task as the owner.',
+    input: { hint: 'create <JSON> | status [project-id] | take <project-id> <epoch> [leader-bot-id|new] | work [work-id] | attach-document <work-id> <task-id> <authorization-version> | proposal [proposal-id]' },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()

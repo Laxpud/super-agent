@@ -1,6 +1,8 @@
 /** Durable Studio project identity, management history, and work dispatch. */
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
+import { attachProjectDocument, projectDocumentAttached, projectDocumentCommandUsed, readProjectDocument,
+  type ProjectDocumentAccess, type StudioProjectDocument } from './project-document-store.js'
 import { armProjectJob, consumeJobAuto, consumedJobAuto, jobAutoPage, projectJobAutoCommandUsed, readAutoReservation,
   readJobRoute, sameJobRoute, type StudioJobAuto, type StudioJobRoute } from './project-job-auto-store.js'
 import { attachProjectJob, isConfirmedJobState, isJobState, observeProjectJob, observeWatchedProjectJob, projectJobCommandUsed,
@@ -9,6 +11,7 @@ import type { ManagedResult, StudioDraftResult } from './store.ts'
 import { validSystemdJob, type SystemdJobRef, type SystemdJobState } from './systemd-job.js'
 
 export { sameJobRoute, type StudioJobAuto, type StudioJobRoute } from './project-job-auto-store.js'
+export type { StudioProjectDocument } from './project-document-store.js'
 export type { StudioProjectJob } from './project-job-store.js'
 
 /** Maximum project name length in UTF-16 code units. */
@@ -70,11 +73,12 @@ export interface StudioProjectRun {
   failure?: string
 }
 
-/** Registered work, its latest dispatch (including a release), and any pinned external job. */
+/** Registered work, its latest dispatch (including a release), and any external job or document attachment. */
 export interface StudioProjectWorkView {
   work: StudioProjectWork
   run?: StudioProjectRun
   job?: StudioProjectJob
+  document?: StudioProjectDocument
 }
 
 // The current epoch points to an immutable binding. Each binding also records the native command that created it.
@@ -159,7 +163,7 @@ export const PROJECT_SCHEMA = `
     ON studio_project_dispatch (work_id) WHERE state <> 'released';
 `
 
-interface ProjectStoreAccess {
+interface ProjectStoreAccess extends ProjectDocumentAccess {
   db(): DatabaseSync
   write<T>(operation: () => ManagedResult<T>): ManagedResult<T>
   snapshot<T>(operation: () => ManagedResult<T>): ManagedResult<T>
@@ -167,6 +171,7 @@ interface ProjectStoreAccess {
   readonly runId: string
   assistantBinding(sessionId: string): string | undefined
   nonProjectSessionBound(sessionId: string): boolean
+  documentCommandUsed(commandId: string): boolean
 }
 
 interface CreateInput {
@@ -516,6 +521,21 @@ export class ProjectStore {
     })
   }
 
+  /** Host-only: link an existing version 1 task with an exact owner authorization version; neither grant nor start execution. */
+  attachDocument(leaderSessionId: string, workId: string, taskId: string, expectedAuthorizationVersion: number,
+    commandId: string): ManagedResult<StudioProjectDocument> {
+    if (!isId(leaderSessionId) || !isId(workId) || !isId(taskId) || !isEpoch(expectedAuthorizationVersion) || !isId(commandId)) {
+      return deny('INVALID_INPUT')
+    }
+    return this.access.write(() => {
+      const current = this.currentProject(leaderSessionId)
+      if (!current.ok) return current
+      if (!this.work(current.value.projectId, workId)) return deny('WORK_NOT_FOUND')
+      return attachProjectDocument(this.db, this.access, current.value, workId, taskId, expectedAuthorizationVersion, commandId,
+        () => this.commandUsed(commandId) || this.access.documentCommandUsed(commandId))
+    })
+  }
+
   /** Pin only an already observed invocation, without creating or controlling the external job. */
   attachJob(leaderSessionId: string, workId: string, commandId: string, ref: SystemdJobRef,
     state: Exclude<SystemdJobState, 'unknown'>): ManagedResult<StudioProjectJob> {
@@ -523,8 +543,10 @@ export class ProjectStore {
       || !ref || typeof ref !== 'object') return deny('INVALID_INPUT')
     const { unit, invocationId } = ref
     if (!isId(unit) || !isId(invocationId) || !validSystemdJob({ unit, invocationId })) return deny('INVALID_INPUT')
-    return this.withCurrentJobWork(leaderSessionId, workId, actor =>
-      attachProjectJob(this.db, actor, workId, commandId, { unit, invocationId }, state, () => this.commandUsed(commandId)))
+    return this.withCurrentJobWork(leaderSessionId, workId, actor => {
+      if (projectDocumentAttached(this.db, workId)) return deny('WORK_HAS_DOCUMENT_TASK')
+      return attachProjectJob(this.db, actor, workId, commandId, { unit, invocationId }, state, () => this.commandUsed(commandId))
+    })
   }
 
   /** Read a pinned invocation for a current or historical Leader without granting control. */
@@ -615,6 +637,8 @@ export class ProjectStore {
       const { projectId, managementEpoch } = current.value
       const work = this.work(projectId, workId)
       if (!work) return deny('WORK_NOT_FOUND')
+      // A document task keeps its own execution authority. Neither manual nor automatic dispatch may claim its work.
+      if (projectDocumentAttached(this.db, workId)) return deny('WORK_HAS_DOCUMENT_TASK')
       // Manual callers still get the existing attempt. An automatic caller cannot claim it with a grant.
       const previous = this.latestRun(work)
       const job = readProjectJob(this.db, projectId, workId)
@@ -688,27 +712,23 @@ export class ProjectStore {
   /** Read one work item for a current or historical Leader of that project, without granting management. */
   readWork(leaderSessionId: string, workId: string): ManagedResult<StudioProjectWorkView> {
     if (!isId(leaderSessionId) || !isId(workId)) return deny('INVALID_INPUT')
-    try {
+    return this.access.snapshot(() => {
       const binding = this.binding(leaderSessionId)
       if (!binding) return deny('SESSION_NOT_BOUND')
       const work = this.work(binding.projectId, workId)
-      return work ? accept(this.workView(work)) : deny('WORK_NOT_FOUND')
-    } catch {
-      return deny('STORAGE_ERROR')
-    }
+      return work ? accept(this.workView(work, true)) : deny('WORK_NOT_FOUND')
+    })
   }
 
-  /** Read up to 20 work items in reverse registration order, across every Leader epoch of the caller's project. */
+  /** Read up to 20 recent work summaries without document result text, across every Leader epoch of the caller's project. */
   listWork(leaderSessionId: string): ManagedResult<StudioProjectWorkView[]> {
     if (!isId(leaderSessionId)) return deny('INVALID_INPUT')
-    try {
+    return this.access.snapshot(() => {
       const binding = this.binding(leaderSessionId)
       if (!binding) return deny('SESSION_NOT_BOUND')
       const rows = this.db.prepare(`${WORK_SELECT} WHERE b.project_id = ? ORDER BY w.rowid DESC LIMIT 20`).all(binding.projectId)
-      return accept(rows.map(row => this.workView(readWorkRow(row))))
-    } catch {
-      return deny('STORAGE_ERROR')
-    }
+      return accept(rows.map(row => this.workView(readWorkRow(row), false)))
+    })
   }
 
   private work(projectId: string, workId: string): StudioProjectWork | undefined {
@@ -716,10 +736,11 @@ export class ProjectStore {
     return row && readWorkRow(row)
   }
 
-  private workView(work: StudioProjectWork): StudioProjectWorkView {
+  private workView(work: StudioProjectWork, full: boolean): StudioProjectWorkView {
     const run = this.latestRun(work)
     const job = readProjectJob(this.db, work.projectId, work.workId)
-    return { work, ...(run ? { run } : {}), ...(job ? { job } : {}) }
+    const document = readProjectDocument(this.db, this.access, work, full)
+    return { work, ...(run ? { run } : {}), ...(job ? { job } : {}), ...(document ? { document } : {}) }
   }
 
   /** Pause takes precedence over observation; unpinned work follows the existing dispatch path. */
@@ -755,6 +776,7 @@ export class ProjectStore {
     if (!stored) return deny('STALE_EXECUTION')
     if (stored.state !== 'reserved') return deny('WORK_NOT_RESERVED')
     if (!this.work(stored.projectId, stored.workId)) return deny('WORK_NOT_FOUND')
+    if (projectDocumentAttached(this.db, stored.workId)) return deny('WORK_HAS_DOCUMENT_TASK')
     const job = readProjectJob(this.db, stored.projectId, stored.workId)
     const blocked = this.jobDispatchBlock(job)
     if (blocked) return blocked
@@ -782,13 +804,16 @@ export class ProjectStore {
     return project
   }
 
-  /** Count work with no active or terminal attempt across all management epochs. Released attempts do not claim work. */
+  /** Count work with no active or terminal text attempt and no completed document, across all management epochs. */
   private project(projectId: string): StudioProject | undefined {
     const row = this.db.prepare(`SELECT p.project_id, p.name, p.objective, p.origin_task_id, p.management_epoch,
       b.leader_bot_id, b.leader_session_id,
       (SELECT count(*) FROM studio_project_binding h JOIN studio_project_work w USING (leader_session_id)
         WHERE h.project_id = p.project_id AND NOT EXISTS (
           SELECT 1 FROM studio_project_dispatch d WHERE d.work_id = w.work_id AND d.state <> 'released'
+        ) AND NOT EXISTS (
+          SELECT 1 FROM studio_project_document link JOIN managed_document d USING (task_id)
+          WHERE link.work_id = w.work_id AND link.project_id = p.project_id AND d.document_version = 2
         )) AS pending_count
       FROM studio_project p LEFT JOIN studio_project_binding b USING (project_id, management_epoch)
       WHERE p.project_id = ?`).get(projectId)
@@ -810,6 +835,7 @@ export class ProjectStore {
     return !!this.db.prepare('SELECT 1 FROM studio_project_binding WHERE command_id = ?').get(commandId)
       || projectJobCommandUsed(this.db, commandId)
       || projectJobAutoCommandUsed(this.db, commandId)
+      || projectDocumentCommandUsed(this.db, commandId)
   }
 
   /** Scope exact IDs and latest lookups to the originating Session, not the shared Assistant Bot. */
