@@ -382,6 +382,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/quota-store.ts` | Persists one active stop per pool and the owner evidence that clears it; an unconfirmed stop cannot end a Host run cleanly |
 | `src/managed-worker/quota-notices.ts` | Sends a deterministic status notice through the verified Feishu bot, without a model or a second account |
 | `src/managed-worker/quota-notice-store.ts` | Claims one durable channel attempt per incident and preserves delivered or ambiguous outcomes across restarts |
+| `src/managed-worker/watchdog.ts` | Renders bounded owner-only health observations, separating saved failures from absent live Sessions without polling or recovery |
+| `src/managed-worker/watchdog-store.ts` | Reads bounded authorization, job, execution and quota metadata under the Host run fence without opening business text or changing state |
 | `src/managed-worker/store.ts` | The SQLite store for Studio Bot identities, draft results, managed documents, and project state; checks shared revisions together with write authority and recovery across host runs |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |

@@ -24,6 +24,7 @@ import { StudioQuotaNotices } from './quota-notices.ts'
 import { QuotaPoolConfig, StudioQuotaControl, quotaProviderMap } from './quota.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
 import { StudioStudy, isStudyTool, studyOutput } from './study.ts'
+import { watchdogCommand } from './watchdog.ts'
 
 export const name = 'dsh-superagent-managed-worker'
 export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'permissionPresets', 'sandboxPolicy', 'sessionPersistence', 'systemPrompt', 'tools', 'webServer']
@@ -40,6 +41,8 @@ export const Config = s.object({
     .description('Explicit provider IDs that share each inference quota pool; empty disables the quota gate.'),
   quotaFeishuAlerts: s.boolean().default(false)
     .description('Send one system notice per confirmed quota incident to the configured Feishu owner as the verified bot.'),
+  watchdog: s.boolean().default(false)
+    .description('Expose an owner-only read-only health snapshot of recorded Studio state; no background recovery.'),
   systemdJobInbox: s.boolean().default(false)
     .description('Allow the owner to attach and check existing local systemd user jobs in a Studio project.'),
   systemdJobPollSeconds: s.number().default(0)
@@ -107,7 +110,7 @@ function receipt(operation: string, result: ManagedResult<ManagedTask>, showResu
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
 export function apply(context: Context, config: Config): void {
   const { stateDir, guiDocumentInbox, advisor, feishuDocumentInbox, feishuTextInbox, quotaPools, quotaFeishuAlerts,
-    systemdJobInbox, systemdJobPollSeconds } = config
+    watchdog, systemdJobInbox, systemdJobPollSeconds } = config
   const ctx = localOwnerHost(context)
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
   const advisoryModel = advisor ? advisorSelection(advisor) : undefined
@@ -422,6 +425,21 @@ export function apply(context: Context, config: Config): void {
     input: { hint: 'attach <work-id> <unit> <invocation-id> | status/check <work-id> | pause/resume/auto <work-id> <authorization-version>' },
     recordInput: false,
     handler: ({ agent, commandId, rawInput, signal }) => projectJobs.command(agent, commandId, rawInput, signal),
+  }))
+  if (watchdog) ctx.effect(() => ctx.commands.register({
+    name: 'studio-health',
+    description: 'Inspect saved Studio state without calling a model, querying a job, or recovering work.',
+    input: { hint: '[document|job|draft|feishu|project|study|advice <id>]' },
+    recordInput: false,
+    handler({ agent, rawInput, signal }) {
+      signal.throwIfAborted()
+      if (!channelReady() || !currentSession(agent)) return { kind: 'error', text: 'Studio Watchdog unavailable.' }
+      return watchdogCommand(store, rawInput, sessionId => {
+        const observed = ctx.agents.get(sessionId as SessionId)
+        if (!observed) return 'not-attached'
+        return observed.id === sessionId ? observed.status : 'unknown'
+      })
+    },
   }))
   quota.install()
   if (quotaPools.length) ctx.effect(() => ctx.commands.register({

@@ -96,6 +96,11 @@ export class QuotaStore {
     return this.authorize(poolId) ?? this.snapshot(() => this.readCurrent(poolId))
   }
 
+  /** Read every configured pool within the caller's fenced snapshot, without recording new in-memory evidence. */
+  observePools(): { poolId: string; current: ManagedResult<StudioQuotaIncident | undefined> }[] {
+    return Array.from(this.poolIds, poolId => ({ poolId, current: this.readCurrent(poolId, { remember: false }) }))
+  }
+
   trip(poolId: string, provider: string, model: string, sessionId?: string): ManagedResult<{ incident: StudioQuotaIncident; created: boolean }> {
     const rejected = this.authorize(poolId)
     if (rejected) return rejected
@@ -149,21 +154,22 @@ export class QuotaStore {
     if (!this.poolIds.has(poolId)) return deny('QUOTA_POOL_NOT_CONFIGURED')
   }
 
-  /** Observe the active ID for this run until a committed clear authorizes its absence. */
-  private readCurrent(poolId: string): ManagedResult<StudioQuotaIncident | undefined> {
+  /** Check the active ID against this run's memory fence. Diagnostic reads must not move or latch the fence. */
+  private readCurrent(poolId: string, { remember = true } = {}): ManagedResult<StudioQuotaIncident | undefined> {
     if (this.quotaFault.has(poolId)) return deny('QUOTA_UNCONFIRMED')
     const active = this.active(poolId)
     const observed = this.observed.get(poolId)
     if (observed !== undefined && active?.incidentId !== observed) {
-      this.quotaFault.add(poolId)
+      if (remember) this.quotaFault.add(poolId)
       return deny('QUOTA_UNCONFIRMED')
     }
-    if (active) this.observed.set(poolId, active.incidentId)
+    if (remember && active) this.observed.set(poolId, active.incidentId)
     return accept(active)
   }
 
   private active(poolId: string): StudioQuotaIncident | undefined {
-    const row = this.db().prepare('SELECT * FROM studio_quota_incident WHERE pool_id = ? AND cleared_at IS NULL').get(poolId)
+    const row = this.db().prepare(`SELECT incident_id, pool_id, reason, noticed_at, provider, model, session_id
+      FROM studio_quota_incident WHERE pool_id = ? AND cleared_at IS NULL`).get(poolId)
     return row && readIncident(row)
   }
 

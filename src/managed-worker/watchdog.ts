@@ -1,0 +1,120 @@
+/** Project recorded Studio state and local Session visibility without probing, dispatching, or recovering work. */
+import { z } from 'zod'
+import type { ManagedWorkerStore } from './store.ts'
+import { WATCHDOG_KINDS, WATCHDOG_PAGE_LIMIT, type WatchdogDocument, type WatchdogEntry, type WatchdogExecution,
+  type WatchdogJob, type WatchdogQuota } from './watchdog-store.ts'
+
+const query = z.tuple([z.enum(WATCHDOG_KINDS), z.uuid()])
+type SessionPresence = 'idle' | 'running' | 'not-attached' | 'unknown'
+type ObserveSession = (sessionId: string) => SessionPresence
+
+/** A live registry entry is a local observation, not an execution grant or proof a model is generating. */
+function observedSession(label: string, sessionId: string, observe: ObserveSession): string {
+  let visibility: SessionPresence
+  try { visibility = observe(sessionId) } catch { visibility = 'unknown' }
+  const visible = visibility === 'not-attached' ? 'not attached here; absence alone does not confirm failure'
+    : visibility === 'unknown' ? 'visibility unknown' : `attached, ${visibility}`
+  return `${label} Session ${sessionId}: ${visible}.`
+}
+
+function documentHealth(entry: WatchdogDocument, captureUnconfirmed: boolean, observe: ObserveSession): string {
+  const facts = [`Document ${entry.id}: snapshot v${entry.documentVersion}; execution epoch ${entry.executionEpoch}; authorization v${entry.authorizationVersion}.`]
+  if (entry.projectId && entry.workId && entry.leaderSessionId && entry.managementEpoch) {
+    facts.push(`Linked work ${entry.workId} in project ${entry.projectId}; management epoch ${entry.managementEpoch}.`,
+      observedSession('Current Leader', entry.leaderSessionId, observe))
+  }
+  if (entry.shared) facts.push(`Shared base revision ${entry.shared.baseVersion}; observed head ${entry.shared.headVersion}.`)
+  if (entry.documentVersion === 2) {
+    facts.push('The document write is committed; no new write is inferred.')
+  } else {
+    // Independent conditions may coexist. Review, an explicit pause and a shared-version conflict are not interchangeable.
+    if (entry.paused) facts.push(entry.recoveryPause ? 'Write paused in recorded Host recovery.' : 'Write paused in the saved authorization.')
+    if (entry.pendingReview) facts.push('Owner correction pending review; writes held.')
+    if (captureUnconfirmed) facts.push('Instruction capture unconfirmed; writes held.')
+    if (entry.pauseUnconfirmed) facts.push('Pause could not be confirmed; writes held.')
+    if (entry.shared && entry.shared.baseVersion !== entry.shared.headVersion) facts.push('Shared document conflict; the old revision cannot be written.')
+    if (!entry.paused && !entry.pendingReview && !captureUnconfirmed && !entry.pauseUnconfirmed
+      && (!entry.shared || entry.shared.baseVersion === entry.shared.headVersion)) facts.push('Awaiting the current authorized document action.')
+  }
+  facts.push(observedSession('Current Worker', entry.sessionId, observe))
+  return facts.join(' ')
+}
+
+function jobHealth(entry: WatchdogJob, observe: ObserveSession): string {
+  const state = entry.state === 'running' ? 'Waiting on the recorded external invocation'
+    : entry.state === 'unknown' ? 'External observation unknown, not a confirmed failure'
+      : entry.state === 'failed' ? 'Recorded external failure' : 'External invocation recorded complete'
+  const facts = [`Job for work ${entry.id}: ${state}.`,
+    `${entry.unit} / ${entry.invocationId}; observation v${entry.observationVersion} at ${entry.observedAt}.`,
+    `Project ${entry.projectId}; management epoch ${entry.managementEpoch}.`, observedSession('Current Leader', entry.leaderSessionId, observe)]
+  if (entry.paused) facts.push(`Owner paused post-processing (authorization v${entry.authorizationVersion}); this does not stop the job.`)
+  else facts.push(`Post-processing is not paused (authorization v${entry.authorizationVersion}).`)
+  if (entry.workState) facts.push(`Latest post-processing attempt: ${entry.workState}.`)
+  if (entry.automatic === 'consumed') facts.push('The current automatic grant has already been consumed.')
+  else if (entry.automatic === 'granted') facts.push('A current automatic grant is recorded, not proof that processing started.')
+  else if (entry.state === 'completed' && (!entry.workState || entry.workState === 'released')) {
+    facts.push('No post-processing start or current automatic grant is recorded.')
+  }
+  return facts.join(' ')
+}
+
+const executionStatus: Record<WatchdogExecution['state'], string> = {
+  pending: 'waiting for assignment',
+  reserved: 'reserved, not yet entered',
+  running: 'recorded active; may be starting, running, or awaiting settlement',
+  completed: 'completion recorded',
+  failed: 'failure recorded',
+  interrupted: 'interruption recorded',
+  released: 'reservation released without entering',
+}
+
+function executionHealth(entry: WatchdogExecution, observe: ObserveSession): string {
+  // A project item's text dispatch is separate from the state of its linked job or document.
+  const label = entry.kind === 'project' ? 'Project text work' : entry.kind === 'feishu' ? 'Feishu task'
+    : entry.kind === 'draft' ? 'Web draft' : entry.kind === 'study' ? 'Study' : 'Advice'
+  const status = entry.kind === 'project' && entry.state === 'pending' ? 'no text dispatch recorded' : executionStatus[entry.state]
+  const facts = [`${label} ${entry.id}: ${status}.`]
+  if (entry.reason) facts.push(`Recorded reason: ${entry.reason}.`)
+  if (entry.projectId && entry.leaderSessionId && entry.managementEpoch) facts.push(`Project ${entry.projectId}; management epoch ${entry.managementEpoch}.`,
+    observedSession('Current Leader', entry.leaderSessionId, observe))
+  if (entry.sessionId && (entry.state === 'reserved' || entry.state === 'running')) {
+    if (entry.executionEpoch) facts.push(`Execution epoch ${entry.executionEpoch}.`)
+    facts.push(observedSession(entry.kind === 'advice' ? 'Advisor' : 'Worker', entry.sessionId, observe))
+  } else if (entry.sessionId && entry.executionEpoch) {
+    facts.push(`Recorded execution Session ${entry.sessionId}, epoch ${entry.executionEpoch}.`)
+  }
+  return facts.join(' ')
+}
+
+function quotaHealth(entry: WatchdogQuota): string {
+  if (entry.state === 'clear') return `Quota pool ${entry.poolId}: no active Studio stop recorded.`
+  if (entry.state === 'unconfirmed' || !entry.incident) return `Quota pool ${entry.poolId}: stop state unconfirmed; inference held.`
+  const { reason, incidentId, noticedAt, sessionId } = entry.incident
+  const notice = entry.notice ? ` Existing Feishu notice: ${entry.notice}.` : ''
+  return `Quota pool ${entry.poolId}: inference held (${reason}); incident ${incidentId} at ${noticedAt}.`
+    + (sessionId ? ` Source Session ${sessionId}.` : '') + notice
+}
+
+function renderEntry(entry: WatchdogEntry, captureUnconfirmed: boolean, observe: ObserveSession): string {
+  if (entry.kind === 'document') return documentHealth(entry, captureUnconfirmed, observe)
+  if (entry.kind === 'job') return jobHealth(entry, observe)
+  return executionHealth(entry, observe)
+}
+
+/** Only the owner-native command reads this status. No model tools or timed side effects are registered. */
+export function watchdogCommand(store: ManagedWorkerStore, argument: string, observe: ObserveSession): { kind: 'success' | 'error'; text: string } {
+  const input = argument.trim()
+  const parsed = input ? query.safeParse(input.length <= 96 ? input.split(/\s+/u) : undefined) : undefined
+  if (parsed && !parsed.success) return { kind: 'error', text: 'Use /studio-health or /studio-health <document|job|draft|feishu|project|study|advice> <id>.' }
+  const target = parsed?.success ? { kind: parsed.data[0], id: parsed.data[1] } : undefined
+  const result = store.watchdog(target)
+  if (!result.ok) return { kind: 'error', text: `Studio Watchdog could not confirm a snapshot: ${result.reason}. No health or recovery conclusion was made.` }
+  const { entries, truncated, quotas, captureUnconfirmed, pauseUnconfirmed } = result.value
+  const header = ['Studio Watchdog: read-only snapshot. External states are saved observations; no polling, inference, or recovery ran.']
+  if (captureUnconfirmed) header.push('A document instruction capture is unconfirmed in this Host run; document writes are held.')
+  if (pauseUnconfirmed) header.push('A document pause is unconfirmed in this Host run; affected writes are held.')
+  if (truncated.length) header.push(`Overview limited to ${WATCHDOG_PAGE_LIMIT} per category. More records exist for: ${truncated.join(', ')}. Use the exact ID to inspect one.`)
+  const sections = [...header, ...quotas.map(quotaHealth), ...entries.map(entry => renderEntry(entry, captureUnconfirmed, observe))]
+  if (!entries.length) sections.push('No matching task or job records in this snapshot; this is not a general health attestation.')
+  return { kind: 'success', text: sections.join('\n') }
+}

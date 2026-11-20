@@ -18,6 +18,8 @@ import { QUOTA_SCHEMA, QuotaStore, type StudioQuotaIncident } from './quota-stor
 import { SHARED_DOCUMENT_SCHEMA, appendSharedRevision, readSharedRevision,
   type SharedDocumentRevision, type SharedDocumentTask } from './shared-document-store.js'
 import { STUDY_SCHEMA, StudyStore, assistantSourceUsed, interruptStudies } from './study-store.js'
+import { WATCHDOG_INDEXES, readWatchdogEntries, readWatchdogTarget,
+  type WatchdogQuota, type WatchdogSnapshot, type WatchdogTarget } from './watchdog-store.js'
 
 export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
 export type { StudioFeishuInstruction } from './instruction-store.js'
@@ -348,6 +350,7 @@ export class ManagedWorkerStore {
         this.db.exec(SHARED_DOCUMENT_SCHEMA)
         this.db.exec(QUOTA_SCHEMA)
         this.db.exec(QUOTA_NOTICE_SCHEMA)
+        this.db.exec(WATCHDOG_INDEXES)
         this.quotaNotices.recoverSending()
         const previous = this.db.prepare('SELECT clean FROM managed_host_run WHERE singleton = 1').get()
         // Unlike document recovery, a previously unrecorded Host run is not evidence of an unconfirmed quota stop.
@@ -456,6 +459,34 @@ export class ManagedWorkerStore {
     if (this.closed) return
     this.closed = true
     this.#db.close()
+  }
+
+  /** Read bounded evidence and local fences together without observing a live Session, systemd, or a model. */
+  watchdog(target?: WatchdogTarget): ManagedResult<WatchdogSnapshot> {
+    let exact: WatchdogTarget | undefined
+    if (target !== undefined) {
+      if (!target || typeof target !== 'object' || types.isProxy(target)) return deny('INVALID_INPUT')
+      exact = readWatchdogTarget(target)
+      if (!exact) return deny('INVALID_INPUT')
+    }
+    return this.snapshot(() => {
+      const page = readWatchdogEntries(this.db, {
+        task: id => this.task(id),
+        pendingReview: id => this.instructions.hasPending(id),
+        frozen: task => this.isFrozen(task),
+      }, exact)
+      if (exact && page.entries.length === 0) return deny('NOT_FOUND')
+      const quotas = this.quota.observePools().map(({ poolId, current }): WatchdogQuota => {
+        if (!current.ok) return { poolId, state: 'unconfirmed' }
+        const incident = current.value
+        if (!incident) return { poolId, state: 'clear' }
+        const notice = this.quotaNotices.status(incident.incidentId)?.state
+        return { poolId, state: 'held', incident, ...(notice === undefined ? {} : { notice }) }
+      })
+      // These fences can outlive or fail to identify a specific row, so surface them even on an empty overview.
+      return accept({ ...page, quotas, captureUnconfirmed: this.captureFault,
+        pauseUnconfirmed: this.frozenTasks.size > 0 || this.frozenSessions.size > 0 })
+    })
   }
 
   /** Read only the active hold for a Host-configured pool. Treat a failure as unavailable, not as a clear pool. */
