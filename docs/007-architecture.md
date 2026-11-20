@@ -383,6 +383,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/preference-intake.ts` | Verifies a fresh owner message and tool call in the persisted active turn, requests a native decision, and rechecks the input before saving |
 | `src/managed-worker/preference-intent.ts` | Recognizes a small, explicit set of durable preference requests and extracts only the original text |
 | `src/managed-worker/preference-proposal-store.ts` | Retains a proposal's source and one-use decision; requires its exact initial preference revision and closes abandoned questions on restart |
+| `src/managed-worker/preference-query-intent.ts` | Parses bounded standalone preference questions with exact keys, optional project scope and historical revision |
+| `src/managed-worker/preference-query.ts` | Matches the live owner's original inbox input and publishes a log-only read result before model admission |
 | `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot, routes the configured owner's private chat to enabled text or document-review paths, and sends best-effort plain-text receipts |
 | `src/managed-worker/feishu-text.ts` | Routes explicit single-message text commands to a restricted Worker or exact result retrieval without rerunning completed work |
 | `src/managed-worker/feishu-draft-store.ts` | Preserves Feishu input, task and Worker identities, and result provenance; deduplicates deliveries under the shared SQLite run fence |

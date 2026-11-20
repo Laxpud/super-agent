@@ -5,6 +5,7 @@ import type {} from '@deepseek-ai/dsh-session-persistence'
 import { z } from 'zod'
 import { isMemoryKey, isPreferenceText, MEMORY_TEXT_LIMIT, PREFERENCE_PROPOSAL_RECEIPT_PREFIX,
   type MemorySource, type PreferenceCitation, type StudioPreference } from './memory-store.ts'
+import type { PreferenceQuery } from './preference-query-intent.ts'
 import type { ManagedResult, ManagedWorkerStore } from './store.ts'
 
 export const MEMORY_COMMAND = 'studio-memory'
@@ -53,6 +54,42 @@ function origin(entry: Pick<StudioPreference, 'source' | 'at'>): string {
   return `Owner command ${commandId} in Session ${sessionId}, event ${eventSeq}. Recorded at ${entry.at}.`
 }
 
+/** Use the same current preference views for natural queries and native commands. */
+function listCurrent(store: ManagedWorkerStore, projectId?: string, after?: string): CommandResult {
+  const result = store.memory.list(projectId, after)
+  if (!result.ok) return denied(result.reason)
+  const { items, next } = result.value
+  if (!items.length) return success('No current preferences in this scope and page.')
+  return success(`Current preferences:\n${items.map(coordinates).join('\n')}`
+    + (next === undefined ? '' : `\nMore results: /studio-memory list ${projectId ?? 'global'} ${next}`))
+}
+
+function readCurrent(store: ManagedWorkerStore, key: string, projectId?: string): CommandResult {
+  const result = store.memory.read(key, projectId)
+  if (!result.ok) return denied(result.reason)
+  return success(`Current preference ${coordinates(result.value)}.\n${origin(result.value)}\n\n${result.value.text}`)
+}
+
+function auditOnly(entry: StudioPreference): CommandResult {
+  return success(`Preference audit only: ${coordinates(entry)}; recorded operation ${entry.operation}; recorded state ${entry.state}.\n${origin(entry)}`)
+}
+
+/** Answer an already-authorized owner's query without writing memory or treating audit metadata as current. */
+export function memoryQuery(store: ManagedWorkerStore, query: PreferenceQuery): CommandResult {
+  switch (query.kind) {
+    case 'list': return listCurrent(store, query.projectId)
+    case 'read': return readCurrent(store, query.key, query.projectId)
+    case 'trace': {
+      const result = store.memory.traceVisible(query.key, query.revision, query.projectId)
+      if (!result.ok) return denied(result.reason)
+      if (query.revision !== undefined) return auditOnly(result.value)
+      return success(`Current preference source: ${coordinates(result.value)}.\n${origin(result.value)}`)
+    }
+    case 'clarify':
+      return success('Please use the stable preference key or the exact project UUID to clarify this read-only query. No preference text was read.')
+  }
+}
+
 /** The native interceptor logs a command before invoking its handler. Verify the exact fresh source after a durability barrier. */
 async function confirmedCommandSource(ctx: Context, agent: Agent, commandId: string, signal: AbortSignal): Promise<MemorySource | undefined> {
   // Capture the boundary now; a concurrent command or turn can append while persistence drains.
@@ -84,27 +121,18 @@ export async function memoryCommand(ctx: Context, store: ManagedWorkerStore, age
     const parsed = list.safeParse(args)
     if (!parsed.success) return denied('EXPECTED_SCOPE_AND_OPTIONAL_CURSOR')
     const [scope, after] = parsed.data
-    const result = store.memory.list(scope === 'global' ? undefined : scope, after)
-    if (!result.ok) return denied(result.reason)
-    const { items, next } = result.value
-    if (!items.length) return success('No current preferences in this scope and page.')
-    return success(`Current preferences:\n${items.map(coordinates).join('\n')}`
-      + (next === undefined ? '' : `\nMore results: /studio-memory list ${scope ?? 'global'} ${next}`))
+    return listCurrent(store, scope === 'global' ? undefined : scope, after)
   }
   if (verb === 'read') {
     const parsed = read.safeParse(args)
     if (!parsed.success) return denied('EXPECTED_PREFERENCE_KEY_AND_OPTIONAL_PROJECT')
-    const result = store.memory.read(...parsed.data)
-    if (!result.ok) return denied(result.reason)
-    return success(`Current preference ${coordinates(result.value)}.\n${origin(result.value)}\n\n${result.value.text}`)
+    return readCurrent(store, ...parsed.data)
   }
   if (verb === 'trace') {
     const parsed = trace.safeParse(args)
     if (!parsed.success) return denied('EXPECTED_PREFERENCE_KEY_AND_OPTIONAL_REVISION')
     const result = store.memory.trace(...parsed.data)
-    if (!result.ok) return denied(result.reason)
-    const entry = result.value
-    return success(`Preference audit only: ${coordinates(entry)}; recorded operation ${entry.operation}; recorded state ${entry.state}.\n${origin(entry)}`)
+    return result.ok ? auditOnly(result.value) : denied(result.reason)
   }
 
   if (verb === 'resolve') {

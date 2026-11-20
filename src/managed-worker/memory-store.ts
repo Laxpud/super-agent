@@ -397,6 +397,25 @@ export class MemoryStore {
     })
   }
 
+  /** Read only metadata for a visible active head, or for one explicitly requested audit revision. */
+  traceVisible(key: string, revision?: number, projectId?: string): ManagedResult<StudioPreference> {
+    if (!isMemoryKey(key) || (revision !== undefined && !isRevision(revision)) || (projectId !== undefined && !isProjectId(projectId))) {
+      return deny('INVALID_INPUT')
+    }
+    return this.access.snapshot(() => {
+      if (revision === undefined) {
+        const current = this.current(key, projectId)
+        return current ? accept(current) : deny('MEMORY_NOT_CURRENT')
+      }
+      // Audit visibility follows the requested revision's recorded scope, not the current head's scope.
+      // Reject an unknown explicit project before it can match a global revision.
+      if (projectId !== undefined && !this.projectExists(projectId)) return deny('MEMORY_NOT_CURRENT')
+      const row = this.access.db().prepare(`SELECT ${METADATA} FROM studio_memory_revision r
+        WHERE r.key = ? AND r.revision = ? AND (r.project_id IS NULL OR r.project_id = ?)`).get(key, revision, projectId ?? null)
+      return row ? accept(metadata(row)) : deny('MEMORY_NOT_CURRENT')
+    })
+  }
+
   /** Record a visible current revision for an exact use context, without reading or copying its text. */
   cite(key: string, revision: number, projectId: string | undefined, source: MemorySource): ManagedResult<PreferenceCitation> {
     const exact = readSource(source)

@@ -21,6 +21,7 @@ import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
 import { MEMORY_COMMAND, MEMORY_HINT, memoryCommand } from './memory.ts'
 import { PROPOSE_PREFERENCE, StudioPreferenceIntake } from './preference-intake.ts'
+import { answerPreferenceQuery } from './preference-query.ts'
 import { PROJECT_ARCHIVE_HINT } from './project-archive.ts'
 import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
 import { StudioProjectJobMonitor } from './project-job-monitor.ts'
@@ -332,6 +333,7 @@ export function apply(context: Context, config: Config): void {
     const role = scopes.get(agent)?.role
     if ((role === 'assistant' || role === 'leader') && !ready(agent, role)) return { kind: 'reject' }
     if (!validateDocumentRelays(store, agent, messages, () => ready(agent, 'document-worker'))) return { kind: 'reject' }
+    if (memory && role === 'assistant' && answerPreferenceQuery(store, step)) return { kind: 'enter', messages: [] }
     const decision = await next()
     if (decision.kind === 'enter' && (role === 'draft-worker' || role === 'advisor')) {
       // Verify the messages the native loop will actually admit, after any downstream pre-step transforms.
