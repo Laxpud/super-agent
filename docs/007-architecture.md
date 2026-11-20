@@ -354,7 +354,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/managed-worker/index.ts` | The opt-in Studio host: keeps its roles read-only, registers Web commands, and guards the one allowed managed document action without running GitHub setup |
-| `src/managed-worker/assistant.ts` | Delegates Assistant requests and runs restricted text Workers or Advisors; captures the exact admitted turn's final text and drains the source Session before delivery |
+| `src/managed-worker/assistant.ts` | Runs restricted text Workers or Advisors, rechecks protected relays at the native stream boundary, and captures the exact admitted turn's result |
 | `src/managed-worker/advisor.ts` | Uses an opt-in model route to obtain a separate Advisor opinion on a scoped owner question, without dispatching work or granting actions |
 | `src/managed-worker/advisor-store.ts` | Captures the question, exact evidence and Advisor provenance; rechecks management authority at reservation and admission and retains opinions across handoffs |
 | `src/managed-worker/study.ts` | Coordinates bounded investigations and a separate synthesis Worker for one owner message; presents saved results without asking the Assistant to rewrite them |
@@ -366,6 +366,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/project-handoff.ts` | Formats a read-only handoff review with historical state and current blockers or result coordinates in separate sections |
 | `src/managed-worker/project-archive.ts` | Handles owner-only commands for selecting, inspecting and tracing project facts without a model |
 | `src/managed-worker/project-archive-store.ts` | Stores fact revisions and excerpt coordinates under the stable project ID; checks management and exact saved Worker evidence before writes and reads |
+| `src/managed-worker/project-fact-request.ts` | Parses one exact project, fact key, and revision from a reserved owner input, preserving the task text below it |
+| `src/managed-worker/project-fact-intake.ts` | Binds a fresh native owner message to one pending work item before model admission |
+| `src/managed-worker/project-fact-use-store.ts` | Pins one fact revision to registered work without copying its excerpt; retains the native owner event and protects the immutable link |
 | `src/managed-worker/bot-experience.ts` | Handles owner-only commands for recording a reusable method and inspecting its applicability and provenance |
 | `src/managed-worker/bot-experience-store.ts` | Keys method revisions by stable Leader Bot and checks their exact project fact parents without returning source project text |
 | `src/managed-worker/project-document-store.ts` | Links project work to one already authorized document task and reads its exact audited commit, never a later shared head |

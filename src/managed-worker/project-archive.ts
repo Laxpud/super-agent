@@ -1,6 +1,7 @@
 /** Owner commands for project facts backed by an exact excerpt of a saved text result. */
 import { z } from 'zod'
 import { isProjectFactKey, isProjectFactQuote, type ProjectFact, type ProjectArchiveStore } from './project-archive-store.ts'
+import { PROJECT_FACT_HEADER } from './project-fact-request.ts'
 
 export const PROJECT_ARCHIVE_HINT = 'record-fact <JSON> | facts [after-key] | fact <key> | fact-history <key> <revision>'
 const key = z.string().refine(isProjectFactKey)
@@ -51,7 +52,8 @@ export function projectArchiveCommand(archive: ProjectArchiveStore, sessionId: s
     const result = archive.read(sessionId, parsed.data)
     if (!result.ok) return denied(result.reason)
     const fact = result.value
-    return success(`Current project fact ${fact.key} v${fact.revision} (owner-selected Worker excerpt).\n${factOrigin(fact)}\n\n${fact.quote}`)
+    return success(`Current project fact ${fact.key} v${fact.revision} (owner-selected Worker excerpt).\n${factOrigin(fact)}\n\n${fact.quote}`
+      + `\n\nTo register a work item using this fact, start a new message with:\n${PROJECT_FACT_HEADER} ${fact.projectId} ${fact.key} v${fact.revision}\nWrite the task on the next line. This registers work without dispatching it.`)
   }
   if (verb === 'fact-history') {
     const parsed = historyArgs.safeParse(argument.split(/\s+/u))

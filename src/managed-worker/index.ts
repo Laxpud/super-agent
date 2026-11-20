@@ -25,6 +25,8 @@ import { StudioPreferenceChange } from './preference-correction.ts'
 import { PROPOSE_PREFERENCE, StudioPreferenceIntake } from './preference-intake.ts'
 import { answerPreferenceQuery } from './preference-query.ts'
 import { PROJECT_ARCHIVE_HINT } from './project-archive.ts'
+import { StudioProjectFactIntake } from './project-fact-intake.ts'
+import { parseProjectFactRequest } from './project-fact-request.ts'
 import { PROJECT_HANDOFF_HINT } from './project-handoff.ts'
 import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
 import { StudioProjectJobMonitor } from './project-job-monitor.ts'
@@ -44,7 +46,7 @@ export const Config = s.object({
   advisor: s.union([s.const(null), AdvisorConfig]).default(null)
     .description('Opt-in route for independent, tool-free Advisor consultations; null disables new consultations.'),
   memory: s.boolean().default(false)
-    .description('Enable owner preference intake, explicit preference citations for standalone text tasks, project archives and Bot experiences. Saved preferences are never applied automatically.'),
+    .description('Enable owner preferences, explicit references in text work, project archives and Bot experiences. Saved preferences and project facts are never applied automatically.'),
   feishuDocumentInbox: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
     .description('Optional, separately configured single-owner Feishu inbox for a managed document.'),
   feishuTextInbox: s.union([s.const(null), FeishuTextInboxConfig]).default(null)
@@ -199,6 +201,7 @@ export function apply(context: Context, config: Config): void {
   const advisors = new StudioAdvisor(ctx, store, drafts, advisoryModel, ready, channelStop.signal)
   const studies = new StudioStudy(store, drafts, agent => ready(agent, 'assistant'), channelStop.signal)
   const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts, provider => providerPool.get(provider), memory)
+  const projectFactIntake = new StudioProjectFactIntake(ctx, store, ready, memory, channelStop.signal)
   const jobMonitor = systemdJobPollSeconds ? new StudioProjectJobMonitor(store, systemdJobPollSeconds * 1000, channelReady, (permit, signal) => {
     const leader = ctx.agents.get(permit.leaderSessionId as SessionId)
     return leader ? projects.continueJob(leader, permit, signal) : undefined
@@ -248,6 +251,7 @@ export function apply(context: Context, config: Config): void {
       await advisors.drain()
       await studies.drain()
       await preferenceChanges?.drain()
+      await projectFactIntake.drain()
       await recovery?.drain()
       await failureNotices?.drain()
       await projectJobs?.drain()
@@ -338,16 +342,26 @@ export function apply(context: Context, config: Config): void {
     const role = scopes.get(agent)?.role
     if ((role === 'assistant' || role === 'leader') && !ready(agent, role)) return { kind: 'reject' }
     if (!validateDocumentRelays(store, agent, messages, () => ready(agent, 'document-worker'))) return { kind: 'reject' }
-    if (memory && role === 'assistant') {
+    if (role === 'assistant' || role === 'leader') {
       const input = currentOwnerInboxInput(step)
       if (input) {
         step.signal.throwIfAborted()
-        if (answerPreferenceQuery(store, agent, input)) return { kind: 'enter', messages: [] }
-        const change = preferenceChanges?.review(step, input)
-        if (change) {
-          await change
+        const registration = projectFactIntake.review(step, input, role)
+        if (registration) {
+          await registration
           return { kind: 'enter', messages: [] }
         }
+        if (memory && role === 'assistant') {
+          if (answerPreferenceQuery(store, agent, input)) return { kind: 'enter', messages: [] }
+          const change = preferenceChanges?.review(step, input)
+          if (change) {
+            await change
+            return { kind: 'enter', messages: [] }
+          }
+        }
+      } else if (messages.some(message => message.content.some(block => block.type === 'text' && parseProjectFactRequest(block.text).kind !== 'plain'))) {
+        // An edited, batched, or non-owner reference must not silently enter a different work route.
+        return { kind: 'reject' }
       }
     }
     const decision = await next()

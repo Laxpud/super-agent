@@ -1,8 +1,11 @@
 /** Durable Studio project identity, management history, and work dispatch. */
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
+import { isProjectFactKey } from './project-archive-store.js'
 import { attachProjectDocument, projectDocumentAttached, projectDocumentCommandUsed, readProjectDocument,
   type ProjectDocumentAccess, type StudioProjectDocument } from './project-document-store.js'
+import { parseProjectFactRequest } from './project-fact-request.js'
+import { appendWorkFact, readWorkFact, type ProjectWorkFactUse, type WorkFactSource } from './project-fact-use-store.js'
 import { captureProjectHandoff, readProjectHandoff, type ProjectHandoffReview } from './project-handoff-store.js'
 import { armProjectJob, consumeJobAuto, consumedJobAuto, jobAutoPage, projectJobAutoCommandUsed, readAutoReservation,
   readJobRoute, sameJobRoute, type StudioJobAuto, type StudioJobRoute } from './project-job-auto-store.js'
@@ -81,6 +84,7 @@ export interface StudioProjectWorkView {
   run?: StudioProjectRun
   job?: StudioProjectJob
   document?: StudioProjectDocument
+  fact?: ProjectWorkFactUse
 }
 
 // The current epoch points to an immutable binding. Each binding also records the native command that created it.
@@ -176,6 +180,7 @@ interface ProjectStoreAccess extends ProjectDocumentAccess {
   assistantBinding(sessionId: string): string | undefined
   nonProjectSessionBound(sessionId: string): boolean
   documentCommandUsed(commandId: string): boolean
+  exactFactQuote(projectId: string, key: string, revision: number): string | undefined
 }
 
 interface CreateInput {
@@ -195,7 +200,7 @@ interface HandoffInput {
   leaderBotId?: string
 }
 
-interface WorkInput {
+export interface WorkInput {
   leaderSessionId: string
   sourceMessageId: string
   sourceRequestId: string
@@ -278,7 +283,7 @@ function readWorkRow(row: Record<string, SQLOutputValue>): StudioProjectWork {
 }
 
 /** Decode the stored dispatch, never recovering origin or result from the caller's copy. */
-function readRunRow(row: Record<string, SQLOutputValue>): StudioProjectRun {
+function readRunRow(row: Record<string, SQLOutputValue>, omitResult = false): StudioProjectRun {
   const { work_id: workId, project_id: projectId, leader_session_id: leaderSessionId, management_epoch: managementEpoch,
     worker_session_id: workerSessionId, worker_bot_id: workerBotId, execution_epoch: executionEpoch,
     state, result_json: resultJson, failure } = row
@@ -288,6 +293,7 @@ function readRunRow(row: Record<string, SQLOutputValue>): StudioProjectRun {
       && state !== 'interrupted' && state !== 'released')) throw new Error('Invalid Studio project dispatch')
   const run: StudioProjectRun = { workId, projectId, leaderSessionId, managementEpoch, workerSessionId, workerBotId, executionEpoch, state }
   if (state === 'completed') {
+    if (omitResult && resultJson === null && failure === null) return run
     const result = typeof resultJson === 'string' ? draftResult(JSON.parse(resultJson)) : undefined
     if (!result || failure !== null) throw new Error('Invalid Studio project result')
     run.result = result
@@ -319,6 +325,13 @@ export class ProjectStore {
     return !!this.db.prepare('SELECT 1 FROM studio_project_dispatch WHERE worker_session_id = ?').get(sessionId)
   }
 
+  /** Classify a fact-linked Worker durably, even if its reservation was released or its execution failed. */
+  hasWorkFactWorker(sessionId: string): boolean {
+    if (!isId(sessionId)) throw new Error('Invalid Studio project Worker session ID')
+    return !!this.db.prepare(`SELECT 1 FROM studio_project_dispatch d JOIN studio_project_work_fact f USING (work_id)
+      WHERE d.worker_session_id = ?`).get(sessionId)
+  }
+
   /** Read the current project only for its active Leader in the active host run. Writes still need their own check. */
   current(sessionId: string): ManagedResult<StudioProject> {
     if (!isId(sessionId)) return deny('INVALID_INPUT')
@@ -339,17 +352,21 @@ export class ProjectStore {
   /** Internal Advisor evidence lookup. Only completed standalone text work in this project can supply evidence. */
   workEvidence(projectId: string, workId: string):
     (Pick<StudioProjectRun, 'workId' | 'workerSessionId' | 'workerBotId' | 'executionEpoch'> & { result: StudioDraftResult }) | undefined {
-    // Filter by both the registered project and dispatch project before reading any result. Do not open document or job records.
+    // Reject every fact-linked result, even if its source is current. Archive and Advisor must not mistake derived text
+    // for standalone evidence, and checking its fact here would recurse through this method.
     const row = this.db.prepare(`SELECT d.* FROM studio_project_dispatch d
       JOIN studio_project_work w ON w.work_id = d.work_id
       JOIN studio_project_binding b ON b.leader_session_id = w.leader_session_id
       WHERE d.work_id = ? AND b.project_id = ? AND d.project_id = b.project_id AND d.state = 'completed'
         AND NOT EXISTS (SELECT 1 FROM studio_project_document WHERE work_id = w.work_id)
-        AND NOT EXISTS (SELECT 1 FROM studio_project_job WHERE work_id = w.work_id)`).get(workId, projectId)
+        AND NOT EXISTS (SELECT 1 FROM studio_project_job WHERE work_id = w.work_id)
+        AND NOT EXISTS (SELECT 1 FROM studio_project_work_fact WHERE work_id = w.work_id)`).get(workId, projectId)
     if (!row) return
-    const { workerSessionId, workerBotId, executionEpoch, result } = readRunRow(row)
-    if (!result) throw new Error('Missing completed Studio text result')
-    return { workId, workerSessionId, workerBotId, executionEpoch, result }
+    // A malformed stored result cannot serve as evidence. Database query failures still propagate to the parent fence.
+    try {
+      const { workerSessionId, workerBotId, executionEpoch, result } = readRunRow(row)
+      if (result) return { workId, workerSessionId, workerBotId, executionEpoch, result }
+    } catch { /* The original result is no longer verifiable. */ }
   }
 
   /** Show current project state by ID or by the caller's durable Leader role. The Host authorizes this read. */
@@ -545,15 +562,17 @@ export class ProjectStore {
     if (!isId(leaderSessionId) || !isId(sourceMessageId) || !isId(sourceRequestId) || !isText(requestText, PROJECT_TEXT_LIMIT)) {
       return deny('INVALID_INPUT')
     }
+    if (parseProjectFactRequest(requestText).kind !== 'plain') return deny('INVALID_PROJECT_FACT_REQUEST')
     return this.access.write<{ work: StudioProjectWork; created: boolean }>(() => {
       // Check authority before deduplication, so replaying old work cannot succeed after a handoff.
       const current = this.currentProject(leaderSessionId)
       if (!current.ok) return current
       const { projectId, leaderBotId, managementEpoch } = current.value
       const binding = { projectId, leaderBotId, leaderSessionId, managementEpoch }
-      // Reject either coordinate claimed by advice, even if the other matches an earlier work registration.
-      if (this.db.prepare(`SELECT 1 FROM studio_advice WHERE role = 'leader' AND requester_session_id = ?
-        AND (source_message_id = ? OR source_request_id = ?) LIMIT 1`).get(leaderSessionId, sourceMessageId, sourceRequestId)) {
+      // A fact or advice claim cannot be replayed as plain work using either native coordinate.
+      if (this.adviceUsedWorkSource(leaderSessionId, sourceMessageId, sourceRequestId) || this.db.prepare(`SELECT 1
+        FROM studio_project_work w JOIN studio_project_work_fact f USING (work_id) WHERE w.leader_session_id = ?
+        AND (w.source_message_id = ? OR w.source_request_id = ?) LIMIT 1`).get(leaderSessionId, sourceMessageId, sourceRequestId)) {
         return deny('SOURCE_ALREADY_USED')
       }
       const existing = this.db.prepare(`SELECT work_id, source_message_id, request_text FROM studio_project_work
@@ -563,11 +582,61 @@ export class ProjectStore {
         if (!isId(workId) || !isId(messageId) || !isText(text, PROJECT_TEXT_LIMIT)) throw new Error('Invalid Studio project work')
         return accept({ work: { ...binding, workId, sourceMessageId: messageId, sourceRequestId, requestText: text }, created: false })
       }
-      const workId = randomUUID()
-      requireWrite(this.db.prepare(`INSERT INTO studio_project_work (work_id, leader_session_id, source_message_id, source_request_id, request_text)
-        VALUES (?, ?, ?, ?, ?)`).run(workId, leaderSessionId, sourceMessageId, sourceRequestId, requestText).changes)
-      return accept({ work: { ...binding, workId, sourceMessageId, sourceRequestId, requestText }, created: true })
+      return accept({ work: this.insertWork(binding, sourceMessageId, sourceRequestId, requestText), created: true })
     })
+  }
+
+  /** Host-only: pin the exact fact mentioned in a verified native owner event, without reserving a Worker. */
+  recordFactWork(input: WorkInput & { sourceEventSeq: number; turn: number }): ManagedResult<{ work: StudioProjectWork; created: boolean }> {
+    if (!input) return deny('INVALID_INPUT')
+    const { leaderSessionId, sourceMessageId, sourceRequestId, requestText, sourceEventSeq, turn } = input
+    if (!isId(leaderSessionId) || !isId(sourceMessageId) || !isId(sourceRequestId) || !isText(requestText, PROJECT_TEXT_LIMIT)
+      || (sourceEventSeq !== 0 && !isEpoch(sourceEventSeq)) || !isEpoch(turn)) return deny('INVALID_INPUT')
+    const reference = parseProjectFactRequest(requestText)
+    if (reference.kind !== 'fact') return deny('INVALID_PROJECT_FACT_REQUEST')
+    const { projectId, key, revision, taskText } = reference
+    if (!isId(projectId) || !isProjectFactKey(key) || !isEpoch(revision) || !isText(taskText, PROJECT_TEXT_LIMIT)) {
+      return deny('INVALID_PROJECT_FACT_REQUEST')
+    }
+    const source = { projectId, key, revision, sourceEventSeq, turn }
+    return this.access.write<{ work: StudioProjectWork; created: boolean }>(() => {
+      const current = this.currentProject(leaderSessionId, true)
+      if (!current.ok) return current
+      if (current.value.projectId !== projectId) return deny('FACT_PROJECT_MISMATCH')
+      if (this.adviceUsedWorkSource(leaderSessionId, sourceMessageId, sourceRequestId)) return deny('SOURCE_ALREADY_USED')
+      // Match each native coordinate independently. An exact replay returns its one original row, never a second binding.
+      const matches = this.db.prepare(`${WORK_SELECT} LEFT JOIN studio_project_work_fact f ON f.work_id = w.work_id
+        WHERE w.leader_session_id = ? AND (w.source_request_id = ? OR w.source_message_id = ? OR f.source_event_seq = ?)
+        LIMIT 2`).all(leaderSessionId, sourceRequestId, sourceMessageId, sourceEventSeq)
+      if (matches.length) {
+        if (matches.length !== 1) return deny('SOURCE_ALREADY_USED')
+        const work = readWorkRow(matches[0]!)
+        const pinned = readWorkFact(this.db, work.workId)
+        if (!pinned || work.sourceRequestId !== sourceRequestId || work.sourceMessageId !== sourceMessageId
+          || work.requestText !== taskText || pinned.projectId !== projectId || pinned.key !== key || pinned.revision !== revision
+          || pinned.sourceEventSeq !== sourceEventSeq || pinned.turn !== turn) return deny('SOURCE_ALREADY_USED')
+        if (this.factQuote(pinned) === undefined) return deny('FACT_NOT_CURRENT')
+        return accept({ work, created: false })
+      }
+      if (this.factQuote(source) === undefined) return deny('FACT_NOT_CURRENT')
+      // Preserve the owner's task verbatim; neither the header nor the checked quote is copied into the work row.
+      const work = this.insertWork(current.value, sourceMessageId, sourceRequestId, taskText)
+      appendWorkFact(this.db, work.workId, source)
+      return accept({ work, created: true })
+    })
+  }
+
+  private adviceUsedWorkSource(leaderSessionId: string, sourceMessageId: string, sourceRequestId: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM studio_advice WHERE role = 'leader' AND requester_session_id = ?
+      AND (source_message_id = ? OR source_request_id = ?) LIMIT 1`).get(leaderSessionId, sourceMessageId, sourceRequestId)
+  }
+
+  /** Insert work with its original Leader binding inside the caller's write transaction. */
+  private insertWork(binding: StudioProjectBinding, sourceMessageId: string, sourceRequestId: string, requestText: string): StudioProjectWork {
+    const workId = randomUUID()
+    requireWrite(this.db.prepare(`INSERT INTO studio_project_work (work_id, leader_session_id, source_message_id, source_request_id, request_text)
+      VALUES (?, ?, ?, ?, ?)`).run(workId, binding.leaderSessionId, sourceMessageId, sourceRequestId, requestText).changes)
+    return { ...binding, workId, sourceMessageId, sourceRequestId, requestText }
   }
 
   /** Host-only: link an existing version 1 task with an exact owner authorization version; neither grant nor start execution. */
@@ -580,6 +649,7 @@ export class ProjectStore {
       const current = this.currentProject(leaderSessionId)
       if (!current.ok) return current
       if (!this.work(current.value.projectId, workId)) return deny('WORK_NOT_FOUND')
+      if (readWorkFact(this.db, workId)) return deny('FACT_TEXT_WORK_ONLY')
       return attachProjectDocument(this.db, this.access, current.value, workId, taskId, expectedAuthorizationVersion, commandId,
         () => this.commandUsed(commandId) || this.access.documentCommandUsed(commandId))
     })
@@ -593,6 +663,7 @@ export class ProjectStore {
     const { unit, invocationId } = ref
     if (!isId(unit) || !isId(invocationId) || !validSystemdJob({ unit, invocationId })) return deny('INVALID_INPUT')
     return this.withCurrentJobWork(leaderSessionId, workId, actor => {
+      if (readWorkFact(this.db, workId)) return deny('FACT_TEXT_WORK_ONLY')
       if (projectDocumentAttached(this.db, workId)) return deny('WORK_HAS_DOCUMENT_TASK')
       return attachProjectJob(this.db, actor, workId, commandId, { unit, invocationId }, state, () => this.commandUsed(commandId))
     })
@@ -676,7 +747,8 @@ export class ProjectStore {
   }
 
   /** Reserve an eligible Worker, spending the exact grant in the same transaction for automatic dispatches only. */
-  reserveWork(leaderSessionId: string, workId: string, workerSessionId: string, automatic?: { permitId: string; route: StudioJobRoute }):
+  reserveWork(leaderSessionId: string, workId: string, workerSessionId: string, automatic?: { permitId: string; route: StudioJobRoute },
+    allowFact = false):
     ManagedResult<StudioProjectWorkView & { run: StudioProjectRun; created: boolean }> {
     const auto = automatic === undefined ? undefined : readAutoReservation(automatic)
     if (!isId(leaderSessionId) || !isId(workId) || !isId(workerSessionId) || (automatic !== undefined && !auto)) return deny('INVALID_INPUT')
@@ -686,12 +758,19 @@ export class ProjectStore {
       const { projectId, managementEpoch } = current.value
       const work = this.work(projectId, workId)
       if (!work) return deny('WORK_NOT_FOUND')
+      const fact = readWorkFact(this.db, workId)
+      if (fact && fact.projectId !== projectId) return deny('FACT_PROJECT_MISMATCH')
+      // A fact is only for a fresh, explicit owner dispatch to a standalone text Worker.
+      if (fact && auto) return deny('FACT_TEXT_WORK_ONLY')
+      if (fact && allowFact !== true) return deny('PROJECT_FACT_USE_DISABLED')
+      if (fact && this.factQuote(fact) === undefined) return deny('FACT_NOT_CURRENT')
       // A document task keeps its own execution authority. Neither manual nor automatic dispatch may claim its work.
-      if (projectDocumentAttached(this.db, workId)) return deny('WORK_HAS_DOCUMENT_TASK')
-      // Manual callers still get the existing attempt. An automatic caller cannot claim it with a grant.
-      const previous = this.latestRun(work)
+      if (projectDocumentAttached(this.db, workId)) return deny(fact ? 'FACT_TEXT_WORK_ONLY' : 'WORK_HAS_DOCUMENT_TASK')
       const job = readProjectJob(this.db, projectId, workId)
-      const view = job ? { work, job } : { work }
+      if (fact && job) return deny('FACT_TEXT_WORK_ONLY')
+      // Manual callers still get the existing attempt. An automatic caller cannot claim it with a grant.
+      const { run: previous, ...attempt } = this.workRunView(work, fact && { ...fact, current: true }, true)
+      const view = { work, ...attempt, ...(job ? { job } : {}) }
       if (previous && previous.state !== 'released') {
         return auto ? deny('WORK_ALREADY_DISPATCHED') : accept({ ...view, run: previous, created: false })
       }
@@ -723,7 +802,10 @@ export class ProjectStore {
     const identity = dispatchIdentity(run)
     if (!identity) return deny('INVALID_INPUT')
     // Unlike this preflight, beginWork also takes the write lock and consumes the reservation.
-    return this.access.snapshot(() => this.startableReservation(identity))
+    return this.access.snapshot(() => {
+      const reservation = this.startableReservation(identity)
+      return reservation.ok ? accept(reservation.value.run) : reservation
+    })
   }
 
   /** Consume the exact reservation before the Host lets the Worker enter the model. */
@@ -736,7 +818,34 @@ export class ProjectStore {
       if (!reservation.ok) return reservation
       requireWrite(this.db.prepare(`UPDATE studio_project_dispatch SET state = 'running'
         WHERE ${EXACT_DISPATCH} AND state = 'reserved'`).run(...this.dispatchKeys(identity)).changes)
-      return accept({ ...reservation.value, state: 'running' })
+      return accept({ ...reservation.value.run, state: 'running' })
+    })
+  }
+
+  /** Open the checked excerpt only for the exact reservation at the private relay boundary. */
+  resolveWorkFact(run: StudioProjectRun): ManagedResult<{ text: string }> {
+    const identity = dispatchIdentity(run)
+    if (!identity) return deny('INVALID_INPUT')
+    return this.access.snapshot(() => {
+      const reservation = this.startableReservation(identity)
+      if (!reservation.ok) return reservation
+      return reservation.value.fact === undefined ? deny('WORK_FACT_NOT_LINKED') : accept(reservation.value.fact)
+    })
+  }
+
+  /** Check a running fact Worker before a model stream; the fact and current management share one snapshot. */
+  checkRunningWorkFact(run: StudioProjectRun): ManagedResult<void> {
+    const identity = dispatchIdentity(run)
+    if (!identity) return deny('INVALID_INPUT')
+    return this.access.snapshot(() => {
+      const current = this.dispatchAuthority(identity)
+      if (!current.ok) return current
+      const stored = this.exactRun(identity)
+      if (!stored) return deny('STALE_EXECUTION')
+      if (stored.state !== 'running') return deny('WORK_NOT_RUNNING')
+      const fact = this.confirmWorkFact(stored)
+      if (!fact.ok) return fact
+      return fact.value === undefined ? deny('WORK_FACT_NOT_LINKED') : accept(undefined)
     })
   }
 
@@ -746,15 +855,18 @@ export class ProjectStore {
     const outcome = draftResult(result)
     if (!identity || (result === undefined ? !isFailure(failure) : !outcome)) return deny('INVALID_INPUT')
     return this.access.write(() => {
-      // The stored origin authorizes settlement even after handoff; current management gates starts, not final messages.
+      // The stored origin authorizes a started Worker to settle across handoff, but not to publish against a stale fact.
       const stored = this.exactRun(identity)
       if (!stored) return deny('STALE_EXECUTION')
       if (stored.state !== 'running' && (stored.state !== 'reserved' || outcome)) return deny('WORK_NOT_RUNNING')
-      const state = outcome ? 'completed' : stored.state === 'running' ? 'failed' : 'released'
+      const source = outcome ? this.confirmWorkFact(stored) : undefined
+      const finalResult = source?.ok === false ? undefined : outcome
+      const finalFailure = source?.ok === false ? source.reason : failure
+      const state = finalResult ? 'completed' : stored.state === 'running' ? 'failed' : 'released'
       requireWrite(this.db.prepare(`UPDATE studio_project_dispatch SET state = ?, result_json = ?, failure = ?
-        WHERE ${EXACT_DISPATCH} AND state = ?`).run(state, outcome ? JSON.stringify(outcome) : null,
-        outcome ? null : failure, ...this.dispatchKeys(identity), stored.state).changes)
-      return accept({ ...stored, state, ...(outcome ? { result: outcome } : { failure }) })
+        WHERE ${EXACT_DISPATCH} AND state = ?`).run(state, finalResult ? JSON.stringify(finalResult) : null,
+        finalResult ? null : finalFailure, ...this.dispatchKeys(identity), stored.state).changes)
+      return accept({ ...stored, state, ...(finalResult ? { result: finalResult } : { failure: finalFailure }) })
     })
   }
 
@@ -765,18 +877,20 @@ export class ProjectStore {
       const binding = this.binding(leaderSessionId)
       if (!binding) return deny('SESSION_NOT_BOUND')
       const work = this.work(binding.projectId, workId)
-      return work ? accept(this.workView(work, true)) : deny('WORK_NOT_FOUND')
+      if (!work) return deny('WORK_NOT_FOUND')
+      const current = this.currentProject(leaderSessionId, true)
+      return accept(this.workView(work, true, current.ok))
     })
   }
 
-  /** Read up to 20 recent work summaries without document result text, across every Leader epoch of the caller's project. */
+  /** Read up to 20 recent work summaries without document or fact-derived result text. */
   listWork(leaderSessionId: string): ManagedResult<StudioProjectWorkView[]> {
     if (!isId(leaderSessionId)) return deny('INVALID_INPUT')
     return this.access.snapshot(() => {
       const binding = this.binding(leaderSessionId)
       if (!binding) return deny('SESSION_NOT_BOUND')
       const rows = this.db.prepare(`${WORK_SELECT} WHERE b.project_id = ? ORDER BY w.rowid DESC LIMIT 20`).all(binding.projectId)
-      return accept(rows.map(row => this.workView(readWorkRow(row), false)))
+      return accept(rows.map(row => this.workView(readWorkRow(row), false, false)))
     })
   }
 
@@ -785,11 +899,26 @@ export class ProjectStore {
     return row && readWorkRow(row)
   }
 
-  private workView(work: StudioProjectWork, full: boolean): StudioProjectWorkView {
-    const run = this.latestRun(work)
+  private workView(work: StudioProjectWork, full: boolean, includeFactResult: boolean): StudioProjectWorkView {
+    const pinned = readWorkFact(this.db, work.workId)
     const job = readProjectJob(this.db, work.projectId, work.workId)
     const document = readProjectDocument(this.db, this.access, work, full)
-    return { work, ...(run ? { run } : {}), ...(job ? { job } : {}), ...(document ? { document } : {}) }
+    // Historical Leaders still get provenance. Fact validity describes the head, not the viewing Session's authority.
+    const fact = pinned && { ...pinned, current: pinned.projectId === work.projectId && this.factQuote(pinned) !== undefined }
+    return { work, ...this.workRunView(work, fact, includeFactResult), ...(job ? { job } : {}), ...(document ? { document } : {}) }
+  }
+
+  private factQuote({ projectId, key, revision }: WorkFactSource): string | undefined {
+    return this.access.exactFactQuote(projectId, key, revision)
+  }
+
+  /** Join a stored dispatch to its own work and confirm the pinned scope and original evidence, not caller metadata. */
+  private confirmWorkFact(run: StudioProjectRun): ManagedResult<{ text: string } | undefined> {
+    const fact = readWorkFact(this.db, run.workId)
+    if (!fact) return accept(undefined)
+    if (fact.projectId !== run.projectId || !this.work(run.projectId, run.workId)) return deny('FACT_PROJECT_MISMATCH')
+    const text = this.factQuote(fact)
+    return text === undefined ? deny('FACT_NOT_CURRENT') : accept({ text })
   }
 
   /** Pause takes precedence over observation; unpinned work follows the existing dispatch path. */
@@ -798,12 +927,30 @@ export class ProjectStore {
     if (job && job.state !== 'completed') return deny('EXTERNAL_JOB_NOT_COMPLETE')
   }
 
-  private latestRun(work: StudioProjectWork): StudioProjectRun | undefined {
-    const row = this.db.prepare(`SELECT * FROM studio_project_dispatch WHERE work_id = ? ORDER BY execution_epoch DESC LIMIT 1`).get(work.workId)
-    if (!row) return
-    const run = readRunRow(row)
+  /** Keep completed coordinates on stale or historical reads without selecting the saved derived body. */
+  private workRunView(work: StudioProjectWork, fact: ProjectWorkFactUse | undefined, includeFactResult: boolean):
+    Pick<StudioProjectWorkView, 'run' | 'fact'> {
+    const omitResult = fact !== undefined && (!fact.current || !includeFactResult)
+    const columns = omitResult ? `work_id, execution_epoch, project_id, leader_session_id, management_epoch, worker_session_id,
+      worker_bot_id, run_id, state, failure, NULL AS result_json,
+      CASE WHEN state = 'completed' AND json_type(result_json, '$.messageId') = 'text'
+        AND instr(json_extract(result_json, '$.messageId'), char(0)) = 0
+        THEN json_extract(result_json, '$.messageId') END AS message_id,
+      CASE WHEN state = 'completed' AND json_type(result_json, '$.turn') = 'integer'
+        THEN json_extract(result_json, '$.turn') END AS result_turn,
+      CASE WHEN state = 'completed' AND json_type(result_json, '$.eventSeq') = 'integer'
+        THEN json_extract(result_json, '$.eventSeq') END AS event_seq` : '*'
+    const row = this.db.prepare(`SELECT ${columns} FROM studio_project_dispatch WHERE work_id = ?
+      ORDER BY execution_epoch DESC LIMIT 1`).get(work.workId)
+    if (!row) return fact ? { fact } : {}
+    const run = readRunRow(row, omitResult)
     if (run.projectId !== work.projectId) throw new Error('Studio project dispatch belongs to another project')
-    return run
+    if (fact && run.state === 'completed') {
+      const { messageId, turn, eventSeq } = run.result ?? { messageId: row.message_id, turn: row.result_turn, eventSeq: row.event_seq }
+      if (!isId(messageId) || !isEpoch(turn) || (eventSeq !== 0 && !isEpoch(eventSeq))) throw new Error('Invalid Studio project result source')
+      return { run, fact: { ...fact, resultSource: { messageId, turn, eventSeq } } }
+    }
+    return fact ? { run, fact } : { run }
   }
 
   private dispatchKeys(run: DispatchIdentity): [string, number, string, string, number, string, string, string] {
@@ -811,22 +958,34 @@ export class ProjectStore {
       run.workerSessionId, run.workerBotId, this.access.runId]
   }
 
+  /** State transitions check the exact attempt without reading a previously stored result body. */
   private exactRun(identity: DispatchIdentity): StudioProjectRun | undefined {
-    const row = this.db.prepare(`SELECT * FROM studio_project_dispatch WHERE ${EXACT_DISPATCH}`).get(...this.dispatchKeys(identity))
-    return row && readRunRow(row)
+    const row = this.db.prepare(`SELECT work_id, execution_epoch, project_id, leader_session_id, management_epoch,
+      worker_session_id, worker_bot_id, run_id, state, failure, NULL AS result_json
+      FROM studio_project_dispatch WHERE ${EXACT_DISPATCH}`).get(...this.dispatchKeys(identity))
+    return row && readRunRow(row, true)
   }
 
-  /** Recheck both current management and the exact stored reservation, regardless of the caller's copy of its state. */
-  private startableReservation(identity: DispatchIdentity): ManagedResult<StudioProjectRun> {
-    const current = this.currentProject(identity.leaderSessionId)
+  private dispatchAuthority(identity: DispatchIdentity): ManagedResult<StudioProjectBinding> {
+    const current = this.currentProject(identity.leaderSessionId, true)
     if (!current.ok) return current
     if (current.value.projectId !== identity.projectId || current.value.managementEpoch !== identity.managementEpoch) return deny('STALE_MANAGEMENT')
+    return current
+  }
+
+  /** Recheck the exact stored reservation and its sources, regardless of the caller's copy of its state. */
+  private startableReservation(identity: DispatchIdentity): ManagedResult<{ run: StudioProjectRun; fact?: { text: string } }> {
+    const current = this.dispatchAuthority(identity)
+    if (!current.ok) return current
     const stored = this.exactRun(identity)
     if (!stored) return deny('STALE_EXECUTION')
     if (stored.state !== 'reserved') return deny('WORK_NOT_RESERVED')
     if (!this.work(stored.projectId, stored.workId)) return deny('WORK_NOT_FOUND')
-    if (projectDocumentAttached(this.db, stored.workId)) return deny('WORK_HAS_DOCUMENT_TASK')
+    const fact = this.confirmWorkFact(stored)
+    if (!fact.ok) return fact
+    if (projectDocumentAttached(this.db, stored.workId)) return deny(fact.value ? 'FACT_TEXT_WORK_ONLY' : 'WORK_HAS_DOCUMENT_TASK')
     const job = readProjectJob(this.db, stored.projectId, stored.workId)
+    if (fact.value && job) return deny('FACT_TEXT_WORK_ONLY')
     const blocked = this.jobDispatchBlock(job)
     if (blocked) return blocked
     // A spent grant identifies the original automatic attempt even when a newer authorization hides it from the job view.
@@ -835,7 +994,7 @@ export class ProjectStore {
       || grant.leaderSessionId !== stored.leaderSessionId || grant.managementEpoch !== stored.managementEpoch)) {
       return deny('STALE_JOB_AUTHORIZATION')
     }
-    return accept(stored)
+    return accept({ run: stored, ...(fact.value ? { fact: fact.value } : {}) })
   }
 
   private currentProject(sessionId: string): ManagedResult<StudioProject>

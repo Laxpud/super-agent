@@ -218,9 +218,14 @@ export class ProjectArchiveStore {
 
   /** Check a pinned revision in the caller's transaction. Return only validity, never the Worker excerpt. */
   sourceCurrent(projectId: string, key: string, revision: number): boolean {
+    return this.exactQuote(projectId, key, revision) !== undefined
+  }
+
+  /** Resolve one exact revision only while it is the verified head. The caller owns the transaction and project scope. */
+  exactQuote(projectId: string, key: string, revision: number): string | undefined {
     const row = this.factHead(projectId, key)
-    if (!row || row.revision !== revision) return false
-    return this.verifiedQuote(row, readFact(row)) !== undefined
+    if (!row || row.revision !== revision) return
+    return this.verifiedQuote(row, readFact(row))
   }
 
   private factHead(projectId: string, key: string): Row | undefined {

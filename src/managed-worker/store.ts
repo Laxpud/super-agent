@@ -23,6 +23,7 @@ import { PREFERENCE_SCOPE_CHANGE_SCHEMA, SCOPE_CHANGE_ASSISTANT_SOURCE_GUARDS, S
   closePreviousPreferenceScopeChanges } from './preference-scope-change-store.js'
 import { PROJECT_ARCHIVE_SCHEMA, ProjectArchiveStore } from './project-archive-store.js'
 import { PROJECT_DOCUMENT_SCHEMA, projectDocumentCommandUsed } from './project-document-store.js'
+import { PROJECT_FACT_USE_SCHEMA } from './project-fact-use-store.js'
 import { PROJECT_HANDOFF_SCHEMA } from './project-handoff-store.js'
 import { PROJECT_JOB_AUTO_SCHEMA } from './project-job-auto-store.js'
 import { PROJECT_JOB_SCHEMA } from './project-job-store.js'
@@ -48,6 +49,7 @@ export { MEMORY_TEXT_LIMIT, PREFERENCE_CORRECTION_RECEIPT_PREFIX, PREFERENCE_PRO
   type PreferenceProposal, type PreferenceProposalInput, type PreferenceScopeChangeInput, type PreferenceScopeChangeReceipt,
   type StudioPreference } from './memory-store.js'
 export { PROJECT_FACT_QUOTE_LIMIT, isProjectFactKey, isProjectFactQuote, type ProjectFact } from './project-archive-store.js'
+export type { ProjectWorkFactUse } from './project-fact-use-store.js'
 export type { StudioQuotaNotice } from './quota-notice-store.js'
 export type { StudioQuotaIncident, StudioQuotaReason } from './quota-store.js'
 export type { SharedDocumentRevision } from './shared-document-store.js'
@@ -405,6 +407,7 @@ export class ManagedWorkerStore {
         this.db.exec(PROJECT_DOCUMENT_SCHEMA)
         this.db.exec(PROJECT_JOB_SCHEMA)
         this.db.exec(PROJECT_JOB_AUTO_SCHEMA)
+        this.db.exec(PROJECT_FACT_USE_SCHEMA)
         this.db.exec(INSTRUCTION_SCHEMA)
         this.db.exec(FEISHU_DRAFT_SCHEMA)
         this.db.exec(FEISHU_DELIVERY_SCHEMA)
@@ -463,6 +466,8 @@ export class ManagedWorkerStore {
         documentTask: taskId => this.task(taskId),
         documentHold: task => this.projectDocumentHold(task),
         documentCommandUsed: commandId => this.commandUsed(commandId),
+        // Resolve the verified archive head within the calling project transaction, not a nested snapshot.
+        exactFactQuote: (projectId, key, revision) => this.projectArchive.exactQuote(projectId, key, revision),
       })
       this.projectArchive = new ProjectArchiveStore({
         db: () => this.db,
