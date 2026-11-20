@@ -40,7 +40,7 @@ export const Config = s.object({
   advisor: s.union([s.const(null), AdvisorConfig]).default(null)
     .description('Opt-in route for independent, tool-free Advisor consultations; null disables new consultations.'),
   memory: s.boolean().default(false)
-    .description('Enable owner-confirmed preference intake, preference commands, project archives and Bot experiences without injecting saved records into model context.'),
+    .description('Enable owner preference intake, explicit preference citations for standalone text tasks, project archives and Bot experiences. Saved preferences are never applied automatically.'),
   feishuDocumentInbox: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
     .description('Optional, separately configured single-owner Feishu inbox for a managed document.'),
   feishuTextInbox: s.union([s.const(null), FeishuTextInboxConfig]).default(null)
@@ -184,7 +184,14 @@ export function apply(context: Context, config: Config): void {
   const recovery = documentRecovery ? new StudioDocumentRecovery(ctx, store, agent => ready(agent, 'document-worker'),
     channelReady, channelStop.signal, failureNoticeReady) : undefined
   const quota = new StudioQuotaControl(ctx, store, quotaPools, providerPool, quotaFeishuAlerts)
-  const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), ready, provider => quota.denial(provider))
+  const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), ready, provider => quota.denial(provider),
+    memory, channelStop.signal)
+  ctx.on('llm/stream', (options, next) => drafts.stream(options, next))
+  // On hosts with this optional extension, native command receipts and the exact Worker relay stay out of supplemental log uploads.
+  ctx.inject(['sessionLogDeepSeek'], scope => {
+    const service = (scope as unknown as { sessionLogDeepSeek: { registerExclusion(exclude: (request: { sessionId: SessionId }) => boolean): () => Promise<void> } }).sessionLogDeepSeek
+    scope.effect(() => service.registerExclusion(({ sessionId }) => drafts.excludeHistoryUpload(sessionId)))
+  })
   const advisors = new StudioAdvisor(ctx, store, drafts, advisoryModel, ready, channelStop.signal)
   const studies = new StudioStudy(store, drafts, agent => ready(agent, 'assistant'), channelStop.signal)
   const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts, provider => providerPool.get(provider), memory)
@@ -297,6 +304,10 @@ export function apply(context: Context, config: Config): void {
     if (!role || !agent) return exec.name === TOOL || exec.name === PROPOSE_PROJECT || exec.name === PROPOSE_PREFERENCE || isAssistantTool(exec.name)
       || isStudyTool(exec.name) || isLeaderTool(exec.name) || isAdvisorTool(exec.name) ? 'Studio tool denied: INVALID_EXECUTION' : undefined
     if (!ready(agent, role) || exec.parent !== undefined) return 'Studio tool denied: INVALID_EXECUTION'
+    if (role === 'assistant') {
+      const denial = drafts.preferenceRouteDenial(agent, exec.callId, exec.name)
+      if (denial) return denial
+    }
     if (isAdvisorTool(exec.name)) return advisors.guard(agent, exec.name, role)
     if (role === 'assistant' && (isAssistantTool(exec.name) || isStudyTool(exec.name)
       || (exec.name === PROPOSE_PROJECT && intake.available(agent))
@@ -320,13 +331,14 @@ export function apply(context: Context, config: Config): void {
     const { agent, turn, messages } = step
     const role = scopes.get(agent)?.role
     if ((role === 'assistant' || role === 'leader') && !ready(agent, role)) return { kind: 'reject' }
-    if (role === 'draft-worker' || role === 'advisor') {
-      // The installed Host captures the exact selection for this step, including later native retries.
-      const selection = (step as typeof step & { modelSelection?: AdvisorRoute }).modelSelection
-      if (!drafts.admit(agent, messages, turn, selection)) return { kind: 'reject' }
-    }
     if (!validateDocumentRelays(store, agent, messages, () => ready(agent, 'document-worker'))) return { kind: 'reject' }
-    return next()
+    const decision = await next()
+    if (decision.kind === 'enter' && (role === 'draft-worker' || role === 'advisor')) {
+      // Verify the messages the native loop will actually admit, after any downstream pre-step transforms.
+      const selection = (step as typeof step & { modelSelection?: AdvisorRoute }).modelSelection
+      if (!drafts.admit(agent, decision.messages, turn, selection, step.signal)) return { kind: 'reject' }
+    }
+    return decision
   })
   for (const agent of ctx.agents.list()) configure(agent)
   recovery?.install()
@@ -402,8 +414,8 @@ export function apply(context: Context, config: Config): void {
       if (!ready(agent, 'assistant')) return { kind: 'error', text: 'Open a Studio Assistant Session to read Studio results.' }
       const id = rawInput.trim()
       if (id && !z.uuid().safeParse(id).success) return { kind: 'error', text: 'Expected one Studio task ID, or no ID for the latest task in this Session.' }
-      const result = store.readDraft(agent.id, id || undefined)
-      if (result.ok) return { kind: 'success', text: draftOutput(result.value).text }
+      const result = store.readDraft(agent.id, id || undefined, memory)
+      if (result.ok) return { kind: 'success', text: draftOutput(result.value, memory).text }
       // The no-ID lookup still selects only an ordinary draft in this Session. Studies and Feishu require their durable IDs.
       if (id && result.reason === 'TASK_NOT_FOUND') {
         const study = store.studies.read(agent.id, id)

@@ -8,6 +8,9 @@ import { ADVISOR_SCHEMA, AdvisorStore, interruptAdvice } from './advisor-store.j
 import { BOT_EXPERIENCE_SCHEMA, BotExperienceStore } from './bot-experience-store.js'
 import { DOCUMENT_FAILURE_NOTICE_SCHEMA, DocumentFailureNoticeStore, type DocumentFailureNotice } from './document-failure-notice-store.js'
 import { DOCUMENT_RECOVERY_SCHEMA, DocumentRecoveryStore, type DocumentFailure, type DocumentFailureInput } from './document-recovery-store.js'
+import { parseDraftPreference } from './draft-preference-request.js'
+import { DRAFT_PREFERENCE_SCHEMA, appendDraftPreference, currentDraftCitation, draftPreferenceText, pinnedDraftPreference,
+  type StudioDraftPreference } from './draft-preference-store.js'
 import { FEISHU_DELIVERY_SCHEMA, FeishuDeliveryStore, feishuDeliveryCoordinates } from './feishu-delivery-store.js'
 import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFeishuDraftTask } from './feishu-draft-store.js'
 import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
@@ -31,6 +34,7 @@ import { WATCHDOG_INDEXES, readWatchdogEntries, readWatchdogTarget,
 export { EXPERIENCE_TEXT_LIMIT, isExperienceText, type BotExperience } from './bot-experience-store.js'
 export type { DocumentFailureNotice } from './document-failure-notice-store.js'
 export type { DocumentFailure, DocumentFailureInput } from './document-recovery-store.js'
+export type { StudioDraftPreference } from './draft-preference-store.js'
 export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
 export type { StudioFeishuInstruction } from './instruction-store.js'
 export { MEMORY_TEXT_LIMIT, PREFERENCE_PROPOSAL_INTENT_LIMIT, PREFERENCE_PROPOSAL_RECEIPT_PREFIX, isMemoryKey,
@@ -88,6 +92,7 @@ export interface StudioDraftTask {
   workerSessionId: string
   executionEpoch: number
   state: 'running' | 'completed' | 'failed' | 'interrupted'
+  preference?: StudioDraftPreference
   result?: StudioDraftResult
   failure?: string
 }
@@ -223,12 +228,14 @@ const isVersion = (value: unknown): value is number => typeof value === 'number'
 const isDraftText = (value: unknown): value is string => isText(value) && value.length > 0 && value.length <= DRAFT_TEXT_LIMIT
 const isEventSeq = (value: unknown): value is number => value === 0 || isVersion(value)
 
-/** Decode the stored snapshot without casting unchecked SQL values into a public task. */
+const DRAFT_METADATA = `task_id, assistant_bot_id, assistant_session_id, source_message_id, source_request_id,
+  worker_bot_id, worker_session_id, execution_epoch, state, failure`
+
+/** Decode task metadata without selecting or requiring a completed result. */
 function readDraftRow(row: Record<string, SQLOutputValue>): StudioDraftTask {
   const { task_id: taskId, assistant_bot_id: assistantBotId, assistant_session_id: assistantSessionId,
     source_message_id: sourceMessageId, source_request_id: sourceRequestId, worker_bot_id: workerBotId,
-    worker_session_id: workerSessionId, execution_epoch: executionEpoch, state, result_text: text,
-    result_message_id: messageId, result_event_seq: eventSeq, result_turn: turn, failure } = row
+    worker_session_id: workerSessionId, execution_epoch: executionEpoch, state, failure } = row
   if (!isId(taskId) || !isId(assistantBotId) || !isId(assistantSessionId) || !isId(sourceMessageId) || !isId(sourceRequestId)
     || !isId(workerBotId) || !isId(workerSessionId) || !isVersion(executionEpoch)
     || (state !== 'running' && state !== 'completed' && state !== 'failed' && state !== 'interrupted')) {
@@ -236,14 +243,18 @@ function readDraftRow(row: Record<string, SQLOutputValue>): StudioDraftTask {
   }
   const task: StudioDraftTask = { taskId, assistantBotId, assistantSessionId, sourceMessageId, sourceRequestId,
     workerBotId, workerSessionId, executionEpoch, state }
-  if (state === 'completed') {
-    if (!isDraftText(text) || !isId(messageId) || !isEventSeq(eventSeq) || !isVersion(turn)) throw new Error('Invalid Studio draft result')
-    task.result = { text, messageId, eventSeq, turn }
-  } else if (state !== 'running') {
+  if (state === 'failed' || state === 'interrupted') {
     if (!isDraftText(failure)) throw new Error('Invalid Studio draft failure')
     task.failure = failure
   }
   return task
+}
+
+/** Copy validated execution coordinates before entering the run fence. */
+function draftExecution(execution: StudioDraftExecution): StudioDraftExecution | undefined {
+  if (!execution) return
+  const { taskId, workerSessionId, executionEpoch } = execution
+  if (isId(taskId) && isId(workerSessionId) && isVersion(executionEpoch)) return { taskId, workerSessionId, executionEpoch }
 }
 
 /** Restrict file permissions in the trusted host directory before SQLite opens the files. Reject symlinks and other non-regular files. */
@@ -376,6 +387,7 @@ export class ManagedWorkerStore {
         this.db.exec(BOT_EXPERIENCE_SCHEMA)
         this.db.exec(MEMORY_SCHEMA)
         this.db.exec(MEMORY_CITATION_SCHEMA)
+        this.db.exec(DRAFT_PREFERENCE_SCHEMA)
         this.db.exec(PREFERENCE_PROPOSAL_SCHEMA)
         this.db.exec(STUDY_SCHEMA)
         this.db.exec(ADVISOR_SCHEMA)
@@ -639,33 +651,79 @@ export class ManagedWorkerStore {
     return { taskId, workerSessionId: sessionId, executionEpoch }
   }
 
-  /** Reserve a Worker Session before launching it. Only a new GUI request may create another draft. */
-  startDraft(input: StudioDraftInput): ManagedResult<{ task: StudioDraftTask; created: boolean }> {
+  /** Classify a cited Worker even after completion or revocation. Storage failures must not look like uncited Sessions. */
+  hasDraftPreferenceWorker(workerSessionId: string): boolean {
+    if (!isId(workerSessionId)) throw new Error('Invalid Studio draft Worker session ID')
+    return !!this.db.prepare(`SELECT 1 FROM studio_draft_task d JOIN studio_draft_preference p ON p.task_id = d.task_id
+      WHERE d.worker_session_id = ?`).get(workerSessionId)
+  }
+
+  /** Reserve a Worker and pin any citation from the exact owner request before the caller can launch the Worker. */
+  startDraft(input: StudioDraftInput, allowPreference = false): ManagedResult<{ task: StudioDraftTask; created: boolean }> {
     if (!input) return deny('INVALID_INPUT')
     const { assistantSessionId, sourceMessageId, sourceRequestId, workerSessionId, requestText } = input
     if (!isId(assistantSessionId) || !isId(sourceMessageId) || !isId(sourceRequestId) || !isId(workerSessionId)
       || !isDraftText(requestText)) return deny('INVALID_INPUT')
+    const reference = parseDraftPreference(requestText)
+    if (reference.kind === 'invalid') return deny('INVALID_PREFERENCE_CITATION')
+    if (reference.kind === 'citation' && allowPreference !== true) return deny('MEMORY_DISABLED')
     return this.write<{ task: StudioDraftTask; created: boolean }>(() => {
       const assistantBotId = this.assistantBinding(assistantSessionId)
       if (!assistantBotId) return deny('SESSION_NOT_BOUND')
       // Check the original request before the proposed Worker so duplicate delivery cannot create another execution.
-      const existing = this.db.prepare('SELECT * FROM studio_draft_task WHERE assistant_session_id = ? AND source_request_id = ?')
-        .get(assistantSessionId, sourceRequestId)
-      if (existing) return accept({ task: readDraftRow(existing), created: false })
+      const existing = this.db.prepare(`SELECT ${DRAFT_METADATA} FROM studio_draft_task
+        WHERE assistant_session_id = ? AND source_request_id = ?`).get(assistantSessionId, sourceRequestId)
+      if (existing) {
+        const task = this.draftTask(existing)
+        if (task.preference || reference.kind === 'citation') {
+          // A cited replay must match the original message and request exactly and can only return metadata.
+          const matches = task.preference && reference.kind === 'citation' && task.preference.citationId === reference.citationId
+            && this.db.prepare('SELECT 1 FROM studio_draft_task WHERE task_id = ? AND source_message_id = ? AND request_text = ?')
+              .get(task.taskId, sourceMessageId, requestText)
+          if (!matches) return deny('SOURCE_ALREADY_USED')
+          if (!task.preference?.current) return deny('CITATION_NOT_CURRENT')
+        } else if (task.state === 'completed') task.result = this.draftResult(task.taskId)
+        return accept({ task, created: false })
+      }
       if (assistantSourceUsed(this.db, { assistantSessionId, sourceMessageId, sourceRequestId })) return deny('SOURCE_ALREADY_USED')
       if (this.sessionBound(workerSessionId)) return deny('SESSION_ALREADY_BOUND')
+      const preference = reference.kind === 'citation' ? currentDraftCitation(this.db, reference.citationId) : undefined
+      if (reference.kind === 'citation' && !preference) return deny('CITATION_NOT_CURRENT')
       const taskId = randomUUID()
       const workerBotId = randomUUID()
       requireWrite(this.db.prepare(`INSERT INTO studio_draft_task (task_id, assistant_bot_id, assistant_session_id, source_message_id,
         source_request_id, request_text, worker_bot_id, worker_session_id, execution_epoch, run_id, state)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'running')`)
         .run(taskId, assistantBotId, assistantSessionId, sourceMessageId, sourceRequestId, requestText, workerBotId, workerSessionId, this.#runId).changes)
+      // Either both rows commit or the reservation rolls back and the Worker remains unbound.
+      if (preference) appendDraftPreference(this.db, taskId, preference)
       return accept({ task: { taskId, assistantBotId, assistantSessionId, sourceMessageId, sourceRequestId,
-        workerBotId, workerSessionId, executionEpoch: 1, state: 'running' }, created: true })
+        workerBotId, workerSessionId, executionEpoch: 1, state: 'running', ...(preference ? { preference } : {}) }, created: true })
     })
   }
 
-  /** Persist the final message snapshot only for the exact running execution. */
+  /** Resolve the body at the relay boundary, only for the exact live execution with a current pinned citation. */
+  resolveDraftPreference(execution: StudioDraftExecution): ManagedResult<{ text: string }> {
+    return this.withDraftPreference(execution, preference => ({ text: draftPreferenceText(this.db, preference) }))
+  }
+
+  /** Recheck an exact cited execution before a model step or stream attempt without reading the preference body. */
+  checkDraftPreference(execution: StudioDraftExecution): ManagedResult<void> {
+    return this.withDraftPreference(execution, () => undefined)
+  }
+
+  private withDraftPreference<T>(execution: StudioDraftExecution, read: (preference: StudioDraftPreference) => T): ManagedResult<T> {
+    const exact = draftExecution(execution)
+    if (!exact) return deny('INVALID_INPUT')
+    return this.snapshot<T>(() => {
+      const task = this.runningDraft(exact)
+      if (!task.ok) return task
+      const preference = task.value.preference
+      return preference?.current ? accept(read(preference)) : deny('CITATION_NOT_CURRENT')
+    })
+  }
+
+  /** Persist the exact running execution's final message, or record a failure if its pinned citation has expired. */
   completeDraft(execution: StudioDraftExecution, result: StudioDraftResult): ManagedResult<StudioDraftTask> {
     if (!result) return deny('INVALID_INPUT')
     const { text, messageId, eventSeq, turn } = result
@@ -680,41 +738,77 @@ export class ManagedWorkerStore {
   }
 
   private finishDraft(execution: StudioDraftExecution, outcome: StudioDraftResult | string): ManagedResult<StudioDraftTask> {
-    if (!execution) return deny('INVALID_INPUT')
-    const { taskId, workerSessionId, executionEpoch } = execution
-    if (!isId(taskId) || !isId(workerSessionId) || !isVersion(executionEpoch)) return deny('INVALID_INPUT')
+    const exact = draftExecution(execution)
+    if (!exact) return deny('INVALID_INPUT')
+    const { taskId, workerSessionId, executionEpoch } = exact
     return this.write(() => {
-      const row = this.db.prepare(`SELECT * FROM studio_draft_task
-        WHERE task_id = ? AND worker_session_id = ? AND execution_epoch = ? AND run_id = ?`)
-        .get(taskId, workerSessionId, executionEpoch, this.#runId)
-      if (!row) return deny('STALE_EXECUTION')
-      const task = readDraftRow(row)
-      if (task.state !== 'running') return deny('TASK_NOT_RUNNING')
-      const failed = typeof outcome === 'string'
+      const running = this.runningDraft(exact)
+      if (!running.ok) return running
+      const task = running.value
+      // The write fence covers both the citation check and publication. An explicit failure keeps its original reason.
+      const final = typeof outcome !== 'string' && task.preference?.current === false ? 'CITATION_NOT_CURRENT' : outcome
+      const failed = typeof final === 'string'
       const state = failed ? 'failed' : 'completed'
       requireWrite(this.db.prepare(`UPDATE studio_draft_task SET state = ?, result_text = ?, result_message_id = ?,
         result_event_seq = ?, result_turn = ?, failure = ?
         WHERE task_id = ? AND worker_session_id = ? AND execution_epoch = ? AND run_id = ? AND state = 'running'`)
-        .run(state, failed ? null : outcome.text, failed ? null : outcome.messageId, failed ? null : outcome.eventSeq,
-          failed ? null : outcome.turn, failed ? outcome : null, taskId, workerSessionId, executionEpoch, this.#runId).changes)
-      return accept(failed ? { ...task, state: 'failed', failure: outcome } : { ...task, state: 'completed', result: outcome })
+        .run(state, failed ? null : final.text, failed ? null : final.messageId, failed ? null : final.eventSeq,
+          failed ? null : final.turn, failed ? final : null, taskId, workerSessionId, executionEpoch, this.#runId).changes)
+      return accept(failed ? { ...task, state: 'failed', failure: final } : { ...task, state: 'completed', result: final })
     })
   }
 
-  /** An explicit task ID can follow the Assistant Bot across Sessions; the implicit lookup stays in this Session. */
-  readDraft(assistantSessionId: string, taskId?: string): ManagedResult<StudioDraftTask> {
+  /** Load the exact running execution within the caller's fence, never selecting any result body. */
+  private runningDraft({ taskId, workerSessionId, executionEpoch }: StudioDraftExecution): ManagedResult<StudioDraftTask> {
+    const row = this.db.prepare(`SELECT ${DRAFT_METADATA} FROM studio_draft_task
+      WHERE task_id = ? AND worker_session_id = ? AND execution_epoch = ? AND run_id = ?`)
+      .get(taskId, workerSessionId, executionEpoch, this.#runId)
+    if (!row) return deny('STALE_EXECUTION')
+    const task = readDraftRow(row)
+    if (task.state !== 'running') return deny('TASK_NOT_RUNNING')
+    const preference = pinnedDraftPreference(this.db, task.taskId)
+    if (preference) task.preference = preference
+    return accept(task)
+  }
+
+  /** An explicit ID can follow the Assistant Bot across Sessions; an implicit lookup stays in this Session.
+   * Cited result bodies require both caller permission and a current citation in the same fenced snapshot.
+   */
+  readDraft(assistantSessionId: string, taskId?: string, includePreferenceResult = false): ManagedResult<StudioDraftTask> {
     if (!isId(assistantSessionId) || (taskId !== undefined && !isId(taskId))) return deny('INVALID_INPUT')
-    try {
+    return this.snapshot(() => {
       const assistantBotId = this.assistantBinding(assistantSessionId)
       if (!assistantBotId) return deny('SESSION_NOT_BOUND')
       const row = taskId === undefined
-        ? this.db.prepare(`SELECT * FROM studio_draft_task WHERE assistant_session_id = ? AND assistant_bot_id = ?
+        ? this.db.prepare(`SELECT ${DRAFT_METADATA} FROM studio_draft_task WHERE assistant_session_id = ? AND assistant_bot_id = ?
           ORDER BY seq DESC LIMIT 1`).get(assistantSessionId, assistantBotId)
-        : this.db.prepare('SELECT * FROM studio_draft_task WHERE task_id = ? AND assistant_bot_id = ?').get(taskId, assistantBotId)
-      return row ? accept(readDraftRow(row)) : deny('TASK_NOT_FOUND')
-    } catch {
-      return deny('STORAGE_ERROR')
-    }
+        : this.db.prepare(`SELECT ${DRAFT_METADATA} FROM studio_draft_task WHERE task_id = ? AND assistant_bot_id = ?`)
+          .get(taskId, assistantBotId)
+      if (!row) return deny('TASK_NOT_FOUND')
+      const task = this.draftTask(row)
+      if (task.state === 'completed' && (!task.preference || (includePreferenceResult === true && task.preference.current))) {
+        task.result = this.draftResult(task.taskId)
+      }
+      return accept(task)
+    })
+  }
+
+  /** Combine task and citation metadata without reading either body. The caller owns the transaction. */
+  private draftTask(row: Record<string, SQLOutputValue>): StudioDraftTask {
+    const task = readDraftRow(row)
+    const preference = pinnedDraftPreference(this.db, task.taskId)
+    if (preference) task.preference = preference
+    return task
+  }
+
+  /** Select the result only after the caller has authorized it in the same transaction. */
+  private draftResult(taskId: string): StudioDraftResult {
+    const row = this.db.prepare(`SELECT result_text AS text, result_message_id AS messageId, result_event_seq AS eventSeq, result_turn AS turn
+      FROM studio_draft_task WHERE task_id = ? AND state = 'completed'`).get(taskId)
+    if (!row) throw new Error('Missing Studio draft result')
+    const { text, messageId, eventSeq, turn } = row
+    if (!isDraftText(text) || !isId(messageId) || !isEventSeq(eventSeq) || !isVersion(turn)) throw new Error('Invalid Studio draft result')
+    return { text, messageId, eventSeq, turn }
   }
 
   /** Claim a combined-scope text route before parsing or checking quota. A duplicate never grants another attempt. */

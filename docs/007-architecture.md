@@ -378,6 +378,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/memory.ts` | Handles model-free preference and citation commands and verifies the exact persisted native command before mutation |
 | `src/managed-worker/memory-store.ts` | Maintains scoped preference revisions and terminal forget records; resolves citations only at the active source revision in the selected context |
 | `src/managed-worker/memory-citation-store.ts` | Stores append-only citation coordinates and native command provenance without copying preference text |
+| `src/managed-worker/draft-preference-request.ts` | Recognizes an explicit citation on the first line of the owner's original standalone assignment; rejects ambiguous markers |
+| `src/managed-worker/draft-preference-store.ts` | Pins a standalone draft to one unprojected citation and verifies its exact current source before any preference or derived result is read |
 | `src/managed-worker/preference-intake.ts` | Verifies a fresh owner message and tool call in the persisted active turn, requests a native decision, and rechecks the input before saving |
 | `src/managed-worker/preference-intent.ts` | Recognizes a small, explicit set of durable preference requests and extracts only the original text |
 | `src/managed-worker/preference-proposal-store.ts` | Retains a proposal's source and one-use decision; requires its exact initial preference revision and closes abandoned questions on restart |
