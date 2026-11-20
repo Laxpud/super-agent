@@ -371,8 +371,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/instructions.ts` | Records Web inputs before model reads, reviews Web and Feishu corrections against their exact versions, and sends current approved text to the bound Worker |
 | `src/managed-worker/document-intent.ts` | Recognizes a small grammar of unambiguous pause or line-subset requests; it has no authority to change them into actions |
 | `src/managed-worker/owner-confirmation.ts` | Checks the explicit answer to a live native Web owner question; timeout and delayed or mismatched replies cannot confirm a change |
-| `src/managed-worker/memory.ts` | Handles model-free owner preference commands and verifies the exact persisted native command before mutation |
-| `src/managed-worker/memory-store.ts` | Maintains scoped preference revisions, current-only reads and terminal forget records under the Host run fence |
+| `src/managed-worker/memory.ts` | Handles model-free preference and citation commands and verifies the exact persisted native command before mutation |
+| `src/managed-worker/memory-store.ts` | Maintains scoped preference revisions and terminal forget records; resolves citations only at the active source revision in the selected context |
+| `src/managed-worker/memory-citation-store.ts` | Stores append-only citation coordinates and native command provenance without copying preference text |
 | `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot, routes the configured owner's private chat to enabled text or document-review paths, and sends best-effort plain-text receipts |
 | `src/managed-worker/feishu-text.ts` | Routes explicit single-message text commands to a restricted Worker or exact result retrieval without rerunning completed work |
 | `src/managed-worker/feishu-draft-store.ts` | Preserves Feishu input, task and Worker identities, and result provenance; deduplicates deliveries under the shared SQLite run fence |

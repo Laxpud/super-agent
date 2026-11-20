@@ -3,11 +3,12 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import { z } from 'zod'
-import { isMemoryKey, isPreferenceText, MEMORY_TEXT_LIMIT, type MemorySource, type StudioPreference } from './memory-store.ts'
+import { isMemoryKey, isPreferenceText, MEMORY_TEXT_LIMIT, type MemorySource, type PreferenceCitation, type StudioPreference } from './memory-store.ts'
 import type { ManagedResult, ManagedWorkerStore } from './store.ts'
 
 export const MEMORY_COMMAND = 'studio-memory'
 export const MEMORY_HINT = 'list [<project-id>|global] [after-key] | read <key> [<project-id>] | trace <key> [revision] | remember <JSON> | correct <JSON> | restrict <key> <revision> <project-id> | forget <key> <revision>'
+  + ' | cite <key> <revision> [<project-id>] | resolve <citation-id> [<project-id>] | trace-citation <citation-id>'
 const key = z.string().refine(isMemoryKey)
 const text = z.string().refine(isPreferenceText)
 const revision = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
@@ -20,6 +21,9 @@ const forget = z.tuple([key, revisionArg])
 const list = z.tuple([z.union([z.literal('global'), project]).optional(), key.optional()])
 const read = z.tuple([key, project.optional()])
 const trace = z.tuple([key, revisionArg.optional()])
+const cite = z.tuple([key, revisionArg, project.optional()])
+const resolveCitation = z.tuple([z.uuid(), project.optional()])
+const traceCitation = z.tuple([z.uuid()])
 const SOURCE_TAIL_LIMIT = 16
 
 interface CommandResult { kind: 'success' | 'error'; text: string }
@@ -31,11 +35,15 @@ function parseJson(raw: string): unknown {
   catch { return undefined }
 }
 
-function coordinates(entry: StudioPreference): string {
+function coordinates(entry: Pick<StudioPreference, 'key' | 'revision' | 'projectId'>): string {
   return `${entry.key} v${entry.revision}; ${entry.projectId ? `project ${entry.projectId}` : 'global'}`
 }
 
-function origin(entry: StudioPreference): string {
+function citationScope(entry: PreferenceCitation): string {
+  return entry.projectId ? `project ${entry.projectId}` : 'unprojected'
+}
+
+function origin(entry: Pick<StudioPreference, 'source' | 'at'>): string {
   const { sessionId, commandId, eventSeq } = entry.source
   return `Owner command ${commandId} in Session ${sessionId}, event ${eventSeq}. Recorded at ${entry.at}.`
 }
@@ -94,8 +102,25 @@ export async function memoryCommand(ctx: Context, store: ManagedWorkerStore, age
     return success(`Preference audit only: ${coordinates(entry)}; recorded operation ${entry.operation}; recorded state ${entry.state}.\n${origin(entry)}`)
   }
 
-  // Parse before touching persistence. The submitted text is not copied into the native command/run event or mutation receipt.
-  let mutate: (source: MemorySource) => ManagedResult<StudioPreference>
+  if (verb === 'resolve') {
+    const parsed = resolveCitation.safeParse(args)
+    if (!parsed.success) return denied('EXPECTED_CITATION_ID_AND_OPTIONAL_PROJECT')
+    const result = store.memory.resolveCitation(...parsed.data)
+    if (!result.ok) return denied(result.reason)
+    const { citation, preference } = result.value
+    return success(`Current preference from citation ${citation.citationId}: ${coordinates(preference)}.\n${origin(preference)}\n\n${preference.text}`)
+  }
+  if (verb === 'trace-citation') {
+    const parsed = traceCitation.safeParse(args)
+    if (!parsed.success) return denied('EXPECTED_CITATION_ID')
+    const result = store.memory.traceCitation(...parsed.data)
+    if (!result.ok) return denied(result.reason)
+    const entry = result.value
+    return success(`Preference citation audit only: ${entry.citationId}; source ${entry.key} v${entry.revision}; use scope ${citationScope(entry)}.\n${origin(entry)}`)
+  }
+
+  // Parse before touching persistence. Neither a preference mutation nor a citation receipt echoes the preference text.
+  let mutate: (source: MemorySource) => ManagedResult<StudioPreference | PreferenceCitation>
   if (verb === 'remember') {
     const parsed = remember.safeParse(parseJson(argument))
     if (!parsed.success) return denied('EXPECTED_KEY_AND_NONSECRET_PREFERENCE_TEXT')
@@ -116,6 +141,11 @@ export async function memoryCommand(ctx: Context, store: ManagedWorkerStore, age
     if (!parsed.success) return denied('EXPECTED_KEY_AND_REVISION')
     const [name, expectedRevision] = parsed.data
     mutate = source => store.memory.change(name, expectedRevision, { kind: 'forget' }, source)
+  } else if (verb === 'cite') {
+    const parsed = cite.safeParse(args)
+    if (!parsed.success) return denied('EXPECTED_KEY_REVISION_AND_OPTIONAL_PROJECT')
+    const [name, expectedRevision, projectId] = parsed.data
+    mutate = source => store.memory.cite(name, expectedRevision, projectId, source)
   } else return denied(`Use /studio-memory ${MEMORY_HINT}`)
 
   const source = await confirmedCommandSource(ctx, agent, commandId, signal).catch(() => undefined)
@@ -125,5 +155,8 @@ export async function memoryCommand(ctx: Context, store: ManagedWorkerStore, age
   const result = mutate(source)
   if (!result.ok) return denied(result.reason)
   const entry = result.value
+  if ('citationId' in entry) {
+    return success(`Preference citation ${entry.citationId}: ${entry.key} v${entry.revision}; use scope ${citationScope(entry)}. ${origin(entry)} No task authorization changed.`)
+  }
   return success(`Preference saved: ${coordinates(entry)}; ${entry.state}. ${origin(entry)} No task authorization changed.`)
 }

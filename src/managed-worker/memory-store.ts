@@ -1,6 +1,8 @@
 /** Owner-controlled Studio preferences. Native Host guards authenticate the owner and persist the command before writing here. */
+import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
+import { appendCitation, citationRow } from './memory-citation-store.js'
 import type { ManagedResult } from './store.js'
 
 /** Exact coordinates of a native command in a persisted Assistant Session, not proof of owner authority. */
@@ -16,6 +18,16 @@ export interface StudioPreference {
   revision: number
   state: 'active' | 'forgotten'
   operation: 'remember' | 'correct' | 'restrict' | 'forget'
+  projectId?: string
+  source: MemorySource
+  at: string
+}
+
+/** Immutable reference to a preference revision, with its use context and the source of the citation itself. */
+export interface PreferenceCitation {
+  citationId: string
+  key: string
+  revision: number
   projectId?: string
   source: MemorySource
   at: string
@@ -182,6 +194,17 @@ function metadata(row: Row): StudioPreference {
   return { key, revision, state, operation, ...(projectId === null ? {} : { projectId }), source: { sessionId, commandId, eventSeq }, at }
 }
 
+/** Decode citation coordinates without looking up the original preference or its text. */
+function citationMetadata(row: Row): PreferenceCitation {
+  const { citation_id: citationId, key, revision, project_id: projectId, source_session_id: sessionId, command_id: commandId,
+    source_event_seq: eventSeq, at } = row
+  if (!isId(citationId) || !isMemoryKey(key) || !isRevision(revision) || (projectId !== null && !isProjectId(projectId))
+    || !isId(sessionId) || !isId(commandId) || !isEventSeq(eventSeq) || !isId(at)) {
+    throw new Error('Invalid Studio memory citation')
+  }
+  return { citationId, key, revision, ...(projectId === null ? {} : { projectId }), source: { sessionId, commandId, eventSeq }, at }
+}
+
 interface MemoryStoreAccess {
   db(): DatabaseSync
   write<T>(operation: () => ManagedResult<T>): ManagedResult<T>
@@ -257,13 +280,53 @@ export class MemoryStore {
   read(key: string, projectId?: string): ManagedResult<StudioPreference & { text: string }> {
     if (!isMemoryKey(key) || (projectId !== undefined && !isProjectId(projectId))) return deny('INVALID_INPUT')
     return this.access.snapshot(() => {
-      if (projectId !== undefined && !this.projectExists(projectId)) return deny('MEMORY_NOT_CURRENT')
-      const row = this.access.db().prepare(`SELECT ${METADATA}, r.text ${HEAD}
-        WHERE h.key = ? AND r.state = 'active' AND (r.project_id IS NULL OR r.project_id = ?)`)
-        .get(key, projectId ?? null)
-      if (!row) return deny('MEMORY_NOT_CURRENT')
-      if (!isPreferenceText(row.text)) throw new Error('Invalid Studio memory text')
-      return accept({ ...metadata(row), text: row.text })
+      const current = this.current(key, projectId)
+      return current ? accept(this.currentText(current)) : deny('MEMORY_NOT_CURRENT')
+    })
+  }
+
+  /** Record a visible current revision for an exact use context, without reading or copying its text. */
+  cite(key: string, revision: number, projectId: string | undefined, source: MemorySource): ManagedResult<PreferenceCitation> {
+    const exact = readSource(source)
+    if (!isMemoryKey(key) || !isRevision(revision) || (projectId !== undefined && !isProjectId(projectId)) || !exact) {
+      return deny('INVALID_INPUT')
+    }
+    return this.access.write(() => {
+      const rejected = this.checkSource(exact)
+      if (rejected) return rejected
+      const current = this.current(key, projectId)
+      if (!current) return deny('MEMORY_NOT_CURRENT')
+      if (current.revision !== revision) return deny('STALE_MEMORY_REVISION')
+      const citation: PreferenceCitation = { citationId: randomUUID(), key, revision,
+        ...(projectId === undefined ? {} : { projectId }), source: exact, at: new Date().toISOString() }
+      appendCitation(this.access.db(), citation)
+      return accept(citation)
+    })
+  }
+
+  /** Resolve only in the recorded use context and only while the exact original revision remains current and visible. */
+  resolveCitation(citationId: string, projectId?: string): ManagedResult<{
+    citation: PreferenceCitation; preference: StudioPreference & { text: string }
+  }> {
+    if (!isId(citationId) || (projectId !== undefined && !isProjectId(projectId))) return deny('CITATION_NOT_CURRENT')
+    return this.access.snapshot(() => {
+      // Match the use scope first; never look up a different project on behalf of the caller.
+      const row = citationRow(this.access.db(), citationId, projectId ?? null)
+      if (!row) return deny('CITATION_NOT_CURRENT')
+      const citation = citationMetadata(row)
+      const current = this.current(citation.key, projectId)
+      if (!current || current.revision !== citation.revision) return deny('CITATION_NOT_CURRENT')
+      // Only the matched current revision can reach the text query in this snapshot.
+      return accept({ citation, preference: this.currentText(current) })
+    })
+  }
+
+  /** Read immutable citation metadata even after the original revision is no longer current. */
+  traceCitation(citationId: string): ManagedResult<PreferenceCitation> {
+    if (!isId(citationId)) return deny('INVALID_INPUT')
+    return this.access.snapshot(() => {
+      const row = citationRow(this.access.db(), citationId)
+      return row ? accept(citationMetadata(row)) : deny('CITATION_NOT_CURRENT')
     })
   }
 
@@ -280,7 +343,25 @@ export class MemoryStore {
   /** Raw duplicate lookup for callers already inside the parent Store's fenced transaction. */
   commandUsed(commandId: string): boolean {
     if (!isId(commandId)) throw new Error('Invalid Studio memory command ID')
-    return !!this.access.db().prepare('SELECT 1 FROM studio_memory_revision WHERE command_id = ?').get(commandId)
+    return !!this.access.db().prepare(`SELECT 1 FROM studio_memory_revision WHERE command_id = ?
+      UNION ALL SELECT 1 FROM studio_memory_citation WHERE command_id = ? LIMIT 1`).get(commandId, commandId)
+  }
+
+  /** Find visible current metadata inside the caller's transaction; a missing project never falls back to global. */
+  private current(key: string, projectId: string | undefined): StudioPreference | undefined {
+    if (projectId !== undefined && !this.projectExists(projectId)) return
+    const row = this.access.db().prepare(`SELECT ${METADATA} ${HEAD}
+      WHERE h.key = ? AND h.state = 'active' AND r.state = h.state AND r.project_id IS h.project_id
+        AND (h.project_id IS NULL OR h.project_id = ?)`).get(key, projectId ?? null)
+    if (row) return metadata(row)
+  }
+
+  /** Read text only after verifying the exact current revision in the same transaction. */
+  private currentText(current: StudioPreference): StudioPreference & { text: string } {
+    const text = this.access.db().prepare('SELECT text FROM studio_memory_revision WHERE key = ? AND revision = ?')
+      .get(current.key, current.revision)?.text
+    if (!isPreferenceText(text)) throw new Error('Invalid Studio memory text')
+    return { ...current, text }
   }
 
   private head(key: string): Row | undefined {
@@ -294,8 +375,9 @@ export class MemoryStore {
   private checkSource(source: MemorySource): Rejection | undefined {
     if (!this.access.assistantBinding(source.sessionId)) return deny('SESSION_NOT_BOUND')
     if (this.commandUsed(source.commandId)) return deny('DUPLICATE_COMMAND')
-    if (this.access.db().prepare('SELECT 1 FROM studio_memory_revision WHERE source_session_id = ? AND source_event_seq = ?')
-      .get(source.sessionId, source.eventSeq)) return deny('SOURCE_ALREADY_USED')
+    if (this.access.db().prepare(`SELECT 1 FROM studio_memory_revision WHERE source_session_id = ? AND source_event_seq = ?
+      UNION ALL SELECT 1 FROM studio_memory_citation WHERE source_session_id = ? AND source_event_seq = ? LIMIT 1`)
+      .get(source.sessionId, source.eventSeq, source.sessionId, source.eventSeq)) return deny('SOURCE_ALREADY_USED')
   }
 
   /** Check both the journal row and its projected head before the parent transaction can commit. */

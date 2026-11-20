@@ -11,6 +11,7 @@ import { FEISHU_DELIVERY_SCHEMA, FeishuDeliveryStore, feishuDeliveryCoordinates 
 import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFeishuDraftTask } from './feishu-draft-store.js'
 import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
   type StudioFeishuInstruction, type StudioInstructionInput } from './instruction-store.js'
+import { MEMORY_CITATION_SCHEMA } from './memory-citation-store.js'
 import { MEMORY_SCHEMA, MemoryStore } from './memory-store.js'
 import { PROJECT_DOCUMENT_SCHEMA, projectDocumentCommandUsed } from './project-document-store.js'
 import { PROJECT_JOB_AUTO_SCHEMA } from './project-job-auto-store.js'
@@ -28,7 +29,8 @@ export type { DocumentFailureNotice } from './document-failure-notice-store.js'
 export type { DocumentFailure, DocumentFailureInput } from './document-recovery-store.js'
 export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
 export type { StudioFeishuInstruction } from './instruction-store.js'
-export { MEMORY_TEXT_LIMIT, isMemoryKey, isPreferenceText, type MemoryChange, type MemorySource, type StudioPreference } from './memory-store.js'
+export { MEMORY_TEXT_LIMIT, isMemoryKey, isPreferenceText, type MemoryChange, type MemorySource,
+  type PreferenceCitation, type StudioPreference } from './memory-store.js'
 export type { StudioQuotaNotice } from './quota-notice-store.js'
 export type { StudioQuotaIncident, StudioQuotaReason } from './quota-store.js'
 export type { SharedDocumentRevision } from './shared-document-store.js'
@@ -363,6 +365,7 @@ export class ManagedWorkerStore {
         this.db.exec(SCHEMA)
         this.db.exec(PROJECT_SCHEMA)
         this.db.exec(MEMORY_SCHEMA)
+        this.db.exec(MEMORY_CITATION_SCHEMA)
         this.db.exec(STUDY_SCHEMA)
         this.db.exec(ADVISOR_SCHEMA)
         this.db.exec(PROJECT_DOCUMENT_SCHEMA)
