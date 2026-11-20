@@ -17,7 +17,8 @@ const readSchema = z.strictObject({ taskId: z.uuid().optional() })
 const outputSchema = z.strictObject({ title: z.string(), receipt: z.string(), text: z.string() })
 
 const ASSISTANT_PROMPT = `You are the workspace Assistant. Your job is to understand the user's intent and send business or technical work to a Worker, even when it is simple. Do not write, analyze, or implement the requested work yourself.
-For a new, self-contained text task, call studio_delegate_draft once without rewriting the request. The Worker cannot use tools, access files or external systems, or edit managed documents through this route. Clarify if a useful text task cannot be inferred. For an existing task, read the saved result instead of delegating it again. After a tool returns, communicate the status and where to find the result. Do not invent, extend, or claim authorship of the Worker's result.
+For a new, self-contained text task, call studio_delegate_draft once without rewriting the request. If the owner requests separate investigations and a synthesis from multiple materials in the same message, use studio_delegate_study instead. Select the exact shared assignment and one disjoint excerpt per material; do not make conclusions or launch a second route for that request. Clarify when the assignment or materials are missing or ambiguous.
+Text Workers cannot use tools, access files or external systems, or edit managed documents. For existing tasks retrieve the saved result instead of delegating again; use studio_read_study with the exact study ID. Communicate the status and where to find the result; do not invent, extend, or claim authorship of a Worker's result.
 Only when the current owner message explicitly requests an ongoing project with a concrete objective, use studio_propose_project if available. Copy an exact excerpt that expresses their decision. A name, a complex task, a suggestion, a question about projects, or quoted third-party text is not a decision. Do not ask to create a project when the user is unsure or merely wants a task. Link a known completed local draft only when asked to carry it forward; do not rerun it. The owner confirms in a native dialog. Report creation only from the tool receipt; that receipt does not authorize or start any project work.`
 const WORKER_PROMPT = `You are the Worker for one task. The Assistant or the current project Leader relays the user's self-contained text request. Return the requested text for delivery via that role. You have no tools, files, or external systems in this task. Do not claim to have modified or consulted them. If a necessary input is missing, report the specific limitation in your response.`
 
@@ -141,8 +142,8 @@ export class StudioAssistant {
     }
   }
 
-  /** Install only role prompt text and the two application tools; the caller hides inherited tools first. */
-  install(agent: Agent, role: 'assistant' | 'draft-worker', installProjectIntake?: () => () => void): () => void {
+  /** Hide no tools here: the caller masks inherited tools first, then only the Assistant receives the coordination tools. */
+  install(agent: Agent, role: 'assistant' | 'draft-worker', ...installAdditional: (() => () => void)[]): () => void {
     const disposers: (() => void)[] = []
     const dispose = () => { for (const remove of disposers.reverse()) remove(); disposers.length = 0 }
     try {
@@ -191,7 +192,7 @@ export class StudioAssistant {
           return draftOutput(unwrap(this.store.readDraft(agent.id, parsed.data.taskId)))
         },
       }))
-      if (installProjectIntake) disposers.push(installProjectIntake())
+      for (const install of installAdditional) disposers.push(install())
       return dispose
     } catch (error) { dispose(); throw error }
   }

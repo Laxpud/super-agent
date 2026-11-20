@@ -1,4 +1,4 @@
-/** Durable execution authority for managed document Workers, Studio drafts, and Studio projects. */
+/** Durable execution authority for managed document Workers and Studio drafts, studies, and projects. */
 import { randomUUID } from 'node:crypto'
 import { chmodSync, closeSync, fchmodSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
@@ -16,6 +16,7 @@ import { QUOTA_NOTICE_SCHEMA, QuotaNoticeStore, isQuotaNoticeMessageId, type Stu
 import { QUOTA_SCHEMA, QuotaStore, type StudioQuotaIncident } from './quota-store.js'
 import { SHARED_DOCUMENT_SCHEMA, appendSharedRevision, readSharedRevision,
   type SharedDocumentRevision, type SharedDocumentTask } from './shared-document-store.js'
+import { STUDY_SCHEMA, StudyStore, assistantSourceUsed, interruptStudies } from './study-store.js'
 
 export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
 export type { StudioFeishuInstruction } from './instruction-store.js'
@@ -196,6 +197,7 @@ const SCHEMA = `
         AND result_event_seq IS NULL AND result_turn IS NULL AND (failure IS NULL) = (state = 'running')))
   ) STRICT;
   CREATE INDEX IF NOT EXISTS studio_draft_session_latest ON studio_draft_task (assistant_session_id, seq DESC);
+  CREATE INDEX IF NOT EXISTS studio_draft_source_message ON studio_draft_task (assistant_session_id, source_message_id);
 `
 
 const isText = (value: unknown): value is string => typeof value === 'string' && value.isWellFormed()
@@ -309,8 +311,9 @@ export class ManagedWorkerStore {
   private captureFault = false
   private closed = false
   readonly recoveredTasks: number
-  /** Internal Studio project facade sharing this Store's connection and run fence. */
+  /** Internal Studio project and study facades share this Store's connection and run fence. */
   readonly projects: ProjectStore
+  readonly studies: StudyStore
 
   /** Open the database under the host directory lock. Do not enable actions until the recovery transaction has committed. */
   constructor(path: string, quotaPoolIds: readonly string[] = [], private readonly quotaNoticeScope?: string,
@@ -332,6 +335,7 @@ export class ManagedWorkerStore {
       const started = this.transaction(() => {
         this.db.exec(SCHEMA)
         this.db.exec(PROJECT_SCHEMA)
+        this.db.exec(STUDY_SCHEMA)
         this.db.exec(PROJECT_DOCUMENT_SCHEMA)
         this.db.exec(PROJECT_JOB_SCHEMA)
         this.db.exec(PROJECT_JOB_AUTO_SCHEMA)
@@ -353,6 +357,7 @@ export class ManagedWorkerStore {
           throw new Error('Cannot interrupt previous Studio drafts')
         }
         this.feishuDrafts.interruptRunning()
+        interruptStudies(this.db)
         // A restart frees only reservations that never entered the model. Running attempts remain terminal.
         // Releasing a reservation never unspends its automatic grant; grants not yet tried survive the restart.
         this.db.exec(`UPDATE studio_project_dispatch SET
@@ -384,6 +389,14 @@ export class ManagedWorkerStore {
         documentTask: taskId => this.task(taskId),
         documentHold: task => this.projectDocumentHold(task),
         documentCommandUsed: commandId => this.commandUsed(commandId),
+      })
+      this.studies = new StudyStore({
+        db: () => this.db,
+        write: operation => this.write(operation),
+        snapshot: operation => this.snapshot(operation),
+        runId: this.#runId,
+        assistantBinding: sessionId => this.assistantBinding(sessionId),
+        sessionBound: sessionId => this.sessionBound(sessionId),
       })
     } catch (error) {
       try { this.close() } catch { /* Preserve the initialization error. */ }
@@ -483,10 +496,9 @@ export class ManagedWorkerStore {
   bindAssistant(sessionId: string): ManagedResult<string> {
     if (!isId(sessionId)) return deny('INVALID_INPUT')
     return this.write(() => {
-      if (this.binding(sessionId) || this.draftBinding(sessionId) || this.feishuDraftBinding(sessionId) || this.projects.binding(sessionId)
-        || this.projects.workerBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
       const existing = this.assistantBinding(sessionId)
       if (existing) return accept(existing)
+      if (this.sessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
       const bot = this.db.prepare('SELECT bot_id FROM studio_assistant_bot WHERE singleton = 1').get()
       const botId = bot ? bot.bot_id : randomUUID()
       if (!isId(botId)) throw new Error('Invalid Studio Assistant Bot ID')
@@ -528,6 +540,7 @@ export class ManagedWorkerStore {
       const existing = this.db.prepare('SELECT * FROM studio_draft_task WHERE assistant_session_id = ? AND source_request_id = ?')
         .get(assistantSessionId, sourceRequestId)
       if (existing) return accept({ task: readDraftRow(existing), created: false })
+      if (assistantSourceUsed(this.db, { assistantSessionId, sourceMessageId, sourceRequestId })) return deny('SOURCE_ALREADY_USED')
       if (this.sessionBound(workerSessionId)) return deny('SESSION_ALREADY_BOUND')
       const taskId = randomUUID()
       const workerBotId = randomUUID()
@@ -704,12 +717,12 @@ export class ManagedWorkerStore {
   /** Check roles other than project Leader; the permanent project Worker lookup does not call back into the Store. */
   private nonProjectSessionBound(sessionId: string): boolean {
     return !!(this.binding(sessionId) || this.assistantBinding(sessionId) || this.draftBinding(sessionId)
-      || this.feishuDraftBinding(sessionId) || this.projects.workerBound(sessionId))
+      || this.feishuDraftBinding(sessionId) || this.studies.binding(sessionId) || this.projects.workerBound(sessionId))
   }
 
   private studioSessionBound(sessionId: string): boolean {
     return !!(this.assistantBinding(sessionId) || this.draftBinding(sessionId) || this.feishuDraftBinding(sessionId)
-      || this.projects.binding(sessionId) || this.projects.workerBound(sessionId))
+      || this.studies.binding(sessionId) || this.projects.binding(sessionId) || this.projects.workerBound(sessionId))
   }
 
   private sessionBound(sessionId: string): boolean {

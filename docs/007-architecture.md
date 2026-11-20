@@ -355,6 +355,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/managed-worker/index.ts` | The opt-in Studio host: keeps its roles read-only, registers Web commands, and guards the one allowed managed document action without running GitHub setup |
 | `src/managed-worker/assistant.ts` | Delegates Assistant requests and runs restricted text Workers for Web and Feishu; captures the exact admitted turn's final text and drains the source Session before delivery |
+| `src/managed-worker/study.ts` | Coordinates bounded investigations and a separate synthesis Worker for one owner message; presents saved results without asking the Assistant to rewrite them |
+| `src/managed-worker/study-store.ts` | Retains exact study inputs and Worker evidence, gates synthesis on completed investigations, and never replays interrupted steps |
 | `src/managed-worker/project.ts` | Owner controls for project work and document links, with Leader tools to register and dispatch text work and inspect saved evidence |
 | `src/managed-worker/project-intake.ts` | Presents a source-bound Assistant proposal to the native Web answerer; only a positive owner answer can establish the project and its Leader Session |
 | `src/managed-worker/project-store.ts` | Persists current management, work and dispatch; rechecks the project, work type and any job hold at reservation and start |

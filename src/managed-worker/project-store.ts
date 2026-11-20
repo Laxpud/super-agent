@@ -8,6 +8,7 @@ import { armProjectJob, consumeJobAuto, consumedJobAuto, jobAutoPage, projectJob
 import { attachProjectJob, isConfirmedJobState, isJobState, observeProjectJob, observeWatchedProjectJob, projectJobCommandUsed,
   readProjectJob, setProjectJobPaused, watchedJobPage, type StudioProjectJob } from './project-job-store.js'
 import type { ManagedResult, StudioDraftResult } from './store.ts'
+import { assistantSourceUsed } from './study-store.js'
 import { validSystemdJob, type SystemdJobRef, type SystemdJobState } from './systemd-job.js'
 
 export { sameJobRoute, type StudioJobAuto, type StudioJobRoute } from './project-job-auto-store.js'
@@ -129,6 +130,8 @@ export const PROJECT_SCHEMA = `
   ) STRICT;
   CREATE INDEX IF NOT EXISTS studio_project_proposal_session_latest
     ON studio_project_proposal (assistant_session_id, seq DESC);
+  CREATE INDEX IF NOT EXISTS studio_project_proposal_source_message
+    ON studio_project_proposal (assistant_session_id, source_message_id);
   CREATE TABLE IF NOT EXISTS studio_project_work (
     work_id TEXT NOT NULL PRIMARY KEY,
     leader_session_id TEXT NOT NULL REFERENCES studio_project_binding (leader_session_id),
@@ -369,6 +372,7 @@ export class ProjectStore {
       if (!isId(sourceMessageId) || !isText(requestText, PROJECT_TEXT_LIMIT) || !isText(intentQuote, PROJECT_TEXT_LIMIT)
         || !requestText.includes(intentQuote) || !isText(name, PROJECT_NAME_LIMIT) || !isText(objective, PROJECT_TEXT_LIMIT)
         || (originTaskId !== undefined && !isId(originTaskId)) || (leaderBotId !== undefined && !isId(leaderBotId))) return deny('INVALID_INPUT')
+      if (assistantSourceUsed(this.db, { assistantSessionId, sourceMessageId, sourceRequestId })) return deny('SOURCE_ALREADY_USED')
       if (originTaskId !== undefined && !this.completedOrigin(originTaskId, assistantSessionId)) return deny('ORIGIN_TASK_NOT_COMPLETED')
       if (leaderBotId !== undefined && !this.leaderBotExists(leaderBotId)) return deny('LEADER_BOT_NOT_FOUND')
       const proposalId = randomUUID()

@@ -21,6 +21,7 @@ import { LEADER_PRESET, StudioProjectControl, isLeaderTool } from './project.ts'
 import { StudioQuotaNotices } from './quota-notices.ts'
 import { QuotaPoolConfig, StudioQuotaControl, quotaProviderMap } from './quota.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
+import { StudioStudy, isStudyTool, studyOutput } from './study.ts'
 
 export const name = 'dsh-superagent-managed-worker'
 export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'permissionPresets', 'sandboxPolicy', 'sessionPersistence', 'systemPrompt', 'tools', 'webServer']
@@ -151,6 +152,7 @@ export function apply(context: Context, config: Config): void {
   const quota = new StudioQuotaControl(ctx, store, quotaPools, providerPool, quotaFeishuAlerts)
   const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), agent => ready(agent, 'draft-worker'),
     provider => quota.denial(provider))
+  const studies = new StudioStudy(store, drafts, agent => ready(agent, 'assistant'), channelStop.signal)
   const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts, provider => providerPool.get(provider))
   const jobMonitor = systemdJobPollSeconds ? new StudioProjectJobMonitor(store, systemdJobPollSeconds * 1000, channelReady, (permit, signal) => {
     const leader = ctx.agents.get(permit.leaderSessionId as SessionId)
@@ -167,7 +169,9 @@ export function apply(context: Context, config: Config): void {
 
   /** A persisted binding wins over the picker, so a retired or finished Worker cannot become a different role on resume. */
   function roleOf(agent: Agent): StudioRole | undefined {
-    if (store.draftBinding(agent.id) || store.feishuDraftBinding(agent.id) || store.projects.workerBound(agent.id)) return 'draft-worker'
+    if (store.draftBinding(agent.id) || store.studies.binding(agent.id) || store.feishuDraftBinding(agent.id) || store.projects.workerBound(agent.id)) {
+      return 'draft-worker'
+    }
     if (store.binding(agent.id)) return 'document-worker'
     if (store.assistantBinding(agent.id)) return 'assistant'
     if (store.projects.binding(agent.id)) return 'leader'
@@ -188,6 +192,7 @@ export function apply(context: Context, config: Config): void {
       if (channelRun) await channelRun
       if (quotaNoticeRun) await quotaNoticeRun
       await feishuText?.drain()
+      await studies.drain()
       await projectJobs?.drain()
       if (projectJobRun) await projectJobRun
       for (const scope of scopes.values()) scope.dispose()
@@ -215,7 +220,8 @@ export function apply(context: Context, config: Config): void {
         if (!bound.ok) throw new Error(`Cannot bind Studio Assistant: ${bound.reason}`)
       }
       const unregister = role === 'leader' ? projects.install(agent)
-        : role !== 'document-worker' ? drafts.install(agent, role, role === 'assistant' ? () => intake.install(agent) : undefined) : agent.ctx.tools.register({
+        : role === 'assistant' ? drafts.install(agent, role, () => intake.install(agent), () => studies.install(agent))
+          : role === 'draft-worker' ? drafts.install(agent, role) : agent.ctx.tools.register({
         name: TOOL,
         description: 'Replace the text of the managed document bound to this worker, using its approved text and version.',
         parameters: z.toJSONSchema(writeSchema),
@@ -244,10 +250,11 @@ export function apply(context: Context, config: Config): void {
     let role: StudioRole | undefined
     try { role = agent && (scopes.get(agent)?.role ?? roleOf(agent)) }
     catch { return 'Studio tool denied: STORAGE_ERROR' }
-    if (!role || !agent) return exec.name === TOOL || exec.name === PROPOSE_PROJECT || isAssistantTool(exec.name) || isLeaderTool(exec.name)
-      ? 'Studio tool denied: INVALID_EXECUTION' : undefined
+    if (!role || !agent) return exec.name === TOOL || exec.name === PROPOSE_PROJECT || isAssistantTool(exec.name)
+      || isStudyTool(exec.name) || isLeaderTool(exec.name) ? 'Studio tool denied: INVALID_EXECUTION' : undefined
     if (!ready(agent, role) || exec.parent !== undefined) return 'Studio tool denied: INVALID_EXECUTION'
-    if (role === 'assistant' && (isAssistantTool(exec.name) || (exec.name === PROPOSE_PROJECT && intake.available(agent)))) return undefined
+    if (role === 'assistant' && (isAssistantTool(exec.name) || isStudyTool(exec.name)
+      || (exec.name === PROPOSE_PROJECT && intake.available(agent)))) return undefined
     if (role === 'leader') return projects.guard(agent, exec.name)
     if (role !== 'document-worker' || exec.name !== TOOL) return 'Studio tool denied: INVALID_EXECUTION'
     const result = store.authorize(agent.id, exec.arguments, exec.callId)
@@ -343,13 +350,26 @@ export function apply(context: Context, config: Config): void {
       if (id && !z.uuid().safeParse(id).success) return { kind: 'error', text: 'Expected one Studio task ID, or no ID for the latest task in this Session.' }
       const result = store.readDraft(agent.id, id || undefined)
       if (result.ok) return { kind: 'success', text: draftOutput(result.value).text }
-      // Keep no-ID lookup local to the Assistant's own Web tasks. A Feishu result requires its exact durable ID.
+      // The no-ID lookup still selects only an ordinary draft in this Session. Studies and Feishu require their durable IDs.
       if (id && result.reason === 'TASK_NOT_FOUND') {
+        const study = store.studies.read(agent.id, id)
+        if (study.ok) return { kind: 'success', text: studyOutput(study.value).text }
+        if (study.reason !== 'TASK_NOT_FOUND') return { kind: 'error', text: `Cannot read Studio result: ${study.reason}.` }
         const external = store.readFeishuDraft(id)
         if (external.ok) return { kind: 'success', text: feishuDraftOutput(external.value) }
         return { kind: 'error', text: `Cannot read Studio result: ${external.reason}.` }
       }
       return { kind: 'error', text: `Cannot read Studio result: ${result.reason}.` }
+    },
+  }))
+  ctx.effect(() => ctx.commands.register({
+    name: 'studio-study',
+    description: 'Read the saved synthesis or an individual Worker contribution without running a model.',
+    input: { hint: '<task-id> [step-number]' },
+    recordInput: false,
+    handler({ agent, rawInput, signal }) {
+      signal.throwIfAborted()
+      return studies.command(agent, rawInput)
     },
   }))
   ctx.effect(() => ctx.commands.register({
