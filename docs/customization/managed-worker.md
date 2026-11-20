@@ -85,6 +85,16 @@ Studio 在咨询前核对路由及思考深度；未指定深度时使用该适�
 - 展开 **Advisor opinion** 卡片，或用 `/studio-advice <咨询ID>` 取回原问题、引用和意见出处。未立项意见由同一 Assistant Bot 取回；项目意见可在本项目的现任或历史 Leader 会话查阅，但移交后旧 Leader 不能再发起咨询。取回不调用模型，关掉咨询配置也不影响已有意见。
 - Advisor 在独立会话中只提出建议，没有工具或派工权。保存意见不会新增待办、启动 Worker、修改文档或授予任何执行权限。同一请求不会重做，宿主重启也不重放中断的咨询。
 
+## 管理已登记的长期偏好
+
+在 Studio 宿主的 `config` 中设置 `memory: true`（默认关闭），然后在普通 **Studio Assistant** Web 会话使用 `/studio-memory`。这里只收所有者明确登记的长期偏好；不要填密码、令牌、项目机密或只适用于本次任务的要求。命令不会启动模型，保存的偏好也不会自动加入对话或改变任务授权。
+
+- **登记与查看。** `/studio-memory remember {"key":"report-format","text":"报告使用编号小标题"}` 创建全局偏好。键由小写字母开头，最多 64 个字符，可含小写字母、数字和连字符。可以加 `projectId` 只用于已存在的项目。`/studio-memory list [项目ID]` 列出当前条目，`/studio-memory read <键> [项目ID]` 读正文；省略项目 ID 时只查全局，指定项目时也可查适用于该项目的全局偏好。
+- **纠正或限域。** `/studio-memory correct {"key":"report-format","expectedRevision":1,"text":"短报告使用编号小标题"}` 只更新指定的当前修订，不改变作用范围。`/studio-memory restrict report-format 2 <项目ID>` 将全局偏好限到一个项目；成功后再从全局查询就不会读到该条目。后续操作使用回执里的新修订号；遇到过期版本，先查当前记录，不要照抄旧命令重发。
+- **忘记与查出处。** `/studio-memory forget <键> <当前修订>` 停用条目。同一个键不会被旧命令或重新登记激活。`/studio-memory trace <键> [修订号]` 仅显示登记、纠正或停用时的来源会话、原生命令和事件编号，不返回旧正文。忘记不删除原始对话或历史记录，也不暂停任务。
+
+Studio 目前不从历史聊天提炼偏好，也未接入 Bot 经验和项目档案；已有旧资料不会因为打开这个入口而成为当前记忆。
+
 ## 文档写入控制
 
 要替换已明确授权的文档，请在新的普通会话中选择 **SuperAgent managed document Worker**。不要在 Assistant、受托起草文字的 Worker、旧执行器或 DSH 子代理会话中登记这项授权。文档 Worker 使用只读沙箱，写入只能通过宿主注册的 `studio_write_document` 动作。

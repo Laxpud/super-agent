@@ -371,6 +371,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/instructions.ts` | Records Web inputs before model reads, reviews Web and Feishu corrections against their exact versions, and sends current approved text to the bound Worker |
 | `src/managed-worker/document-intent.ts` | Recognizes a small grammar of unambiguous pause or line-subset requests; it has no authority to change them into actions |
 | `src/managed-worker/owner-confirmation.ts` | Checks the explicit answer to a live native Web owner question; timeout and delayed or mismatched replies cannot confirm a change |
+| `src/managed-worker/memory.ts` | Handles model-free owner preference commands and verifies the exact persisted native command before mutation |
+| `src/managed-worker/memory-store.ts` | Maintains scoped preference revisions, current-only reads and terminal forget records under the Host run fence |
 | `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot, routes the configured owner's private chat to enabled text or document-review paths, and sends best-effort plain-text receipts |
 | `src/managed-worker/feishu-text.ts` | Routes explicit single-message text commands to a restricted Worker or exact result retrieval without rerunning completed work |
 | `src/managed-worker/feishu-draft-store.ts` | Preserves Feishu input, task and Worker identities, and result provenance; deduplicates deliveries under the shared SQLite run fence |
@@ -388,7 +390,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/quota-notice-store.ts` | Claims one durable channel attempt per incident and preserves delivered or ambiguous outcomes across restarts |
 | `src/managed-worker/watchdog.ts` | Renders bounded owner-only health observations, separating saved failures from absent live Sessions without polling or recovery |
 | `src/managed-worker/watchdog-store.ts` | Reads bounded authorization, job, execution and quota metadata under the Host run fence without opening business text or changing state |
-| `src/managed-worker/store.ts` | The SQLite store for Studio Bot identities, draft results, managed documents, and project state; checks shared revisions together with write authority and recovery across host runs |
+| `src/managed-worker/store.ts` | The run-fenced SQLite store for Studio Bot identities, draft results, managed documents, project state and preferences; checks shared revisions together with write authority and recovery |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |

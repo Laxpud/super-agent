@@ -18,6 +18,7 @@ import { StudioDocumentRecovery } from './document-recovery.ts'
 import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, feishuSourceScope, validateFeishuInbox } from './feishu-inbox.ts'
 import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './feishu-text.ts'
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
+import { MEMORY_COMMAND, MEMORY_HINT, memoryCommand } from './memory.ts'
 import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
 import { StudioProjectJobMonitor } from './project-job-monitor.ts'
 import { StudioProjectJobControl } from './project-job.ts'
@@ -35,6 +36,8 @@ export const Config = s.object({
   guiDocumentInbox: s.boolean().default(false).description('Hold pending document writes for owner review when a new chat message arrives in the bound document Worker.'),
   advisor: s.union([s.const(null), AdvisorConfig]).default(null)
     .description('Opt-in route for independent, tool-free Advisor consultations; null disables new consultations.'),
+  memory: s.boolean().default(false)
+    .description('Enable owner-only Studio preference commands; never inject these records into model context.'),
   feishuDocumentInbox: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
     .description('Optional, separately configured single-owner Feishu inbox for a managed document.'),
   feishuTextInbox: s.union([s.const(null), FeishuTextInboxConfig]).default(null)
@@ -115,7 +118,7 @@ function receipt(operation: string, result: ManagedResult<ManagedTask>, showResu
 
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
 export function apply(context: Context, config: Config): void {
-  const { stateDir, guiDocumentInbox, advisor, feishuDocumentInbox, feishuTextInbox, quotaPools, quotaFeishuAlerts,
+  const { stateDir, guiDocumentInbox, advisor, memory, feishuDocumentInbox, feishuTextInbox, quotaPools, quotaFeishuAlerts,
     watchdog, documentRecovery, documentFailureFeishuAlerts, systemdJobInbox, systemdJobPollSeconds } = config
   const ctx = localOwnerHost(context)
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
@@ -406,6 +409,16 @@ export function apply(context: Context, config: Config): void {
         return { kind: 'error', text: `Cannot read Studio result: ${external.reason}.` }
       }
       return { kind: 'error', text: `Cannot read Studio result: ${result.reason}.` }
+    },
+  }))
+  if (memory) ctx.effect(() => ctx.commands.register({
+    name: MEMORY_COMMAND,
+    description: 'Record, inspect, correct, or forget explicit owner preferences without starting a model.',
+    input: { hint: MEMORY_HINT },
+    recordInput: false,
+    handler({ agent, commandId, rawInput, signal }) {
+      return memoryCommand(ctx, store, agent, commandId, rawInput, AbortSignal.any([signal, channelStop.signal]),
+        () => ready(agent, 'assistant') && agent.session.header.origin !== 'subagent')
     },
   }))
   ctx.effect(() => ctx.commands.register({

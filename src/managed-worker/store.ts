@@ -1,4 +1,4 @@
-/** Durable execution authority for managed document Workers and Studio drafts, studies, projects, and advice. */
+/** Durable execution authority for managed document Workers and Studio drafts, studies, projects, advice, and preferences. */
 import { randomUUID } from 'node:crypto'
 import { chmodSync, closeSync, fchmodSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
@@ -11,6 +11,7 @@ import { FEISHU_DELIVERY_SCHEMA, FeishuDeliveryStore, feishuDeliveryCoordinates 
 import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFeishuDraftTask } from './feishu-draft-store.js'
 import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
   type StudioFeishuInstruction, type StudioInstructionInput } from './instruction-store.js'
+import { MEMORY_SCHEMA, MemoryStore } from './memory-store.js'
 import { PROJECT_DOCUMENT_SCHEMA, projectDocumentCommandUsed } from './project-document-store.js'
 import { PROJECT_JOB_AUTO_SCHEMA } from './project-job-auto-store.js'
 import { PROJECT_JOB_SCHEMA } from './project-job-store.js'
@@ -27,6 +28,7 @@ export type { DocumentFailureNotice } from './document-failure-notice-store.js'
 export type { DocumentFailure, DocumentFailureInput } from './document-recovery-store.js'
 export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
 export type { StudioFeishuInstruction } from './instruction-store.js'
+export { MEMORY_TEXT_LIMIT, isMemoryKey, isPreferenceText, type MemoryChange, type MemorySource, type StudioPreference } from './memory-store.js'
 export type { StudioQuotaNotice } from './quota-notice-store.js'
 export type { StudioQuotaIncident, StudioQuotaReason } from './quota-store.js'
 export type { SharedDocumentRevision } from './shared-document-store.js'
@@ -337,6 +339,7 @@ export class ManagedWorkerStore {
   readonly projects: ProjectStore
   readonly studies: StudyStore
   readonly advice: AdvisorStore
+  readonly memory: MemoryStore
 
   /** Open the database under the host directory lock. Do not enable actions until the recovery transaction has committed. */
   constructor(path: string, quotaPoolIds: readonly string[] = [], private readonly quotaNoticeScope?: string,
@@ -359,6 +362,7 @@ export class ManagedWorkerStore {
       const started = this.transaction(() => {
         this.db.exec(SCHEMA)
         this.db.exec(PROJECT_SCHEMA)
+        this.db.exec(MEMORY_SCHEMA)
         this.db.exec(STUDY_SCHEMA)
         this.db.exec(ADVISOR_SCHEMA)
         this.db.exec(PROJECT_DOCUMENT_SCHEMA)
@@ -419,6 +423,12 @@ export class ManagedWorkerStore {
         documentTask: taskId => this.task(taskId),
         documentHold: task => this.projectDocumentHold(task),
         documentCommandUsed: commandId => this.commandUsed(commandId),
+      })
+      this.memory = new MemoryStore({
+        db: () => this.db,
+        write: operation => this.write(operation),
+        snapshot: operation => this.snapshot(operation),
+        assistantBinding: sessionId => this.assistantBinding(sessionId),
       })
       this.studies = new StudyStore({
         db: () => this.db,
