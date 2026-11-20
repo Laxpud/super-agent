@@ -112,7 +112,16 @@ export class StudioAssistant {
   private readonly drafts = new WeakMap<Agent, DraftInput>()
 
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore, private readonly workerPreset: string,
-    private readonly assistantReady: (agent: Agent) => boolean, private readonly workerReady: (agent: Agent) => boolean) {}
+    private readonly assistantReady: (agent: Agent) => boolean, private readonly workerReady: (agent: Agent) => boolean,
+    readonly providerDenial: (provider: string) => string | undefined) {}
+
+  /** Refuse a stopped route before reserving an execution. Do not select a different account on the caller's behalf. */
+  checkedRoute(agent: Agent): WorkerRoute {
+    const route = draftWorkerRoute(agent)
+    const denial = this.providerDenial(route.model.provider)
+    if (denial) throw new Error(denial)
+    return route
+  }
 
   stop(): void { this.stopping.abort() }
 
@@ -189,7 +198,7 @@ export class StudioAssistant {
 
   /** Reserve the Assistant task and Worker ID before starting the shared text runner. */
   private async delegate(agent: Agent, source: OwnerRequest, caller: AbortSignal): Promise<StudioDraftTask> {
-    const route = draftWorkerRoute(agent)
+    const route = this.checkedRoute(agent)
     caller.throwIfAborted()
     this.stopping.signal.throwIfAborted()
     const workerId = SessionId(randomUUID())
@@ -211,11 +220,11 @@ export class StudioAssistant {
     let failure = 'WORKER_FAILED'
     const authorize = (check?: () => string | undefined) => {
       signal.throwIfAborted()
-      const reason = check?.()
+      const reason = this.providerDenial(route.model.provider) ?? check?.()
       if (reason) { failure = reason; throw new Error(reason) }
     }
     try {
-      signal.throwIfAborted()
+      authorize()
       // The factory finishes mounting and classifying the persisted role before the runner supplies any work.
       handle = await createStudioSession(this.ctx, workerId, this.workerPreset, route, signal)
       if (!this.workerReady(handle.agent)) throw new Error('Worker admission changed')
@@ -235,6 +244,8 @@ export class StudioAssistant {
       catch { result = undefined; failure = 'WORKER_SESSION_CLOSE_FAILED' }
     }
     if (signal.aborted) { result = undefined; failure = timeout.aborted ? 'WORKER_TIMEOUT' : 'WORKER_ABORTED' }
+    // Persist the pool's reason on interrupted text work so its original entry can report it without another inference.
+    if (!result) failure = this.providerDenial(route.model.provider) ?? failure
     return { ...(result ? { result } : {}), failure }
   }
 

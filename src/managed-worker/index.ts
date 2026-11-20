@@ -16,6 +16,7 @@ import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
 import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
 import { LEADER_PRESET, StudioProjectControl, isLeaderTool } from './project.ts'
+import { QuotaPoolConfig, StudioQuotaControl, quotaProviderMap } from './quota.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
 
 export const name = 'dsh-superagent-managed-worker'
@@ -27,6 +28,8 @@ export const Config = s.object({
     .description('Optional, separately configured single-owner Feishu inbox for a managed document.'),
   feishuTextInbox: s.union([s.const(null), FeishuTextInboxConfig]).default(null)
     .description('Optional single-owner Feishu inbox for explicit text tasks. Do not enable it together with the document inbox.'),
+  quotaPools: s.array(QuotaPoolConfig).default([])
+    .description('Explicit provider IDs that share each inference quota pool; empty disables the quota gate.'),
 })
 type Config = ReturnType<typeof Config>
 
@@ -88,9 +91,10 @@ function receipt(operation: string, result: ManagedResult<ManagedTask>, showResu
 }
 
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
-export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocumentInbox, feishuTextInbox }: Config): void {
+export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocumentInbox, feishuTextInbox, quotaPools }: Config): void {
   const ctx = localOwnerHost(context)
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
+  const providerPool = quotaProviderMap(quotaPools)
   if (feishuDocumentInbox && feishuTextInbox) throw new Error('Choose either the Studio Feishu document or text inbox, not both')
   const feishuConfig = feishuDocumentInbox ?? feishuTextInbox
   if (feishuConfig) validateFeishuInbox(feishuConfig)
@@ -106,7 +110,7 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
     ctx.logger.error('Managed Worker lost its state directory lock: %s', String(error))
   } })
   let store: ManagedWorkerStore
-  try { store = new ManagedWorkerStore(join(stateDir, 'managed-worker.sqlite')) }
+  try { store = new ManagedWorkerStore(join(stateDir, 'managed-worker.sqlite'), quotaPools.map(pool => pool.id)) }
   catch (error) { unlock(); throw error }
   if (feishuTextInbox && !store.feishuDraftScopeAvailable(feishuSourceScope(feishuTextInbox))) {
     // Do not reinterpret messages from a chat previously bound to a document.
@@ -124,7 +128,9 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
     && ctx.sandboxPolicy.resolve({ session: agent.session }).mode === 'read-only'
   const ready = (agent: Agent, role: StudioRole): boolean => available && controlReady(ctx) && currentSession(agent)
     && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
-  const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), agent => ready(agent, 'draft-worker'))
+  const quota = new StudioQuotaControl(ctx, store, quotaPools, providerPool)
+  const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), agent => ready(agent, 'draft-worker'),
+    provider => quota.denial(provider))
   const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts)
   const intake = new StudioProjectIntake(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal)
   const delivery = new AgentDelivery(ctx)
@@ -334,6 +340,19 @@ export function apply(context: Context, { stateDir, guiDocumentInbox, feishuDocu
           : { kind: 'error', text: `Cannot read project proposal: ${result.reason}.` }
       }
       return projects.command(agent, commandId, rawInput, assistant || ready(agent, 'leader'))
+    },
+  }))
+  quota.install()
+  if (quotaPools.length) ctx.effect(() => ctx.commands.register({
+    name: 'studio-quota',
+    description: 'Read Studio quota stops or confirm recovery with independent evidence, without calling a model.',
+    input: { hint: 'status | restore <pool-id> <incident-id> <independent-evidence>' },
+    recordInput: false,
+    handler({ agent, commandId, rawInput, signal }) {
+      signal.throwIfAborted()
+      if (!channelReady() || !currentSession(agent)) return { kind: 'error', text: 'Studio quota control unavailable.' }
+      if (rawInput.length > 1_280) return { kind: 'error', text: 'Studio quota controls accept at most 1000 characters of recovery evidence.' }
+      return quota.command(agent.id, commandId, rawInput)
     },
   }))
   if (feishu) channelRun = feishu.run(channelStop.signal)

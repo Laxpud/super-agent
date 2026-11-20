@@ -8,11 +8,13 @@ import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFe
 import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
   type StudioFeishuInstruction, type StudioInstructionInput } from './instruction-store.js'
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
+import { QUOTA_SCHEMA, QuotaStore, type StudioQuotaIncident } from './quota-store.js'
 import { SHARED_DOCUMENT_SCHEMA, appendSharedRevision, readSharedRevision,
   type SharedDocumentRevision, type SharedDocumentTask } from './shared-document-store.js'
 
 export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
 export type { StudioFeishuInstruction } from './instruction-store.js'
+export type { StudioQuotaIncident, StudioQuotaReason } from './quota-store.js'
 export type { SharedDocumentRevision } from './shared-document-store.js'
 
 /** A failure does not confirm a write. Use the reason to block the action or guide the user through a retry. */
@@ -292,6 +294,7 @@ export class ManagedWorkerStore {
   private readonly frozenSessions = new Set<string>()
   private readonly feishuDrafts = new FeishuDraftStore(() => this.db, this.#runId, isDraftText)
   private readonly instructions = new InstructionStore(() => this.db)
+  private readonly quota: QuotaStore
   // The failed capture may not identify a task. Keep this document-wide fence until a new run recovers the dirty marker.
   private captureFault = false
   private closed = false
@@ -300,8 +303,9 @@ export class ManagedWorkerStore {
   readonly projects: ProjectStore
 
   /** Open the database under the host directory lock. Do not enable actions until the recovery transaction has committed. */
-  constructor(path: string) {
+  constructor(path: string, quotaPoolIds: readonly string[] = []) {
     if (!isId(path) || path === ':memory:') throw new Error('Managed Worker requires a persistent SQLite path')
+    this.quota = new QuotaStore(quotaPoolIds, () => this.db, operation => this.write(operation), operation => this.snapshot(operation))
     const file = resolve(path)
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
     privateFile(file, true)
@@ -318,7 +322,10 @@ export class ManagedWorkerStore {
         this.db.exec(INSTRUCTION_SCHEMA)
         this.db.exec(FEISHU_DRAFT_SCHEMA)
         this.db.exec(SHARED_DOCUMENT_SCHEMA)
+        this.db.exec(QUOTA_SCHEMA)
         const previous = this.db.prepare('SELECT clean FROM managed_host_run WHERE singleton = 1').get()
+        // Unlike document recovery, a previously unrecorded Host run is not evidence of an unconfirmed quota stop.
+        this.quota.start(previous !== undefined && previous.clean !== 1)
         // A failed pause may have left no task ID in durable storage. A dirty run (or a pre-fence database) cannot carry forward any pending write authorization.
         const recoveredTasks = previous?.clean === 1 ? 0 : this.pauseUnfinishedTasks()
         // A draft can never be resumed by a new host run, even after a clean stop.
@@ -380,11 +387,12 @@ export class ManagedWorkerStore {
     return this.#db
   }
 
-  /** Mark a normal stop only after admission is disabled and there is no unconfirmed pause or input capture. */
+  /** Mark a normal stop only after admission is disabled and all pause, capture, and quota fences are confirmed. */
   finishRun(): void {
     if (this.closed || this.captureFault || this.frozenTasks.size || this.frozenSessions.size) return
     this.transaction(() => {
       if (!this.ownsRun()) return deny('STALE_HOST_RUN')
+      if (!this.quota.canFinishRun()) return deny('QUOTA_UNCONFIRMED')
       requireWrite(this.db.prepare('UPDATE managed_host_run SET clean = 1 WHERE singleton = 1 AND run_id = ?')
         .run(this.#runId).changes)
       return accept(undefined)
@@ -396,6 +404,22 @@ export class ManagedWorkerStore {
     if (this.closed) return
     this.closed = true
     this.#db.close()
+  }
+
+  /** Read only the active hold for a Host-configured pool. Treat a failure as unavailable, not as a clear pool. */
+  quotaStatus(poolId: string): ManagedResult<StudioQuotaIncident | undefined> {
+    return this.quota.status(poolId)
+  }
+
+  /** Stop a Host-configured pool, preserving the first observed incident until explicit restoration. */
+  tripQuota(poolId: string, provider: string, model: string, sessionId?: string):
+    ManagedResult<{ incident: StudioQuotaIncident; created: boolean }> {
+    return this.quota.trip(poolId, provider, model, sessionId)
+  }
+
+  /** Persist the Host-authenticated owner's confirmation for exactly this active incident. This does not resume any task. */
+  restoreQuota(poolId: string, incidentId: string, sessionId: string, commandId: string, evidence: string): ManagedResult<StudioQuotaIncident> {
+    return this.quota.restore(poolId, incidentId, sessionId, commandId, evidence)
   }
 
   /** Read the durable Session binding. Return undefined only for an unbound Session; throw on storage errors so callers cannot treat the Session as unmanaged. */

@@ -60,6 +60,8 @@ export class StudioFeishuText {
       reply('No task was started. Send draft: followed by a self-contained text request, or result <task-id>.')
       return
     }
+    const denial = this.workers.providerDenial(this.config.provider)
+    if (denial) { reply(`No text task was started. ${denial}`); return }
     const workerId = SessionId(randomUUID())
     const reserved = this.store.startFeishuDraft(source, request, workerId)
     if (!reserved.ok) { reply(`No new task was confirmed: ${reserved.reason}.`); return }

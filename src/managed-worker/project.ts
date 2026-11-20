@@ -4,7 +4,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { z } from 'zod'
-import { DRAFT_TIMEOUT_MS, draftWorkerRoute, ownerRequest, type StudioAssistant } from './assistant.ts'
+import { DRAFT_TIMEOUT_MS, ownerRequest, type StudioAssistant } from './assistant.ts'
 import { PROJECT_NAME_LIMIT, PROJECT_TEXT_LIMIT, type StudioProject, type StudioProjectWorkView } from './project-store.ts'
 import type { ManagedResult, ManagedWorkerStore } from './store.ts'
 
@@ -76,7 +76,7 @@ export class StudioProjectControl {
 
   /** Reserve once under current management and recheck both before the relay and at the Worker's first step. */
   private async runWork(agent: Agent, workId: string, signal: AbortSignal): Promise<StudioProjectWorkView> {
-    const route = draftWorkerRoute(agent)
+    const route = this.workers.checkedRoute(agent)
     signal.throwIfAborted()
     const workerId = SessionId(randomUUID())
     const reserved = this.store.projects.reserveWork(agent.id, workId, workerId)
