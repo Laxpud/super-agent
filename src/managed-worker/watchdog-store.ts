@@ -1,5 +1,6 @@
 /** Bounded evidence projections from the existing Studio ledgers; no live service or Session reads. */
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
+import type { DocumentFailureNotice } from './document-failure-notice-store.js'
 import type { DocumentFailure } from './document-recovery-store.js'
 import { isJobState } from './project-job-store.js'
 import type { StudioQuotaIncident } from './quota-store.js'
@@ -38,6 +39,7 @@ export interface WatchdogDocument {
   pauseUnconfirmed: boolean
   recoveryPause?: boolean
   recovery?: DocumentFailure
+  failureNotice?: DocumentFailureNotice
   shared?: { baseVersion: number; headVersion: number }
   projectId?: string
   workId?: string
@@ -97,6 +99,7 @@ interface DocumentEvidence {
   pendingReview(id: string): boolean
   frozen(task: ManagedTask): boolean
   recovery(task: ManagedTask): DocumentFailure | undefined
+  failureNotice(id: string): DocumentFailureNotice | undefined
 }
 
 const pageSize = WATCHDOG_PAGE_LIMIT + 1
@@ -158,10 +161,13 @@ function document(db: DatabaseSync, id: string, evidence: DocumentEvidence): Wat
   if (link && (!isId(link.work_id) || link.project_id !== workOrigin(db, link.work_id))) throw new Error('Invalid Watchdog document link')
   const project = link && isId(link.work_id) ? { ...management(db, link.project_id), workId: link.work_id } : undefined
   const recovery = evidence.recovery(task)
+  // Retain the delivery result even after the task no longer exposes a recovery action.
+  const failureNotice = evidence.failureNotice(id)
   return { kind: 'document', id, sessionId, executionEpoch, authorizationVersion, documentVersion, paused,
     pendingReview: evidence.pendingReview(id), pauseUnconfirmed: evidence.frozen(task),
     ...(recoveryPause ? { recoveryPause } : {}),
     ...(recovery ? { recovery } : {}),
+    ...(failureNotice ? { failureNotice } : {}),
     ...(sharedDocument ? { shared: { baseVersion: sharedDocument.baseVersion, headVersion: sharedDocument.headVersion } } : {}),
     ...project }
 }

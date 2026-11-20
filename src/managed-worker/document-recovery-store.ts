@@ -207,20 +207,26 @@ export class DocumentRecoveryStore {
     if (!this.failureHold(task, failure) && !this.consumed(failure.evidenceId)) return failure
   }
 
-  /** A spent receipt wins over later epoch, Host run, hold, or replacement changes for this exact task and evidence. */
-  private validate(taskId: string, evidenceId: string, nextSessionId: string): ManagedResult<RecoveryPreview> {
-    const row = this.access.db().prepare('SELECT * FROM studio_document_failure WHERE evidence_id = ? AND task_id = ?').get(evidenceId, taskId)
-    if (!row) return deny('RECOVERY_EVIDENCE_NOT_FOUND')
+  /** Check exact evidence in the caller's transaction, without selecting a replacement or spending the evidence. */
+  eligible(evidenceId: string, taskId?: string): ManagedResult<RecoveryPreview> {
+    const row = this.access.db().prepare('SELECT * FROM studio_document_failure WHERE evidence_id = ?').get(evidenceId)
+    if (!row || (taskId !== undefined && row.task_id !== taskId)) return deny('RECOVERY_EVIDENCE_NOT_FOUND')
+    // A spent receipt wins over later execution, Host run, or hold changes.
     if (this.consumed(evidenceId)) return deny('RECOVERY_ALREADY_USED')
     if (row.run_id !== this.access.runId) return deny('STALE_RECOVERY_EVIDENCE')
     const failure = readFailure(row)
-    const task = this.access.task(taskId)
+    const task = this.access.task(failure.taskId)
     if (!task) return deny('TASK_NOT_FOUND')
     const invalid = this.failureHold(task, failure)
-    if (invalid) return deny(invalid)
+    return invalid ? deny(invalid) : accept({ task, failure })
+  }
+
+  private validate(taskId: string, evidenceId: string, nextSessionId: string): ManagedResult<RecoveryPreview> {
+    const current = this.eligible(evidenceId, taskId)
+    if (!current.ok) return current
     const replacement = this.access.replacementHold(nextSessionId)
-    if (nextSessionId === task.workerSessionId || replacement) return deny(replacement ?? 'SESSION_ALREADY_BOUND')
-    return accept({ task, failure })
+    if (nextSessionId === current.value.task.workerSessionId || replacement) return deny(replacement ?? 'SESSION_ALREADY_BOUND')
+    return current
   }
 
   private failureHold(task: ManagedTask, failure: DocumentFailureInput): string | undefined {

@@ -5,6 +5,7 @@ import { dirname, resolve } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
 import { ADVISOR_SCHEMA, AdvisorStore, interruptAdvice } from './advisor-store.js'
+import { DOCUMENT_FAILURE_NOTICE_SCHEMA, DocumentFailureNoticeStore, type DocumentFailureNotice } from './document-failure-notice-store.js'
 import { DOCUMENT_RECOVERY_SCHEMA, DocumentRecoveryStore, type DocumentFailure, type DocumentFailureInput } from './document-recovery-store.js'
 import { FEISHU_DELIVERY_SCHEMA, FeishuDeliveryStore, feishuDeliveryCoordinates } from './feishu-delivery-store.js'
 import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFeishuDraftTask } from './feishu-draft-store.js'
@@ -22,6 +23,7 @@ import { STUDY_SCHEMA, StudyStore, assistantSourceUsed, interruptStudies } from 
 import { WATCHDOG_INDEXES, readWatchdogEntries, readWatchdogTarget,
   type WatchdogQuota, type WatchdogSnapshot, type WatchdogTarget } from './watchdog-store.js'
 
+export type { DocumentFailureNotice } from './document-failure-notice-store.js'
 export type { DocumentFailure, DocumentFailureInput } from './document-recovery-store.js'
 export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
 export type { StudioFeishuInstruction } from './instruction-store.js'
@@ -321,6 +323,10 @@ export class ManagedWorkerStore {
       : this.frozenSessions.has(sessionId) ? 'PAUSE_UNCONFIRMED' : undefined,
     transfer: (task, sessionId, commandId) => this.transferTask(task, sessionId, commandId, true),
   })
+  private readonly documentFailureNotices = new DocumentFailureNoticeStore(() => this.db, this.#runId, evidenceId => {
+    const current = this.documentRecovery.eligible(evidenceId)
+    return current.ok ? accept(current.value.failure) : current
+  })
   private readonly quota: QuotaStore
   private readonly quotaNotices = new QuotaNoticeStore(() => this.db, this.#runId)
   // The failed capture may not identify a task. Keep this document-wide fence until a new run recovers the dirty marker.
@@ -334,10 +340,11 @@ export class ManagedWorkerStore {
 
   /** Open the database under the host directory lock. Do not enable actions until the recovery transaction has committed. */
   constructor(path: string, quotaPoolIds: readonly string[] = [], private readonly quotaNoticeScope?: string,
-    private readonly feishuCombinedScope?: string) {
+    private readonly feishuCombinedScope?: string, private readonly documentFailureNoticeScope?: string) {
     if (!isId(path) || path === ':memory:') throw new Error('Managed Worker requires a persistent SQLite path')
     if (quotaNoticeScope !== undefined && !isId(quotaNoticeScope)) throw new Error('Invalid Studio quota notice scope')
     if (feishuCombinedScope !== undefined && !isId(feishuCombinedScope)) throw new Error('Invalid Studio Feishu combined scope')
+    if (documentFailureNoticeScope !== undefined && !isId(documentFailureNoticeScope)) throw new Error('Invalid Studio document failure notice scope')
     this.quota = new QuotaStore(quotaPoolIds, () => this.db, operation => this.write(operation), operation => this.snapshot(operation))
     const file = resolve(path)
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
@@ -362,6 +369,8 @@ export class ManagedWorkerStore {
         this.db.exec(FEISHU_DELIVERY_SCHEMA)
         this.db.exec(SHARED_DOCUMENT_SCHEMA)
         this.db.exec(DOCUMENT_RECOVERY_SCHEMA)
+        this.db.exec(DOCUMENT_FAILURE_NOTICE_SCHEMA)
+        this.documentFailureNotices.recoverSending()
         this.db.exec(QUOTA_SCHEMA)
         this.db.exec(QUOTA_NOTICE_SCHEMA)
         this.db.exec(WATCHDOG_INDEXES)
@@ -489,6 +498,7 @@ export class ManagedWorkerStore {
         pendingReview: id => this.instructions.hasPending(id),
         frozen: task => this.isFrozen(task),
         recovery: task => this.documentRecovery.watchdog(task),
+        failureNotice: id => this.documentFailureNotices.latestForTask(id),
       }, exact)
       if (exact && page.entries.length === 0) return deny('NOT_FOUND')
       const quotas = this.quota.observePools().map(({ poolId, current }): WatchdogQuota => {
@@ -1163,6 +1173,27 @@ export class ManagedWorkerStore {
   /** Persist minimal coordinates verified by the Host's live continuation failure observer. */
   recordDocumentFailure(input: DocumentFailureInput): ManagedResult<DocumentFailure> {
     return this.documentRecovery.record(input)
+  }
+
+  /** List candidates in the configured Host scope without giving permission to send. */
+  pendingDocumentFailureNoticePage(scope: string, afterEvidenceId?: string): ManagedResult<{ evidenceIds: string[]; next?: string }> {
+    if (!isId(scope) || (afterEvidenceId !== undefined && !isId(afterEvidenceId))) return deny('INVALID_INPUT')
+    if (scope !== this.documentFailureNoticeScope) return deny('DOCUMENT_FAILURE_NOTICE_SCOPE_NOT_CONFIGURED')
+    return this.snapshot(() => accept(this.documentFailureNotices.page(afterEvidenceId)))
+  }
+
+  /** Check exact recovery eligibility and commit the sole send attempt in the same Host-owned transaction. */
+  claimDocumentFailureNotice(evidenceId: string, scope: string): ManagedResult<{ failure?: DocumentFailure }> {
+    if (!isId(evidenceId) || !isId(scope)) return deny('INVALID_INPUT')
+    if (scope !== this.documentFailureNoticeScope) return deny('DOCUMENT_FAILURE_NOTICE_SCOPE_NOT_CONFIGURED')
+    return this.write(() => this.documentFailureNotices.claim(evidenceId, scope))
+  }
+
+  /** Keep a verified Feishu receipt or finalize the attempt as unconfirmed; neither outcome permits a retry. */
+  settleDocumentFailureNotice(evidenceId: string, scope: string, messageId?: string): ManagedResult<DocumentFailureNotice> {
+    if (!isId(evidenceId) || !isId(scope)) return deny('INVALID_INPUT')
+    if (scope !== this.documentFailureNoticeScope) return deny('DOCUMENT_FAILURE_NOTICE_SCOPE_NOT_CONFIGURED')
+    return this.write(() => this.documentFailureNotices.settle(evidenceId, scope, messageId))
   }
 
   /** Preview an eligible replacement without spending evidence or authorizing it. */

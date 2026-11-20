@@ -17,7 +17,7 @@ function observedSession(label: string, sessionId: string, observe: ObserveSessi
   return `${label} Session ${sessionId}: ${visible}.`
 }
 
-function documentHealth(entry: WatchdogDocument, captureUnconfirmed: boolean, observe: ObserveSession): string {
+function documentHealth(entry: WatchdogDocument, captureUnconfirmed: boolean, observe: ObserveSession, failureAlerts: boolean): string {
   const facts = [`Document ${entry.id}: snapshot v${entry.documentVersion}; execution epoch ${entry.executionEpoch}; authorization v${entry.authorizationVersion}.`]
   if (entry.projectId && entry.workId && entry.leaderSessionId && entry.managementEpoch) {
     facts.push(`Linked work ${entry.workId} in project ${entry.projectId}; management epoch ${entry.managementEpoch}.`,
@@ -39,6 +39,16 @@ function documentHealth(entry: WatchdogDocument, captureUnconfirmed: boolean, ob
         `To consider a paused replacement, open an unbound document Worker and use /studio-doc recover ${entry.id} ${evidenceId}.`)
     } else if (!entry.paused && !entry.pendingReview && !captureUnconfirmed && !entry.pauseUnconfirmed
       && (!entry.shared || entry.shared.baseVersion === entry.shared.headVersion)) facts.push('Awaiting the current authorized document action.')
+  }
+  // A historical delivery remains visible after recovery, but is not a receipt for a newer failure.
+  const notice = entry.failureNotice
+  if (notice) {
+    const state = notice.state === 'delivered' ? `delivered (${notice.messageId})`
+      : notice.state === 'unconfirmed' ? 'delivery unconfirmed; no automatic resend' : 'attempt recorded; no receipt confirmed yet'
+    facts.push(`Feishu Watchdog notice for evidence ${notice.evidenceId}: ${state}.`)
+  }
+  if (failureAlerts && entry.recovery && entry.recovery.evidenceId !== notice?.evidenceId) {
+    facts.push('No Feishu notice attempt recorded for the current evidence.')
   }
   facts.push(observedSession('Current Worker', entry.sessionId, observe))
   return facts.join(' ')
@@ -99,14 +109,15 @@ function quotaHealth(entry: WatchdogQuota): string {
     + (sessionId ? ` Source Session ${sessionId}.` : '') + notice
 }
 
-function renderEntry(entry: WatchdogEntry, captureUnconfirmed: boolean, observe: ObserveSession): string {
-  if (entry.kind === 'document') return documentHealth(entry, captureUnconfirmed, observe)
+function renderEntry(entry: WatchdogEntry, captureUnconfirmed: boolean, observe: ObserveSession, failureAlerts: boolean): string {
+  if (entry.kind === 'document') return documentHealth(entry, captureUnconfirmed, observe, failureAlerts)
   if (entry.kind === 'job') return jobHealth(entry, observe)
   return executionHealth(entry, observe)
 }
 
-/** Only the owner-native command reads this status. No model tools or timed side effects are registered. */
-export function watchdogCommand(store: ManagedWorkerStore, argument: string, observe: ObserveSession): { kind: 'success' | 'error'; text: string } {
+/** Only the owner-native command reads this status. Inspecting a receipt does not wake the notifier. */
+export function watchdogCommand(store: ManagedWorkerStore, argument: string, observe: ObserveSession,
+  failureAlerts: boolean): { kind: 'success' | 'error'; text: string } {
   const input = argument.trim()
   const parsed = input ? query.safeParse(input.length <= 96 ? input.split(/\s+/u) : undefined) : undefined
   if (parsed && !parsed.success) return { kind: 'error', text: 'Use /studio-health or /studio-health <document|job|draft|feishu|project|study|advice> <id>.' }
@@ -118,7 +129,7 @@ export function watchdogCommand(store: ManagedWorkerStore, argument: string, obs
   if (captureUnconfirmed) header.push('A document instruction capture is unconfirmed in this Host run; document writes are held.')
   if (pauseUnconfirmed) header.push('A document pause is unconfirmed in this Host run; affected writes are held.')
   if (truncated.length) header.push(`Overview limited to ${WATCHDOG_PAGE_LIMIT} per category. More records exist for: ${truncated.join(', ')}. Use the exact ID to inspect one.`)
-  const sections = [...header, ...quotas.map(quotaHealth), ...entries.map(entry => renderEntry(entry, captureUnconfirmed, observe))]
+  const sections = [...header, ...quotas.map(quotaHealth), ...entries.map(entry => renderEntry(entry, captureUnconfirmed, observe, failureAlerts))]
   if (!entries.length) sections.push('No matching task or job records in this snapshot; this is not a general health attestation.')
   return { kind: 'success', text: sections.join('\n') }
 }

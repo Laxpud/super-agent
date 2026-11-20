@@ -83,7 +83,7 @@ export class StudioFeishuInbox {
 
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore, private readonly stateDir: string,
     private readonly config: FeishuInboxConfig, private readonly allowed: () => boolean, private readonly text: StudioFeishuText | undefined,
-    private readonly documentCorrections: boolean) {
+    private readonly documentCorrections: boolean, private readonly onNoticeReady?: () => void) {
     this.scope = feishuSourceScope(config)
   }
 
@@ -139,6 +139,7 @@ export class StudioFeishuInbox {
             this.listening = true
             this.noticeChannel = { bot, signal: active }
             this.state = 'listening for the configured private chat'
+            this.onNoticeReady?.()
           },
           problem: () => {
             this.noticeChannel = undefined

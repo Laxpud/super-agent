@@ -13,6 +13,7 @@ import type { AdvisorRoute } from './advisor-store.ts'
 import { AdvisorConfig, StudioAdvisor, advisorSelection, isAdvisorTool } from './advisor.ts'
 import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool, type RestrictedTextRole } from './assistant.ts'
 import { documentStartArgs, sharedDocumentCommand, sharedDocumentCoordinates, sharedDocumentError } from './document-command.ts'
+import { StudioDocumentFailureNotices } from './document-failure-notices.ts'
 import { StudioDocumentRecovery } from './document-recovery.ts'
 import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, feishuSourceScope, validateFeishuInbox } from './feishu-inbox.ts'
 import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './feishu-text.ts'
@@ -46,6 +47,8 @@ export const Config = s.object({
     .description('Expose an owner-only read-only health snapshot of recorded Studio state; no background recovery.'),
   documentRecovery: s.boolean().default(false)
     .description('With watchdog, record qualifying document turn failures and allow one owner-confirmed paused replacement.'),
+  documentFailureFeishuAlerts: s.boolean().default(false)
+    .description('With document recovery and a Feishu inbox, notify the configured owner once per eligible failure.'),
   systemdJobInbox: s.boolean().default(false)
     .description('Allow the owner to attach and check existing local systemd user jobs in a Studio project.'),
   systemdJobPollSeconds: s.number().default(0)
@@ -113,7 +116,7 @@ function receipt(operation: string, result: ManagedResult<ManagedTask>, showResu
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
 export function apply(context: Context, config: Config): void {
   const { stateDir, guiDocumentInbox, advisor, feishuDocumentInbox, feishuTextInbox, quotaPools, quotaFeishuAlerts,
-    watchdog, documentRecovery, systemdJobInbox, systemdJobPollSeconds } = config
+    watchdog, documentRecovery, documentFailureFeishuAlerts, systemdJobInbox, systemdJobPollSeconds } = config
   const ctx = localOwnerHost(context)
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
   if (documentRecovery && !watchdog) throw new Error('Studio document recovery requires watchdog for evidence lookup')
@@ -129,7 +132,12 @@ export function apply(context: Context, config: Config): void {
   const combinedFeishu = feishuTextInbox?.documentCorrections === true
   const combinedFeishuScope = feishuTextInbox && combinedFeishu ? feishuSourceScope(feishuTextInbox) : undefined
   if (quotaFeishuAlerts && (!feishuConfig || !quotaPools.length)) throw new Error('Studio quota notices require a dedicated Feishu inbox and quota pools')
-  const quotaNoticeScope = quotaFeishuAlerts && feishuConfig ? feishuSourceScope(feishuConfig) : undefined
+  if (documentFailureFeishuAlerts && (!documentRecovery || !feishuConfig)) {
+    throw new Error('Studio document failure notices require document recovery and a dedicated Feishu inbox')
+  }
+  const feishuScope = feishuConfig ? feishuSourceScope(feishuConfig) : undefined
+  const quotaNoticeScope = quotaFeishuAlerts ? feishuScope : undefined
+  const documentFailureNoticeScope = documentFailureFeishuAlerts ? feishuScope : undefined
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   let available = true
   const channelStop = new AbortController()
@@ -143,7 +151,10 @@ export function apply(context: Context, config: Config): void {
     ctx.logger.error('Managed Worker lost its state directory lock: %s', String(error))
   } })
   let store: ManagedWorkerStore
-  try { store = new ManagedWorkerStore(join(stateDir, 'managed-worker.sqlite'), quotaPools.map(pool => pool.id), quotaNoticeScope, combinedFeishuScope) }
+  try {
+    store = new ManagedWorkerStore(join(stateDir, 'managed-worker.sqlite'), quotaPools.map(pool => pool.id),
+      quotaNoticeScope, combinedFeishuScope, documentFailureNoticeScope)
+  }
   catch (error) { unlock(); throw error }
   if (feishuTextInbox && !store.feishuDraftScopeAvailable(feishuSourceScope(feishuTextInbox))) {
     // Only the explicit combined configuration can share an existing document chat.
@@ -162,8 +173,10 @@ export function apply(context: Context, config: Config): void {
   const ready = (agent: Agent, role: StudioRole): boolean => available && controlReady(ctx) && currentSession(agent)
     && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
   const channelReady = () => available && controlReady(ctx)
+  let failureNotices: StudioDocumentFailureNotices | undefined
+  const failureNoticeReady = () => failureNotices?.wake()
   const recovery = documentRecovery ? new StudioDocumentRecovery(ctx, store, agent => ready(agent, 'document-worker'),
-    channelReady, channelStop.signal) : undefined
+    channelReady, channelStop.signal, failureNoticeReady) : undefined
   const quota = new StudioQuotaControl(ctx, store, quotaPools, providerPool, quotaFeishuAlerts)
   const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), ready, provider => quota.denial(provider))
   const advisors = new StudioAdvisor(ctx, store, drafts, advisoryModel, ready, channelStop.signal)
@@ -178,7 +191,12 @@ export function apply(context: Context, config: Config): void {
   const intake = new StudioProjectIntake(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal)
   const delivery = new AgentDelivery(ctx)
   const feishuText = feishuTextInbox ? new StudioFeishuText(store, drafts, feishuTextInbox, channelStop.signal, channelReady, combinedFeishu) : undefined
-  const feishu = feishuConfig && new StudioFeishuInbox(ctx, store, stateDir, feishuConfig, channelReady, feishuText, !!feishuDocumentInbox || combinedFeishu)
+  const feishu = feishuConfig && new StudioFeishuInbox(ctx, store, stateDir, feishuConfig, channelReady, feishuText,
+    !!feishuDocumentInbox || combinedFeishu, failureNoticeReady)
+  if (documentFailureNoticeScope && feishu) {
+    failureNotices = new StudioDocumentFailureNotices(ctx, store, () => feishu.noticeDestination(), channelStop.signal,
+      () => ctx.logger.warn('Studio Feishu document failure notice was not confirmed; check /studio-health document <task-id>'))
+  }
   const quotaNotices = quotaFeishuAlerts && feishu ? new StudioQuotaNotices(store, quotaPools, () => feishu.noticeDestination(),
     () => ctx.logger.warn('Studio Feishu quota notice delivery was not confirmed; check /studio-quota status')) : undefined
 
@@ -211,6 +229,7 @@ export function apply(context: Context, config: Config): void {
       await advisors.drain()
       await studies.drain()
       await recovery?.drain()
+      await failureNotices?.drain()
       await projectJobs?.drain()
       if (projectJobRun) await projectJobRun
       for (const scope of scopes.values()) scope.dispose()
@@ -448,7 +467,7 @@ export function apply(context: Context, config: Config): void {
         const observed = ctx.agents.get(sessionId as SessionId)
         if (!observed) return 'not-attached'
         return observed.id === sessionId ? observed.status : 'unknown'
-      })
+      }, documentFailureFeishuAlerts)
     },
   }))
   quota.install()

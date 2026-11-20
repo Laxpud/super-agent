@@ -30,7 +30,7 @@ export class StudioDocumentRecovery {
 
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore,
     private readonly ready: (agent: Agent) => boolean, private readonly available: () => boolean,
-    private readonly stopping: AbortSignal) {}
+    private readonly stopping: AbortSignal, private readonly onConfirmed?: () => void) {}
 
   install(): void {
     this.ctx.on('session/event', (session, event) => {
@@ -74,7 +74,8 @@ export class StudioDocumentRecovery {
       await this.ctx.sessionPersistence.flush()
       if (this.stopping.aborted || !this.available()) return
       const result = this.store.recordDocumentFailure(input)
-      if (!result.ok && result.reason === 'STORAGE_ERROR') this.ctx.logger.warn('Studio could not confirm document recovery evidence')
+      if (result.ok) this.onConfirmed?.()
+      else if (result.reason === 'STORAGE_ERROR') this.ctx.logger.warn('Studio could not confirm document recovery evidence')
     }).catch(() => {
       if (!this.stopping.aborted) this.ctx.logger.warn('Studio could not flush the document failure event')
     }).finally(() => { this.confirmingEvidence.delete(attempt) })
