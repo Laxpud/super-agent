@@ -1,5 +1,6 @@
 /** Bounded evidence projections from the existing Studio ledgers; no live service or Session reads. */
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
+import type { DocumentFailure } from './document-recovery-store.js'
 import { isJobState } from './project-job-store.js'
 import type { StudioQuotaIncident } from './quota-store.js'
 import type { ManagedTask } from './store.js'
@@ -36,6 +37,7 @@ export interface WatchdogDocument {
   pendingReview: boolean
   pauseUnconfirmed: boolean
   recoveryPause?: boolean
+  recovery?: DocumentFailure
   shared?: { baseVersion: number; headVersion: number }
   projectId?: string
   workId?: string
@@ -94,6 +96,7 @@ interface DocumentEvidence {
   task(id: string): ManagedTask | undefined
   pendingReview(id: string): boolean
   frozen(task: ManagedTask): boolean
+  recovery(task: ManagedTask): DocumentFailure | undefined
 }
 
 const pageSize = WATCHDOG_PAGE_LIMIT + 1
@@ -154,9 +157,11 @@ function document(db: DatabaseSync, id: string, evidence: DocumentEvidence): Wat
   const link = db.prepare('SELECT work_id, project_id FROM studio_project_document WHERE task_id = ?').get(id)
   if (link && (!isId(link.work_id) || link.project_id !== workOrigin(db, link.work_id))) throw new Error('Invalid Watchdog document link')
   const project = link && isId(link.work_id) ? { ...management(db, link.project_id), workId: link.work_id } : undefined
+  const recovery = evidence.recovery(task)
   return { kind: 'document', id, sessionId, executionEpoch, authorizationVersion, documentVersion, paused,
     pendingReview: evidence.pendingReview(id), pauseUnconfirmed: evidence.frozen(task),
     ...(recoveryPause ? { recoveryPause } : {}),
+    ...(recovery ? { recovery } : {}),
     ...(sharedDocument ? { shared: { baseVersion: sharedDocument.baseVersion, headVersion: sharedDocument.headVersion } } : {}),
     ...project }
 }

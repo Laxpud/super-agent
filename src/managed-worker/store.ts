@@ -5,6 +5,7 @@ import { dirname, resolve } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
 import { ADVISOR_SCHEMA, AdvisorStore, interruptAdvice } from './advisor-store.js'
+import { DOCUMENT_RECOVERY_SCHEMA, DocumentRecoveryStore, type DocumentFailure, type DocumentFailureInput } from './document-recovery-store.js'
 import { FEISHU_DELIVERY_SCHEMA, FeishuDeliveryStore, feishuDeliveryCoordinates } from './feishu-delivery-store.js'
 import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFeishuDraftTask } from './feishu-draft-store.js'
 import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
@@ -21,6 +22,7 @@ import { STUDY_SCHEMA, StudyStore, assistantSourceUsed, interruptStudies } from 
 import { WATCHDOG_INDEXES, readWatchdogEntries, readWatchdogTarget,
   type WatchdogQuota, type WatchdogSnapshot, type WatchdogTarget } from './watchdog-store.js'
 
+export type { DocumentFailure, DocumentFailureInput } from './document-recovery-store.js'
 export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
 export type { StudioFeishuInstruction } from './instruction-store.js'
 export type { StudioQuotaNotice } from './quota-notice-store.js'
@@ -308,6 +310,17 @@ export class ManagedWorkerStore {
   // Only fresh draft claims grant a synchronous start attempt. Unused grants expire, but the SQLite claims remain.
   private readonly pendingFeishuDraftClaims = new Map<string, number>()
   private readonly instructions = new InstructionStore(() => this.db)
+  private readonly documentRecovery = new DocumentRecoveryStore({
+    db: () => this.db,
+    runId: this.#runId,
+    write: operation => this.write(operation),
+    snapshot: operation => this.snapshot(operation),
+    task: taskId => this.task(taskId),
+    hold: task => this.documentRecoveryHold(task),
+    replacementHold: sessionId => this.sessionBound(sessionId) ? 'SESSION_ALREADY_BOUND'
+      : this.frozenSessions.has(sessionId) ? 'PAUSE_UNCONFIRMED' : undefined,
+    transfer: (task, sessionId, commandId) => this.transferTask(task, sessionId, commandId, true),
+  })
   private readonly quota: QuotaStore
   private readonly quotaNotices = new QuotaNoticeStore(() => this.db, this.#runId)
   // The failed capture may not identify a task. Keep this document-wide fence until a new run recovers the dirty marker.
@@ -348,6 +361,7 @@ export class ManagedWorkerStore {
         this.db.exec(FEISHU_DRAFT_SCHEMA)
         this.db.exec(FEISHU_DELIVERY_SCHEMA)
         this.db.exec(SHARED_DOCUMENT_SCHEMA)
+        this.db.exec(DOCUMENT_RECOVERY_SCHEMA)
         this.db.exec(QUOTA_SCHEMA)
         this.db.exec(QUOTA_NOTICE_SCHEMA)
         this.db.exec(WATCHDOG_INDEXES)
@@ -474,6 +488,7 @@ export class ManagedWorkerStore {
         task: id => this.task(id),
         pendingReview: id => this.instructions.hasPending(id),
         frozen: task => this.isFrozen(task),
+        recovery: task => this.documentRecovery.watchdog(task),
       }, exact)
       if (exact && page.entries.length === 0) return deny('NOT_FOUND')
       const quotas = this.quota.observePools().map(({ poolId, current }): WatchdogQuota => {
@@ -1141,14 +1156,37 @@ export class ManagedWorkerStore {
       const blocked = this.authorizationBlocked(task)
       if (blocked) return blocked
       if (this.sessionBound(nextSessionId)) return deny('SESSION_ALREADY_BOUND')
-      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
-      const next = { ...task, workerSessionId: nextSessionId, executionEpoch: expectedEpoch + 1, authorizationVersion: task.authorizationVersion + 1 }
-      requireWrite(this.db.prepare('INSERT INTO managed_session_binding VALUES (?, ?, ?)').run(nextSessionId, taskId, next.executionEpoch).changes)
-      requireWrite(this.db.prepare('UPDATE managed_task SET execution_epoch = ?, authorization_version = ? WHERE task_id = ? AND execution_epoch = ?')
-        .run(next.executionEpoch, next.authorizationVersion, taskId, expectedEpoch).changes)
-      this.audit('transfer', next, commandId, null)
-      return accept(next)
+      return this.transferTask(task, nextSessionId, commandId, false)
     })
+  }
+
+  /** Persist minimal coordinates verified by the Host's live continuation failure observer. */
+  recordDocumentFailure(input: DocumentFailureInput): ManagedResult<DocumentFailure> {
+    return this.documentRecovery.record(input)
+  }
+
+  /** Preview an eligible replacement without spending evidence or authorizing it. */
+  previewDocumentRecovery(taskId: string, evidenceId: string, nextSessionId: string): ManagedResult<{ failure: DocumentFailure; task: ManagedTask }> {
+    return this.documentRecovery.preview(taskId, evidenceId, nextSessionId)
+  }
+
+  /** Apply one native owner confirmation for this exact recovery. The replacement cannot write until separately resumed. */
+  recoverDocument(taskId: string, evidenceId: string, nextSessionId: string, commandId: string, confirmationId: string): ManagedResult<ManagedTask> {
+    return this.documentRecovery.recover(taskId, evidenceId, nextSessionId, commandId, confirmationId)
+  }
+
+  /** Under the caller's write lock, advance the binding and authorization together and append the ordinary transfer audit. */
+  private transferTask(task: ManagedTask, nextSessionId: string, commandId: string, pauseForRecovery: boolean): ManagedResult<ManagedTask> {
+    if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
+    const next = { ...task, workerSessionId: nextSessionId, executionEpoch: task.executionEpoch + 1,
+      authorizationVersion: task.authorizationVersion + 1, paused: pauseForRecovery || task.paused }
+    requireWrite(this.db.prepare('INSERT INTO managed_session_binding VALUES (?, ?, ?)').run(nextSessionId, task.taskId, next.executionEpoch).changes)
+    // Manual transfer never updates the pause column. Recovery must durably pause the new binding before it becomes visible.
+    const pause = pauseForRecovery ? ', paused = 1' : ''
+    requireWrite(this.db.prepare(`UPDATE managed_task SET execution_epoch = ?, authorization_version = ?${pause}
+      WHERE task_id = ? AND execution_epoch = ?`).run(next.executionEpoch, next.authorizationVersion, task.taskId, task.executionEpoch).changes)
+    this.audit('transfer', next, commandId, null)
+    return accept(next)
   }
 
   /** Resume a durably paused task only when its authorization version matches and no unconfirmed pause remains. */
@@ -1356,6 +1394,12 @@ export class ManagedWorkerStore {
 
   private executionBlocked(task: ManagedTask): Rejection | undefined {
     return this.authorizationBlocked(task) ?? (task.paused ? deny('TASK_PAUSED') : undefined)
+  }
+
+  /** Recovery requires an unfinished, unblocked continuation and a Worker with no competing Studio role. */
+  private documentRecoveryHold(task: ManagedTask): string | undefined {
+    if (task.documentVersion !== 1) return 'VERSION_CONFLICT'
+    return this.projectDocumentHold(task) ?? (this.studioSessionBound(task.workerSessionId) ? 'SESSION_ALREADY_BOUND' : undefined)
   }
 
   /** Expose only the blocker code for an unfinished task, never its instructions or approved replacement. */

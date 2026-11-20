@@ -377,6 +377,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/feishu-delivery-store.ts` | Fixes the first route for each combined-inbox delivery and retains those claims across restarts and mode changes |
 | `src/managed-worker/instruction-store.ts` | Preserves Feishu task links, original deliveries and review receipts, including replacements narrowed to a subset of approved changes; pending inputs hold writes even when the listeners are off |
 | `src/managed-worker/document-command.ts` | Owner-only commands for inspecting, creating and editing a shared document, and for selecting a task's exact base revision |
+| `src/managed-worker/document-recovery.ts` | Correlates a verified document continuation with its native terminal error and requests live owner consent to replace that execution once |
+| `src/managed-worker/document-recovery-store.ts` | Pins failure evidence to the current Host, task, execution and authorization; spends it atomically with a paused transfer and audit receipt |
 | `src/managed-worker/shared-document-store.ts` | Immutable shared document revisions, exact task base links, and provenance for owner and Worker writes; a shared commit cannot update only a task's private snapshot |
 | `src/managed-worker/quota.ts` | Stops configured inference pools before adapter dispatch, cancels affected native Agent turns even during retry backoff, and exposes model-free owner controls |
 | `src/managed-worker/quota-store.ts` | Persists one active stop per pool and the owner evidence that clears it; an unconfirmed stop cannot end a Host run cleanly |

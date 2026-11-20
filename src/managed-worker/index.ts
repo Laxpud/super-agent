@@ -13,6 +13,7 @@ import type { AdvisorRoute } from './advisor-store.ts'
 import { AdvisorConfig, StudioAdvisor, advisorSelection, isAdvisorTool } from './advisor.ts'
 import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool, type RestrictedTextRole } from './assistant.ts'
 import { documentStartArgs, sharedDocumentCommand, sharedDocumentCoordinates, sharedDocumentError } from './document-command.ts'
+import { StudioDocumentRecovery } from './document-recovery.ts'
 import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, feishuSourceScope, validateFeishuInbox } from './feishu-inbox.ts'
 import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './feishu-text.ts'
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
@@ -43,6 +44,8 @@ export const Config = s.object({
     .description('Send one system notice per confirmed quota incident to the configured Feishu owner as the verified bot.'),
   watchdog: s.boolean().default(false)
     .description('Expose an owner-only read-only health snapshot of recorded Studio state; no background recovery.'),
+  documentRecovery: s.boolean().default(false)
+    .description('With watchdog, record qualifying document turn failures and allow one owner-confirmed paused replacement.'),
   systemdJobInbox: s.boolean().default(false)
     .description('Allow the owner to attach and check existing local systemd user jobs in a Studio project.'),
   systemdJobPollSeconds: s.number().default(0)
@@ -110,9 +113,10 @@ function receipt(operation: string, result: ManagedResult<ManagedTask>, showResu
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
 export function apply(context: Context, config: Config): void {
   const { stateDir, guiDocumentInbox, advisor, feishuDocumentInbox, feishuTextInbox, quotaPools, quotaFeishuAlerts,
-    watchdog, systemdJobInbox, systemdJobPollSeconds } = config
+    watchdog, documentRecovery, systemdJobInbox, systemdJobPollSeconds } = config
   const ctx = localOwnerHost(context)
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
+  if (documentRecovery && !watchdog) throw new Error('Studio document recovery requires watchdog for evidence lookup')
   const advisoryModel = advisor ? advisorSelection(advisor) : undefined
   if (systemdJobPollSeconds !== 0 && (!systemdJobInbox || !Number.isInteger(systemdJobPollSeconds) || systemdJobPollSeconds < 5 || systemdJobPollSeconds > 300)) {
     throw new Error('Studio job watcher requires systemdJobInbox and a polling interval of 5–300 seconds')
@@ -158,6 +162,8 @@ export function apply(context: Context, config: Config): void {
   const ready = (agent: Agent, role: StudioRole): boolean => available && controlReady(ctx) && currentSession(agent)
     && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
   const channelReady = () => available && controlReady(ctx)
+  const recovery = documentRecovery ? new StudioDocumentRecovery(ctx, store, agent => ready(agent, 'document-worker'),
+    channelReady, channelStop.signal) : undefined
   const quota = new StudioQuotaControl(ctx, store, quotaPools, providerPool, quotaFeishuAlerts)
   const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), ready, provider => quota.denial(provider))
   const advisors = new StudioAdvisor(ctx, store, drafts, advisoryModel, ready, channelStop.signal)
@@ -204,6 +210,7 @@ export function apply(context: Context, config: Config): void {
       await feishuText?.drain()
       await advisors.drain()
       await studies.drain()
+      await recovery?.drain()
       await projectJobs?.drain()
       if (projectJobRun) await projectJobRun
       for (const scope of scopes.values()) scope.dispose()
@@ -295,6 +302,7 @@ export function apply(context: Context, config: Config): void {
     return next()
   })
   for (const agent of ctx.agents.list()) configure(agent)
+  recovery?.install()
 
   if (guiDocumentInbox) captureDocumentInstructions(ctx, store, session => {
     if (!available || !controlReady(ctx)) return false
@@ -307,7 +315,8 @@ export function apply(context: Context, config: Config): void {
   ctx.effect(() => ctx.commands.register({
     name: 'studio-doc',
     description: 'Manage a document task in this managed worker Session.',
-    input: { hint: 'doc-new <JSON> | doc-read <document-id> [revision] | doc-save <JSON> | start <JSON> | status | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review [<instruction-id> <authorization-version> <unchanged|pause>] | narrow <JSON> | continue <authorization-version> | feishu-status | bind-feishu' },
+    input: { hint: 'doc-new <JSON> | doc-read <document-id> [revision] | doc-save <JSON> | start <JSON> | status | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review [<instruction-id> <authorization-version> <unchanged|pause>] | narrow <JSON> | continue <authorization-version> | feishu-status | bind-feishu'
+      + (recovery ? ' | recover <task-id> <evidence-id>' : '') },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()
@@ -315,7 +324,8 @@ export function apply(context: Context, config: Config): void {
       if (!ready(agent, 'document-worker')) return rejected('MANAGED_SESSION_REQUIRED')
       if (rawInput.length > TEXT_LIMIT * 12 + 128) return rejected('INPUT_TOO_LARGE')
       const [, verb, argument = ''] = /^\s*(\S+)(?:\s+([\s\S]*))?$/.exec(rawInput.trim()) ?? []
-      // Only explicit continuation wakes the Worker. Review and other control commands commit without cancelling the active turn.
+      // Only explicit continuation wakes the Worker. Review, replacement, and other controls do not cancel the old turn.
+      if (verb === 'recover') return recovery ? recovery.command(agent, argument, commandId, signal) : rejected('DOCUMENT_RECOVERY_DISABLED')
       if (verb === 'continue') return continueDocument(delivery, store, agent, argument, signal, () => ready(agent, 'document-worker'))
       if (verb === 'review' && !argument) return reviewDocumentIntent(store, agent, commandId, signal, channelStop.signal, () => ready(agent, 'document-worker'))
       // Keep review available even after capture is disabled; toggling the listener must not clear a durable pending hold.

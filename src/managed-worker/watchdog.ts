@@ -33,7 +33,11 @@ function documentHealth(entry: WatchdogDocument, captureUnconfirmed: boolean, ob
     if (captureUnconfirmed) facts.push('Instruction capture unconfirmed; writes held.')
     if (entry.pauseUnconfirmed) facts.push('Pause could not be confirmed; writes held.')
     if (entry.shared && entry.shared.baseVersion !== entry.shared.headVersion) facts.push('Shared document conflict; the old revision cannot be written.')
-    if (!entry.paused && !entry.pendingReview && !captureUnconfirmed && !entry.pauseUnconfirmed
+    if (entry.recovery) {
+      const { evidenceId, turn, failureEventSeq } = entry.recovery
+      facts.push(`Recovery evidence ${evidenceId}: current continuation ended with TRANSPORT (turn ${turn}, event ${failureEventSeq}).`,
+        `To consider a paused replacement, open an unbound document Worker and use /studio-doc recover ${entry.id} ${evidenceId}.`)
+    } else if (!entry.paused && !entry.pendingReview && !captureUnconfirmed && !entry.pauseUnconfirmed
       && (!entry.shared || entry.shared.baseVersion === entry.shared.headVersion)) facts.push('Awaiting the current authorized document action.')
   }
   facts.push(observedSession('Current Worker', entry.sessionId, observe))
