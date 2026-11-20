@@ -10,12 +10,14 @@ import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type St
 import { PROJECT_JOB_AUTO_SCHEMA } from './project-job-auto-store.js'
 import { PROJECT_JOB_SCHEMA } from './project-job-store.js'
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
+import { QUOTA_NOTICE_SCHEMA, QuotaNoticeStore, isQuotaNoticeMessageId, type StudioQuotaNotice } from './quota-notice-store.js'
 import { QUOTA_SCHEMA, QuotaStore, type StudioQuotaIncident } from './quota-store.js'
 import { SHARED_DOCUMENT_SCHEMA, appendSharedRevision, readSharedRevision,
   type SharedDocumentRevision, type SharedDocumentTask } from './shared-document-store.js'
 
 export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
 export type { StudioFeishuInstruction } from './instruction-store.js'
+export type { StudioQuotaNotice } from './quota-notice-store.js'
 export type { StudioQuotaIncident, StudioQuotaReason } from './quota-store.js'
 export type { SharedDocumentRevision } from './shared-document-store.js'
 
@@ -297,6 +299,7 @@ export class ManagedWorkerStore {
   private readonly feishuDrafts = new FeishuDraftStore(() => this.db, this.#runId, isDraftText)
   private readonly instructions = new InstructionStore(() => this.db)
   private readonly quota: QuotaStore
+  private readonly quotaNotices = new QuotaNoticeStore(() => this.db, this.#runId)
   // The failed capture may not identify a task. Keep this document-wide fence until a new run recovers the dirty marker.
   private captureFault = false
   private closed = false
@@ -305,8 +308,9 @@ export class ManagedWorkerStore {
   readonly projects: ProjectStore
 
   /** Open the database under the host directory lock. Do not enable actions until the recovery transaction has committed. */
-  constructor(path: string, quotaPoolIds: readonly string[] = []) {
+  constructor(path: string, quotaPoolIds: readonly string[] = [], private readonly quotaNoticeScope?: string) {
     if (!isId(path) || path === ':memory:') throw new Error('Managed Worker requires a persistent SQLite path')
+    if (quotaNoticeScope !== undefined && !isId(quotaNoticeScope)) throw new Error('Invalid Studio quota notice scope')
     this.quota = new QuotaStore(quotaPoolIds, () => this.db, operation => this.write(operation), operation => this.snapshot(operation))
     const file = resolve(path)
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
@@ -327,6 +331,8 @@ export class ManagedWorkerStore {
         this.db.exec(FEISHU_DRAFT_SCHEMA)
         this.db.exec(SHARED_DOCUMENT_SCHEMA)
         this.db.exec(QUOTA_SCHEMA)
+        this.db.exec(QUOTA_NOTICE_SCHEMA)
+        this.quotaNotices.recoverSending()
         const previous = this.db.prepare('SELECT clean FROM managed_host_run WHERE singleton = 1').get()
         // Unlike document recovery, a previously unrecorded Host run is not evidence of an unconfirmed quota stop.
         this.quota.start(previous !== undefined && previous.clean !== 1)
@@ -426,6 +432,30 @@ export class ManagedWorkerStore {
   /** Persist the Host-authenticated owner's confirmation for exactly this active incident. This does not resume any task. */
   restoreQuota(poolId: string, incidentId: string, sessionId: string, commandId: string, evidence: string): ManagedResult<StudioQuotaIncident> {
     return this.quota.restore(poolId, incidentId, sessionId, commandId, evidence)
+  }
+
+  /** Allow a send only after committing the sole attempt for this exact active, confirmed quota incident. */
+  claimQuotaNotice(poolId: string, incidentId: string, scope: string): ManagedResult<{ claimed: boolean }> {
+    if (!isId(incidentId) || !isId(scope)) return deny('INVALID_INPUT')
+    if (this.quotaNoticeScope !== scope) return deny('QUOTA_NOTICE_SCOPE_NOT_CONFIGURED')
+    // Read the quota store's memory and SQLite fences before opening the notice write transaction.
+    const current = this.quotaStatus(poolId)
+    if (!current.ok) return current
+    if (current.value?.incidentId !== incidentId || current.value.reason !== 'ACCOUNT_QUOTA') return deny('STALE_QUOTA_INCIDENT')
+    return this.write(() => this.quotaNotices.claim(poolId, incidentId, scope))
+  }
+
+  /** Keep the confirmed receipt, or record an unknown outcome without authorizing another attempt. */
+  settleQuotaNotice(incidentId: string, scope: string, messageId?: string): ManagedResult<StudioQuotaNotice> {
+    if (!isId(incidentId) || !isId(scope) || (messageId !== undefined && !isQuotaNoticeMessageId(messageId))) return deny('INVALID_INPUT')
+    if (this.quotaNoticeScope !== scope) return deny('QUOTA_NOTICE_SCOPE_NOT_CONFIGURED')
+    return this.write(() => this.quotaNotices.settle(incidentId, scope, messageId))
+  }
+
+  /** Read retained notice state in this profile without exposing the destination or limiting visibility to the current scope. */
+  quotaNoticeStatus(incidentId: string): ManagedResult<StudioQuotaNotice | undefined> {
+    if (!isId(incidentId)) return deny('INVALID_INPUT')
+    return this.snapshot(() => accept(this.quotaNotices.status(incidentId)))
   }
 
   /** Read the durable Session binding. Return undefined only for an unbound Session; throw on storage errors so callers cannot treat the Session as unmanaged. */

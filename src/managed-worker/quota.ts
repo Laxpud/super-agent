@@ -37,7 +37,18 @@ export class StudioQuotaControl {
   private readonly attempts = new Map<Agent, Attempt>()
 
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore,
-    private readonly pools: readonly StudioQuotaPoolConfig[], private readonly providerPool: ReadonlyMap<string, string>) {}
+    private readonly pools: readonly StudioQuotaPoolConfig[], private readonly providerPool: ReadonlyMap<string, string>,
+    private readonly feishuAlerts: boolean) {}
+
+  /** Report what the channel confirmed, without performing a new send or an inference call. */
+  private noticeStatus(incidentId: string): string {
+    const result = this.store.quotaNoticeStatus(incidentId)
+    if (!result.ok) return '\nFeishu owner notice: delivery state could not be confirmed.'
+    const notice = result.value
+    if (!notice) return this.feishuAlerts ? '\nFeishu owner notice: no attempt yet; waiting for the verified channel.' : ''
+    if (notice.state === 'delivered') return `\nFeishu owner notice: confirmed (${notice.messageId}).`
+    return `\nFeishu owner notice: ${notice.state === 'sending' ? 'attempt recorded, no delivery receipt yet' : 'delivery unconfirmed'}. No automatic resend.`
+  }
 
   /** Return a stable check for both new dispatch and model attempts; unknown routes are not part of the configured pool. */
   denial(provider: string): string | undefined {
@@ -138,6 +149,7 @@ export class StudioQuotaControl {
         const { incidentId, reason, noticedAt, provider, model, sessionId: affected } = status.value
         return `${id}: stopped; waiting for recovery confirmation. ${routes}\nIncident ${incidentId}: ${reason}, ${noticedAt}.`
           + (provider && model ? ` Observed at ${provider}/${model}${affected ? ` in Session ${affected}` : ''}.` : '')
+          + (reason === 'ACCOUNT_QUOTA' ? this.noticeStatus(incidentId) : '')
       })
       return { kind: 'success', text: `Studio quota status (no model calls)\n\n${lines.join('\n\n')}` }
     }

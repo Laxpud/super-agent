@@ -18,6 +18,7 @@ import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
 import { StudioProjectJobMonitor } from './project-job-monitor.ts'
 import { StudioProjectJobControl } from './project-job.ts'
 import { LEADER_PRESET, StudioProjectControl, isLeaderTool } from './project.ts'
+import { StudioQuotaNotices } from './quota-notices.ts'
 import { QuotaPoolConfig, StudioQuotaControl, quotaProviderMap } from './quota.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
 
@@ -32,6 +33,8 @@ export const Config = s.object({
     .description('Optional single-owner Feishu inbox for explicit text tasks. Do not enable it together with the document inbox.'),
   quotaPools: s.array(QuotaPoolConfig).default([])
     .description('Explicit provider IDs that share each inference quota pool; empty disables the quota gate.'),
+  quotaFeishuAlerts: s.boolean().default(false)
+    .description('Send one system notice per confirmed quota incident to the configured Feishu owner as the verified bot.'),
   systemdJobInbox: s.boolean().default(false)
     .description('Allow the owner to attach and check existing local systemd user jobs in a Studio project.'),
   systemdJobPollSeconds: s.number().default(0)
@@ -98,7 +101,7 @@ function receipt(operation: string, result: ManagedResult<ManagedTask>, showResu
 
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
 export function apply(context: Context, config: Config): void {
-  const { stateDir, guiDocumentInbox, feishuDocumentInbox, feishuTextInbox, quotaPools, systemdJobInbox, systemdJobPollSeconds } = config
+  const { stateDir, guiDocumentInbox, feishuDocumentInbox, feishuTextInbox, quotaPools, quotaFeishuAlerts, systemdJobInbox, systemdJobPollSeconds } = config
   const ctx = localOwnerHost(context)
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
   if (systemdJobPollSeconds !== 0 && (!systemdJobInbox || !Number.isInteger(systemdJobPollSeconds) || systemdJobPollSeconds < 5 || systemdJobPollSeconds > 300)) {
@@ -109,11 +112,14 @@ export function apply(context: Context, config: Config): void {
   const feishuConfig = feishuDocumentInbox ?? feishuTextInbox
   if (feishuConfig) validateFeishuInbox(feishuConfig)
   if (feishuTextInbox) validateFeishuTextRoute(feishuTextInbox)
+  if (quotaFeishuAlerts && (!feishuConfig || !quotaPools.length)) throw new Error('Studio quota notices require a dedicated Feishu inbox and quota pools')
+  const quotaNoticeScope = quotaFeishuAlerts && feishuConfig ? feishuSourceScope(feishuConfig) : undefined
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   let available = true
   const channelStop = new AbortController()
   let channelRun: Promise<void> | undefined
   let projectJobRun: Promise<void> | undefined
+  let quotaNoticeRun: Promise<void> | undefined
   // Reserve the directory for one host. The SQLite run fence also rejects commits from a prior holder of the lock.
   const unlock = lockSync(stateDir, { stale: 30_000, onCompromised(error) {
     available = false
@@ -121,7 +127,7 @@ export function apply(context: Context, config: Config): void {
     ctx.logger.error('Managed Worker lost its state directory lock: %s', String(error))
   } })
   let store: ManagedWorkerStore
-  try { store = new ManagedWorkerStore(join(stateDir, 'managed-worker.sqlite'), quotaPools.map(pool => pool.id)) }
+  try { store = new ManagedWorkerStore(join(stateDir, 'managed-worker.sqlite'), quotaPools.map(pool => pool.id), quotaNoticeScope) }
   catch (error) { unlock(); throw error }
   if (feishuTextInbox && !store.feishuDraftScopeAvailable(feishuSourceScope(feishuTextInbox))) {
     // Do not reinterpret messages from a chat previously bound to a document.
@@ -140,7 +146,7 @@ export function apply(context: Context, config: Config): void {
   const ready = (agent: Agent, role: StudioRole): boolean => available && controlReady(ctx) && currentSession(agent)
     && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
   const channelReady = () => available && controlReady(ctx)
-  const quota = new StudioQuotaControl(ctx, store, quotaPools, providerPool)
+  const quota = new StudioQuotaControl(ctx, store, quotaPools, providerPool, quotaFeishuAlerts)
   const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), agent => ready(agent, 'draft-worker'),
     provider => quota.denial(provider))
   const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts, provider => providerPool.get(provider))
@@ -154,6 +160,8 @@ export function apply(context: Context, config: Config): void {
   const delivery = new AgentDelivery(ctx)
   const feishuText = feishuTextInbox ? new StudioFeishuText(store, drafts, feishuTextInbox, channelStop.signal, channelReady) : undefined
   const feishu = feishuConfig && new StudioFeishuInbox(ctx, store, stateDir, feishuConfig, channelReady, feishuText)
+  const quotaNotices = quotaFeishuAlerts && feishu ? new StudioQuotaNotices(store, quotaPools, () => feishu.noticeDestination(),
+    () => ctx.logger.warn('Studio Feishu quota notice delivery was not confirmed; check /studio-quota status')) : undefined
 
   /** A persisted binding wins over the picker, so a retired or finished Worker cannot become a different role on resume. */
   function roleOf(agent: Agent): StudioRole | undefined {
@@ -174,8 +182,9 @@ export function apply(context: Context, config: Config): void {
     drafts.stop()
     permits.clear()
     try {
-      // Drain pending lookups and text work before closing the Store. External jobs are not owned by this Host.
+      // Drain channel attempts, lookups, and text work before closing the Store. External jobs are not owned by this Host.
       if (channelRun) await channelRun
+      if (quotaNoticeRun) await quotaNoticeRun
       await feishuText?.drain()
       await projectJobs?.drain()
       if (projectJobRun) await projectJobRun
@@ -382,6 +391,7 @@ export function apply(context: Context, config: Config): void {
     },
   }))
   if (feishu) channelRun = feishu.run(channelStop.signal)
+  if (quotaNotices) quotaNoticeRun = ctx.agents.withoutInitiator(() => quotaNotices.run(channelStop.signal))
   if (jobMonitor) projectJobRun = ctx.agents.withoutInitiator(() => jobMonitor.run(channelStop.signal))
   ctx.logger.info('SuperAgent Studio ready (no GitHub source)')
 }

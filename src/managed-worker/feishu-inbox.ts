@@ -21,6 +21,15 @@ const threadId = /^omt?_[a-zA-Z0-9_-]+$/
 const MAX_TEXT = 32_000
 const MAX_REPLIES = 4
 const exec = promisify(execFile)
+const noticeReceipt = z.object({ ok: z.literal(true), data: z.object({
+  message_id: z.string().regex(messageId), chat_id: z.string().regex(chatId),
+}) })
+
+/** A local capability for an already verified bot and its configured owner, not a freely routed transport. */
+export interface StudioFeishuNoticeDestination {
+  scope: string
+  send(text: string, key: string): Promise<string | undefined>
+}
 
 export interface FeishuInboxConfig {
   cli: string
@@ -69,6 +78,7 @@ export class StudioFeishuInbox {
   private state = 'waiting for the bot connection'
   private readonly scope: string
   private readonly replies = new Set<Promise<void>>()
+  private noticeChannel: { bot: FeishuBot; signal: AbortSignal } | undefined
 
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore, private readonly stateDir: string,
     private readonly config: FeishuInboxConfig, private readonly allowed: () => boolean, private readonly text?: StudioFeishuText) {
@@ -76,6 +86,19 @@ export class StudioFeishuInbox {
   }
 
   status(): string { return `Studio Feishu inbox: ${this.state}. Mode: ${this.text ? 'text tasks' : 'document review'}.` }
+
+  /** Notices are DM-only, use the configured owner's open_id, and cannot inherit a recipient from the inbox. */
+  noticeDestination(): StudioFeishuNoticeDestination | undefined {
+    const channel = this.noticeChannel
+    if (!channel || channel.signal.aborted || !this.allowed()) return
+    return { scope: this.scope, send: async (text, key) => {
+      if (this.noticeChannel !== channel || channel.signal.aborted || !this.allowed()) return
+      const output = await runCli(channel.bot.cli, ['im', '+messages-send', '--user-id', this.config.ownerOpenId,
+        '--text', text, '--idempotency-key', key, '--as', 'bot', '--format', 'json'], channel.signal)
+      const result = noticeReceipt.safeParse(JSON.parse(output))
+      if (result.success && result.data.data.chat_id === this.config.chatId) return result.data.data.message_id
+    } }
+  }
 
   /** The command authorizes one link, not a change to the task or permission to send another action. */
   bind(sessionId: string, commandId: string): ManagedResult<ManagedTask> {
@@ -107,8 +130,16 @@ export class StudioFeishuInbox {
         if (!this.allowed()) continue
         this.state = 'waiting for the bot connection'
         await consumeFeishuEvents(bot.cli, active, {
-          ready: () => { this.listening = true; this.state = 'listening for the configured private chat' },
-          problem: () => { this.state = 'the bot listener reported a problem'; this.ctx.logger.warn('Studio Feishu listener reported a problem') },
+          ready: () => {
+            this.listening = true
+            this.noticeChannel = { bot, signal: active }
+            this.state = 'listening for the configured private chat'
+          },
+          problem: () => {
+            this.noticeChannel = undefined
+            this.state = 'the bot listener reported a problem'
+            this.ctx.logger.warn('Studio Feishu listener reported a problem')
+          },
           receive: value => this.receive(bot, value, active),
         })
       } catch {
@@ -118,6 +149,7 @@ export class StudioFeishuInbox {
         }
       } finally {
         this.listening = false
+        this.noticeChannel = undefined
         connection.abort()
         await Promise.all(this.replies)
       }
