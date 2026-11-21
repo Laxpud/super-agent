@@ -12,6 +12,15 @@ export interface StudioFeishuDraftTask extends StudioDraftExecution {
   failure?: string
 }
 
+/** Locate a saved task without reading the original request or its result. */
+export interface StudioFeishuDraftHeader {
+  taskId: string
+  messageId: string
+  sentAt: string
+  state: StudioFeishuDraftTask['state']
+}
+
+export const FEISHU_DRAFT_LIST_LIMIT = 8
 export const FEISHU_DRAFT_SCHEMA = `
   CREATE TABLE IF NOT EXISTS studio_feishu_draft (
     task_id TEXT PRIMARY KEY NOT NULL,
@@ -52,6 +61,8 @@ export type FeishuDraftSource = StudioFeishuInstruction & { text: string; eventS
 const isId = (value: unknown): value is string => typeof value === 'string' && value.length > 0
   && value.isWellFormed() && !value.includes('\0')
 const isCoordinate = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+const isDraftState = (value: unknown): value is StudioFeishuDraftTask['state'] =>
+  value === 'running' || value === 'completed' || value === 'failed' || value === 'interrupted'
 const optionalId = (value: string | undefined): boolean => value === undefined || isId(value)
 
 /** Validate and copy a delivery without trimming or substituting the retained source text. */
@@ -127,6 +138,19 @@ export class FeishuDraftStore {
     return row && this.readRow(row)
   }
 
+  /** Page one private chat by original send time, using the scope/time index without opening any bodies. */
+  recent(scope: string): StudioFeishuDraftHeader[] {
+    return this.database().prepare(`SELECT task_id, message_id, source_time_ms, state FROM studio_feishu_draft
+      WHERE source_scope = ? ORDER BY source_time_ms DESC, rowid DESC LIMIT ?`).all(scope, FEISHU_DRAFT_LIST_LIMIT).map(row => {
+      const { task_id: taskId, message_id: messageId, source_time_ms: sourceTimeMs, state } = row
+      const sentAt = isCoordinate(sourceTimeMs) ? new Date(sourceTimeMs).toJSON() : null
+      if (!isId(taskId) || !isId(messageId) || typeof sentAt !== 'string' || !isDraftState(state)) {
+        throw new Error('Invalid Studio Feishu draft header')
+      }
+      return { taskId, messageId, sentAt, state }
+    })
+  }
+
   /** Keep the role even after the execution is no longer eligible to run. */
   binding(workerSessionId: string): StudioDraftExecution | undefined {
     const row = this.database().prepare('SELECT task_id, execution_epoch FROM studio_feishu_draft WHERE worker_session_id = ?')
@@ -166,7 +190,7 @@ export class FeishuDraftStore {
       source_time_ms: sourceTimeMs, sender_id: senderId, text, parent_id: parentId, root_id: rootId, thread_id: threadId,
       result_text: resultText, result_message_id: resultMessageId, result_event_seq: resultEventSeq, result_turn: resultTurn, failure } = row
     if (!isId(taskId) || !isId(workerBotId) || !isId(workerSessionId) || executionEpoch !== 1
-      || (state !== 'running' && state !== 'completed' && state !== 'failed' && state !== 'interrupted')
+      || !isDraftState(state)
       || channel !== 'feishu' || !isId(sourceScope) || !isId(requestId) || messageId !== requestId || eventSeq !== null
       || !isCoordinate(sourceTimeMs) || !isId(senderId) || !this.isDraftText(text) || text.includes('\0')
       || (parentId !== null && !isId(parentId)) || (rootId !== null && !isId(rootId)) || (threadId !== null && !isId(threadId))) {

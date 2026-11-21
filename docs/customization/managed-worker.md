@@ -447,6 +447,8 @@ Studio 只把 CLI 明确标为 `text` 的消息正文当作纯文字输入。富
 2. Worker 只收到前缀后的文字，不具备工具、文档写入权或外部操作权限。Studio 保存原文和结果出处，再尝试以[纯文字回复](<https://github.com/larksuite/cli/blob/main/skills/lark-im/references/lark-im-messages-reply.md>)发送，不解析结果里的图片地址或下载内容。超出回复限制时给出取回方式。
 3. 在同一私聊发 `result <任务ID>`，或在任何 **SuperAgent Studio Assistant** 会话用 `/studio-result <任务ID>`，无需再次调用模型。会话结束或宿主重启后仍可取回已保存结果；中断的任务不会自动重做。
 
+**没收到回复、也不知道任务 ID？** 在 **SuperAgent Studio Assistant** Web 会话用 `/studio-result feishu`。它按消息发送时间（UTC）倒序列出当前配置私聊中最多 8 个已保存的文字任务。按时间和原消息 ID 核对，复制对应的 `/studio-result <任务ID>` 取回。列表不含正文，也不能确认机器人回复是否送达。查不到不等于原消息未被处理，不要仅凭此重发。
+
 无论是否兼顾文档更正，Studio 都先按消息 ID 登记文字命令，再检查参数、额度和 Worker 是否空闲。已登记的消息重投不会变成新指令，重启或切换模式也不例外。旧版纯文字模式未登记的拒绝不在这项保护内。
 
 #### 同一个私聊兼顾文档更正

@@ -22,7 +22,7 @@ import type { DocumentGuardCapture } from './document-guard-store.ts'
 import { DOCUMENT_GUARD_HINT, documentGuardCommand, documentGuardFeedback } from './document-guard.ts'
 import { StudioDocumentRecovery } from './document-recovery.ts'
 import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, feishuSourceScope, validateFeishuInbox } from './feishu-inbox.ts'
-import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './feishu-text.ts'
+import { StudioFeishuText, feishuDraftOutput, feishuDraftsCommand, validateFeishuTextRoute } from './feishu-text.ts'
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
 import { MEMORY_COMMAND, MEMORY_HINT, memoryCommand } from './memory.ts'
 import { currentOwnerInboxInput } from './owner-inbox-input.ts'
@@ -478,14 +478,17 @@ export function apply(context: Context, config: Config): void {
   }))
   ctx.effect(() => ctx.commands.register({
     name: 'studio-result',
-    description: 'Read a Studio Worker result without running a model.',
-    input: { hint: '[task-id]' },
+    description: 'Read a Studio Worker result or find recent Feishu tasks without running a model.',
+    input: { hint: '[task-id | feishu]' },
     recordInput: false,
     handler({ agent, rawInput, signal }) {
       signal.throwIfAborted()
       if (!ready(agent, 'assistant')) return { kind: 'error', text: 'Open a Studio Assistant Session to read Studio results.' }
       const id = rawInput.trim()
-      if (id && !z.uuid().safeParse(id).success) return { kind: 'error', text: 'Expected one Studio task ID, or no ID for the latest task in this Session.' }
+      if (id === 'feishu') return feishuDraftsCommand(store)
+      if (id && !z.uuid().safeParse(id).success) {
+        return { kind: 'error', text: 'Use /studio-result [task-id] to read a result, or /studio-result feishu to find recent Feishu tasks.' }
+      }
       const result = store.readDraft(agent.id, id || undefined, memory)
       if (result.ok) return { kind: 'success', text: draftOutput(result.value, memory).text }
       // The no-ID lookup still selects only an ordinary draft in this Session. Studies and Feishu require their durable IDs.

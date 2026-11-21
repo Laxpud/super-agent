@@ -19,7 +19,7 @@ import { parseDraftPreference } from './draft-preference-request.js'
 import { DRAFT_PREFERENCE_SCHEMA, appendDraftPreference, currentDraftCitation, draftPreferenceText, pinnedDraftPreference,
   type StudioDraftPreference } from './draft-preference-store.js'
 import { FEISHU_DELIVERY_SCHEMA, FeishuDeliveryStore, feishuDeliveryCoordinates } from './feishu-delivery-store.js'
-import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFeishuDraftTask } from './feishu-draft-store.js'
+import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFeishuDraftHeader, type StudioFeishuDraftTask } from './feishu-draft-store.js'
 import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
   type StudioFeishuInstruction, type StudioInstructionInput } from './instruction-store.js'
 import { MEMORY_CITATION_SCHEMA } from './memory-citation-store.js'
@@ -920,6 +920,14 @@ export class ManagedWorkerStore {
     return this.snapshot(() => {
       const task = this.feishuDrafts.read(taskId, scope)
       return task ? accept(task) : deny('TASK_NOT_FOUND')
+    })
+  }
+
+  /** The owner can recover a lost task ID from the configured chat's saved headers, even while the bot is offline. */
+  recentFeishuDrafts(): ManagedResult<StudioFeishuDraftHeader[]> {
+    return this.snapshot(() => {
+      const scope = this.feishuText?.scope
+      return scope === undefined ? deny('FEISHU_TEXT_SCOPE_REQUIRED') : accept(this.feishuDrafts.recent(scope))
     })
   }
 

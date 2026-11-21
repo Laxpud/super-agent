@@ -266,7 +266,7 @@ export class StudioFeishuInbox {
     const pending = runCli(bot.cli, ['im', '+messages-reply', '--message-id', target, '--text', text,
       '--reply-in-thread', '--idempotency-key', `studio-${key}`, '--as', 'bot', '--format', 'json'], signal).then(output => {
       if (!z.object({ ok: z.literal(true) }).safeParse(JSON.parse(output)).success) throw new Error('Feishu reply was not confirmed')
-    }).catch(() => { if (!signal.aborted) this.ctx.logger.warn('Studio Feishu receipt was not confirmed; consult the Web inbox') })
+    }).catch(() => { if (!signal.aborted) this.ctx.logger.warn('Studio Feishu receipt was not confirmed; check the saved state in Studio Web') })
       .finally(() => { this.replies.delete(pending) })
     this.replies.add(pending)
   }

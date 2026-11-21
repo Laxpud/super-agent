@@ -4,6 +4,7 @@ import { isAbsolute } from 'node:path'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { draftOutput, type StudioAssistant } from './assistant.ts'
+import { FEISHU_DRAFT_LIST_LIMIT } from './feishu-draft-store.ts'
 import { DRAFT_TEXT_LIMIT, type ManagedWorkerStore, type StudioFeishuDraftTask, type StudioFeishuInstruction } from './store.ts'
 
 export interface FeishuTextRoute {
@@ -24,6 +25,18 @@ const taskId = z.uuid()
 
 export function feishuDraftOutput(task: StudioFeishuDraftTask): string {
   return `From Feishu message ${task.source.messageId}.\n${draftOutput(task).text}`
+}
+
+/** Help the owner locate a task after an unconfirmed reply, without making a delivery or retry decision. */
+export function feishuDraftsCommand(store: ManagedWorkerStore): { kind: 'success' | 'error'; text: string } {
+  const result = store.recentFeishuDrafts()
+  if (!result.ok) return { kind: 'error', text: result.reason === 'FEISHU_TEXT_SCOPE_REQUIRED'
+    ? 'No Feishu text inbox is configured. If you know the task ID, use /studio-result <task-id>.'
+    : `Could not confirm saved Feishu tasks (${result.reason}).` }
+  if (!result.value.length) return { kind: 'success', text: 'No saved text tasks for the configured Feishu private chat. This does not confirm whether your message arrived. Do not resend based on this check alone.' }
+  const lines = result.value.map(task => `${task.sentAt} | Feishu message ${task.messageId} | execution ${task.state} | /studio-result ${task.taskId}`)
+  return { kind: 'success', text: [`Saved Feishu text tasks for the configured private chat (up to ${FEISHU_DRAFT_LIST_LIMIT}, newest message first, time in UTC):`,
+    ...lines, 'Use the matching command to check the task or read its saved result. These records do not confirm Feishu reply delivery.'].join('\n') }
 }
 
 function resultReply(task: StudioFeishuDraftTask): string {
