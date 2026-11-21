@@ -407,7 +407,10 @@ Assistant 和工具卡只显示回执。用 `/studio-result <任务ID>` 取回�
 
 ### 飞书私聊登记
 
-飞书入口默认关闭，可在隔离 profile 的 Studio 宿主 `config` 中加以下配置。使用专供 Studio 的可信机器人 CLI，不把凭据写入配置。CLI 必须限制为 `bot` 身份；不要让原型的飞书 Source 同时消费这个机器人的事件。Studio 在连接前核对应用和机器人 ID，只收下面指定人发到指定私聊的消息，不接受群消息或机器人消息。
+飞书入口默认关闭。试用时使用单独的 Studio profile、专用的飞书自建应用和测试私聊。Studio 当前只接受飞书（`feishu`）的机器人，不接受国际版 Lark 机器人。
+
+- 在开放平台启用机器人，以应用身份通过[长连接](<https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-/request-url-configuration-case.md>)订阅[接收消息](<https://open.feishu.cn/document/server-docs/im-v1/message/events/receive>)（`im.message.receive_v1`），发布应用使配置生效。准备私聊收件权限 `im:message.p2p_msg:readonly` 和机器人发件权限 `im:message:send_as_bot`，让测试所有者能与该机器人私聊；不需要给 Studio 开群消息权限。权限和事件参数按 [`lark-cli v1.0.90` 的事件注册](<https://github.com/larksuite/cli/blob/v1.0.90/events/im/register.go#L16-L29>)及[发件定义](<https://github.com/larksuite/cli/blob/v1.0.90/shortcuts/im/im_messages_send.go#L17-L36>)核对，尚未验证真实收发。
+- 在宿主 `config` 中用绝对路径指向已配置好的专用 CLI。用同一入口检查 `config strict-mode` 显示 `strict-mode: bot`，不要把密钥或令牌写入 Studio 配置。若不确定 `ownerOpenId`、`chatId`，在没有其他监听者时，按[官方限时监听示例](<https://github.com/larksuite/cli/blob/v1.0.90/skills/lark-event/SKILL.md#L48-L49>)用该 CLI 读取一条自己的测试私聊事件，核对 `sender_id` 和 `chat_id`。不要取其他应用的 ID，也不要让原型的飞书 Source 与 Studio 同时消费这个机器人的事件。Studio 先核对应用和机器人，只收指定所有者发到该私聊的消息。
 
 ```yaml
 feishuDocumentInbox:
@@ -418,9 +421,11 @@ feishuDocumentInbox:
   chatId: oc_studiochat
 ```
 
-1. 在文档 Worker 会话用 `/studio-doc feishu-status` 确认正在监听。在当前待写任务的 Worker 会话用 `/studio-doc bind-feishu` 绑定。绑定随任务保留，换 Worker 不改变归属；已经绑定的私聊和任务均不能改指到另一个对象。
+1. 在文档 Worker 会话用 `/studio-doc feishu-status` 核对监听状态。`listening` 只表示 CLI 已进入监听，不能证明这个私聊已能收发。要接收文档指令，再在当前待写任务的 Worker 会话用 `/studio-doc bind-feishu` 绑定。绑定随任务保留，换 Worker 不改变归属；已经绑定的私聊和任务均不能改指到另一个对象。
 2. 从指定私聊发送更正。未绑定时不猜任务；回执只确认消息已登记、文档写入暂被阻止，不代表新指令已经生效。若未收到回执，可在当前 Worker 会话用 `/studio-doc inbox` 核实，不必重发。更正消息不会直接唤起 Worker 或启动工作。
 3. GUI 和飞书共用同一待核对列表。相同飞书消息只登记一次。若发送时间早于同一私聊已登记的消息，或顺序无法核实，Web 的 `/studio-doc inbox` 会提示人工核对；无参数的 `/studio-doc review` 不适用于这条消息。飞书私聊内的时间不能确定它与 Web 指令的先后，迟到也不会改变已确认的范围。核对原消息后，只有确认仍按现行范围继续时才选 `unchanged`；不确定时选 `pause`。核对本身不写入文档。
+
+Studio 只把 CLI 明确标为 `text` 的消息正文当作纯文字输入。富文本、附件或类型不明的消息不会派工、取回成果或启动续做。若私聊已绑定文档且启用了文档收件，只登记消息来源（包括可用的父消息 ID）并阻止写入，等待所有者回到原私聊核对。只启用文字入口时忽略这类消息。
 
 此入口只监听实时送到 CLI 的事件，不补收断线期间的历史；已登记消息的阻断不依赖飞书连接仍在线。
 

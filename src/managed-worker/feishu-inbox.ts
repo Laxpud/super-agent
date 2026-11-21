@@ -22,6 +22,12 @@ const threadId = /^omt?_[a-zA-Z0-9_-]+$/
 const MAX_TEXT = 32_000
 const MAX_REPLIES = 4
 const exec = promisify(execFile)
+
+// Use only the coordinates and payload Studio needs. The CLI omits empty content and may omit individual mention fields.
+const liveMessage = FeishuEventSchema.pick({ message_id: true, chat_id: true, chat_type: true, sender_id: true,
+  sender_type: true, create_time: true, parent_id: true, root_id: true, thread_id: true }).extend({
+  message_type: z.string().optional(), content: z.string().optional(), reply_to: z.string().optional(),
+})
 const noticeReceipt = z.object({ ok: z.literal(true), data: z.object({
   message_id: z.string().regex(messageId), chat_id: z.string().regex(chatId),
 }) })
@@ -174,7 +180,7 @@ export class StudioFeishuInbox {
   /** Record synchronously, before starting any outbound receipt or allowing the next event to run. */
   private receive(bot: FeishuBot, value: unknown, signal: AbortSignal): void {
     if (signal.aborted || !this.allowed()) return
-    const event = FeishuEventSchema.safeParse(value)
+    const event = liveMessage.safeParse(value)
     if (!event.success) throw new Error('Unrecognized Feishu message event')
     const data = event.data
     if (data.chat_type !== 'p2p' || data.chat_id !== this.config.chatId || data.sender_type !== 'user' || data.sender_id !== this.config.ownerOpenId) return
@@ -183,10 +189,15 @@ export class StudioFeishuInbox {
     if (!messageId.test(data.message_id) || !/^\d{13}$/.test(data.create_time) || !Number.isSafeInteger(sourceTimeMs)) {
       throw new Error('Invalid Feishu source coordinates')
     }
-    const text = data.content.length <= MAX_TEXT && data.content.isWellFormed() && !data.content.includes('\0') ? data.content : null
+    // The CLI also renders rich messages as strings. Only original text may be read as a command or correction body.
+    const content = data.message_type === 'text' ? data.content : undefined
+    if (content === undefined && !this.documentCorrections) return
+    const text = content !== undefined && content.length <= MAX_TEXT && content.isWellFormed() && !content.includes('\0') ? content : null
+    // The live CLI calls this field reply_to; retain parent_id for older wrappers. Neither controls routing.
+    const parentId = data.reply_to ?? data.parent_id
     const source: StudioFeishuInstruction = { channel: 'feishu', sourceScope: this.scope,
       requestId: data.message_id, messageId: data.message_id, eventSeq: null, sourceTimeMs, text, senderId: data.sender_id,
-      ...(data.parent_id && messageId.test(data.parent_id) ? { parentId: data.parent_id } : {}),
+      ...(parentId && messageId.test(parentId) ? { parentId } : {}),
       ...(data.root_id && messageId.test(data.root_id) ? { rootId: data.root_id } : {}),
       ...(data.thread_id && threadId.test(data.thread_id) ? { threadId: data.thread_id } : {}),
     }
@@ -197,8 +208,8 @@ export class StudioFeishuInbox {
         return
       }
     }
-    // Classify the reserved namespace even if the body is too large to retain. Never turn a malformed command into a correction.
-    const command = this.text ? feishuTextCommand(data.content) : undefined
+    // Classify the reserved namespace even if the original text is too large to retain. Never turn a malformed text command into a correction.
+    const command = this.text && content !== undefined ? feishuTextCommand(content) : undefined
     if (this.text && (command || !this.documentCorrections)) {
       if (!this.documentCorrections) {
         // Standalone text skips the combined route claim. A continuation from a previous configuration must stay claimed.

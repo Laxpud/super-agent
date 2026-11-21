@@ -217,7 +217,8 @@ export function instructionCommand(store: ManagedWorkerStore, sessionId: string,
       ? (feishu?.late ? 'This message was sent before another message already registered in this Feishu chat.' : 'The order of this Feishu message could not be confirmed.')
         + ' This does not establish its order relative to Web messages. Review without arguments is unavailable for this item.\n'
         + 'Check the original message. Choose unchanged only if the confirmed scope still stands, or pause if you are unsure. Reviewing does not write the document.\n'
-      : 'For a clear pause or line-only correction, try /studio-doc review without arguments.\n'
+      : source.text === null ? 'Review this item manually. Review without arguments requires retained text.\n'
+        : 'For a clear pause or line-only correction, try /studio-doc review without arguments.\n'
     const narrow = narrowableLines ? `Approved changed lines: ${narrowableLines.slice(0, 24).join(', ')}${narrowableLines.length > 24 ? ', …' : ''}.\n`
       + 'To retain only some of these lines, set keepLines to the intended subset in this command:\n'
       + `/studio-doc narrow ${JSON.stringify({ instructionId: pending.instructionId, executionEpoch: task.executionEpoch,
