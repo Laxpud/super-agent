@@ -34,6 +34,7 @@ import { PROJECT_FACT_USE_SCHEMA } from './project-fact-use-store.js'
 import { PROJECT_HANDOFF_SCHEMA } from './project-handoff-store.js'
 import { PROJECT_JOB_AUTO_SCHEMA } from './project-job-auto-store.js'
 import { PROJECT_JOB_SCHEMA } from './project-job-store.js'
+import { PROJECT_RESULT_USE_SCHEMA, projectResultCommandUsed } from './project-result-use-store.js'
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
 import { QUOTA_NOTICE_SCHEMA, QuotaNoticeStore, isQuotaNoticeMessageId, type StudioQuotaNotice } from './quota-notice-store.js'
 import { QUOTA_SCHEMA, QuotaStore, type StudioQuotaIncident } from './quota-store.js'
@@ -418,6 +419,7 @@ export class ManagedWorkerStore {
         this.db.exec(PROJECT_JOB_SCHEMA)
         this.db.exec(PROJECT_JOB_AUTO_SCHEMA)
         this.db.exec(PROJECT_FACT_USE_SCHEMA)
+        this.db.exec(PROJECT_RESULT_USE_SCHEMA)
         this.db.exec(INSTRUCTION_SCHEMA)
         this.db.exec(FEISHU_DRAFT_SCHEMA)
         this.db.exec(FEISHU_DELIVERY_SCHEMA)
@@ -1759,6 +1761,7 @@ export class ManagedWorkerStore {
       || this.instructions.commandUsed(commandId)
       || !!this.db.prepare('SELECT 1 FROM studio_shared_document_revision WHERE command_id = ?').get(commandId)
       || projectDocumentCommandUsed(this.db, commandId)
+      || projectResultCommandUsed(this.db, commandId)
   }
 
   private actionUsed(sessionId: string, toolCallId: string): boolean {
