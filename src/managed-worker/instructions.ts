@@ -8,7 +8,7 @@ import { messageId, type AgentDelivery } from '../app/delivery.ts'
 import { sharedDocumentCoordinates, sharedDocumentError } from './document-command.ts'
 import { documentIntent } from './document-intent.ts'
 import { DOCUMENT_CONTINUATION_PREFIX, documentContinuationKey } from './document-recovery-store.ts'
-import type { InstructionDecision } from './instruction-store.ts'
+import type { InstructionDecision, StudioDocumentInstruction } from './instruction-store.ts'
 import { confirmWithOwner, ownerConfirmationAvailable } from './owner-confirmation.ts'
 import type { ManagedResult, ManagedTask, ManagedWorkerStore } from './store.ts'
 
@@ -143,6 +143,11 @@ function reviewReceipt(result: ManagedResult<{ task: ManagedTask; remaining: num
   return { kind: 'success', text: `${effect} Task ${task.taskId}; authorization version ${task.authorizationVersion}; ${remaining} pending. ${next}` }
 }
 
+/** Late or unconfirmed Feishu ordering needs an explicit manual disposition, not a suggested correction. */
+function needsManualOrderReview({ source, feishu }: StudioDocumentInstruction): boolean {
+  return source.channel === 'feishu' && feishu?.late !== false
+}
+
 /** Interpret only the oldest retained text, show a bounded proposal, then apply the same versioned owner operation as manual review. */
 export async function reviewDocumentIntent(store: ManagedWorkerStore, agent: Agent, commandId: string, caller: AbortSignal,
   stopping: AbortSignal, ready: () => boolean): Promise<CommandResult> {
@@ -150,7 +155,7 @@ export async function reviewDocumentIntent(store: ManagedWorkerStore, agent: Age
   if (!snapshot.ok) return instructionFailure(snapshot.reason)
   const { task, pending, narrowableLines } = snapshot.value
   if (!pending) return { kind: 'success', text: 'No document input awaits review.' }
-  if (pending.source.channel === 'feishu' && pending.feishu?.late !== false) return instructionFailure('INSTRUCTION_ORDER_UNCLEAR')
+  if (needsManualOrderReview(pending)) return instructionFailure('INSTRUCTION_ORDER_UNCLEAR')
   const intent = documentIntent(pending.source.text)
   if (!intent) return instructionFailure('NO_CLEAR_DOCUMENT_CORRECTION')
   if (intent.kind === 'narrow') {
@@ -201,20 +206,24 @@ export function instructionCommand(store: ManagedWorkerStore, sessionId: string,
     const state = `Task ${task.taskId}; authorization version ${task.authorizationVersion}; ${remaining} pending; ${task.paused ? 'paused' : 'not paused'}. Execution epoch ${task.executionEpoch}; ${snapshot} ${task.documentVersion}.${sharedDocumentCoordinates(task)}`
     if (!pending) return { kind: 'success', text: state }
     const { source, feishu } = pending
-    const location = feishu ? 'the Feishu private chat' : 'the original Web Session'
+    const fromFeishu = source.channel === 'feishu'
+    const location = fromFeishu ? 'the Feishu private chat' : 'the original Web Session'
     const original = source.text ?? `The input is not retained as text here. Read the original message in ${location} before reviewing.`
     // Sequence is local to the Web Session. Feishu has its own source time and references, which do not order it against Web messages.
     const coordinates = feishu
       ? `sent ${new Date(source.sourceTimeMs).toISOString()}${feishu.parentId ? `; replies to ${feishu.parentId}` : ''}`
-      : `event ${source.eventSeq ?? 'unavailable'}`
-    const ordering = feishu?.late ? 'Older than a Feishu message already registered for this chat. Verify the order before deciding.\n' : ''
+      : fromFeishu ? 'Feishu ordering metadata unavailable' : `event ${source.eventSeq ?? 'unavailable'}`
+    const review = needsManualOrderReview(pending)
+      ? (feishu?.late ? 'This message was sent before another message already registered in this Feishu chat.' : 'The order of this Feishu message could not be confirmed.')
+        + ' This does not establish its order relative to Web messages. Review without arguments is unavailable for this item.\n'
+        + 'Check the original message. Choose unchanged only if the confirmed scope still stands, or pause if you are unsure. Reviewing does not write the document.\n'
+      : 'For a clear pause or line-only correction, try /studio-doc review without arguments.\n'
     const narrow = narrowableLines ? `Approved changed lines: ${narrowableLines.slice(0, 24).join(', ')}${narrowableLines.length > 24 ? ', …' : ''}.\n`
       + 'To retain only some of these lines, set keepLines to the intended subset in this command:\n'
       + `/studio-doc narrow ${JSON.stringify({ instructionId: pending.instructionId, executionEpoch: task.executionEpoch,
         authorizationVersion: task.authorizationVersion, documentVersion: task.documentVersion, keepLines: [] })}\n` : ''
     return { kind: 'success', text: `${state}\nWrites are blocked until all pending input is reviewed, even if the task is not paused.\n`
-      + `Instruction ${pending.instructionId}; ${source.channel} message ${source.messageId}; ${coordinates}.\n${ordering}`
-      + 'For a clear pause or line-only correction, try /studio-doc review without arguments.\n'
+      + `Instruction ${pending.instructionId}; ${source.channel} message ${source.messageId}; ${coordinates}.\n${review}`
       + `Manual review: /studio-doc review ${pending.instructionId} ${task.authorizationVersion} <unchanged|pause>\n${narrow}\n${original}` }
   }
   const parsed = reviewArgs.safeParse(argument.split(/\s+/))
