@@ -51,7 +51,10 @@ function savedReason({ failure, state }: StudioProjectRun, job: StudioProjectWor
     case 'HOST_RESTARTED':
       return state === 'released' || state === 'interrupted' ? {
         reason: 'Studio recorded this outcome during Host restart recovery.',
-        nextCheck: 'Check current project management and any saved model selection; the restart did not authorize work.',
+        // A linked job has its own authorization, not a one-time text model selection.
+        nextCheck: job
+          ? `If job control is enabled, check the pinned invocation and current authorization with /studio-job status ${job.workId}. The restart did not authorize work.`
+          : 'Check current project management and any saved model selection; the restart did not authorize work.',
       } : unconfirmed
     case 'PROJECT_WORK_BLOCKED':
       return state === 'released' ? {
