@@ -5,6 +5,8 @@ import s from '@deepseek-ai/schemastery'
 
 export type TextWorkerModelSelection = { provider: string; model: string; reasoningEffort?: string }
 export type PinnedTextWorkerModel = Readonly<Required<TextWorkerModelSelection>>
+export type TextWorkerDispatchRole = 'assistant' | 'leader'
+type TextWorkerDefaults = Readonly<Partial<Record<TextWorkerDispatchRole, PinnedTextWorkerModel | null>>>
 
 const ROUTE_LIMIT = 64
 const IDENTIFIER_LIMIT = 256
@@ -21,6 +23,12 @@ export const TextWorkerRouteConfig: s<Required<TextWorkerModelSelection>> = s.ob
   model: identifier().description('Exact model ID on this provider route.'),
   reasoningEffort: identifier().description('Exact supported reasoning effort ID for this model.'),
 })
+
+/** Null leaves the role's existing dispatch selection unchanged. */
+export const TextWorkerDefaultsConfig = s.object({
+  assistant: s.union([s.const(null), TextWorkerRouteConfig]).default(null),
+  leader: s.union([s.const(null), TextWorkerRouteConfig]).default(null),
+}).default({ assistant: null, leader: null })
 
 /** Compare the configured tuple against the actual Step or stream, without substituting defaults. */
 export function sameTextWorkerModel(pinned: Readonly<TextWorkerModelSelection>, actual?: Readonly<TextWorkerModelSelection>): boolean {
@@ -71,12 +79,13 @@ async function awaitMetadata(result: unknown, signal: AbortSignal): Promise<unkn
   finally { listener[Symbol.dispose]() }
 }
 
-/** Keep an immutable allow-list snapshot; each pin checks current metadata, never an inferred model or effort ranking. */
+/** Keep an immutable snapshot of allowed routes and role defaults; check current metadata only when pinning. */
 export class TextWorkerModelPolicy {
   readonly #ctx: Context
   readonly #entries: readonly PinnedTextWorkerModel[]
+  readonly #defaults: Readonly<Record<TextWorkerDispatchRole, PinnedTextWorkerModel | undefined>>
 
-  constructor(ctx: Context, entries: readonly Required<TextWorkerModelSelection>[]) {
+  constructor(ctx: Context, entries: readonly Required<TextWorkerModelSelection>[], defaults?: TextWorkerDefaults) {
     this.#ctx = ctx
     if (!Array.isArray(entries) || entries.length === 0 || entries.length > ROUTE_LIMIT) {
       throw notAllowed(`Configure between 1 and ${ROUTE_LIMIT} text Worker routes.`)
@@ -94,6 +103,21 @@ export class TextWorkerModelPolicy {
       snapshot.push(route)
     }
     this.#entries = Object.freeze(snapshot)
+
+    // Resolve each role to a frozen allow-list row; do not retain the caller's defaults or consult the Host.
+    const resolveDefault = (role: TextWorkerDispatchRole): PinnedTextWorkerModel | undefined => {
+      const selection = defaults?.[role]
+      if (selection == null) return undefined
+      const route = this.#entries.find(entry => sameTextWorkerModel(entry, selection))
+      if (!route) throw notAllowed(`textWorkerDefaults.${role} must exactly match a tuple in textWorkerRoutes.`)
+      return route
+    }
+    this.#defaults = Object.freeze({ assistant: resolveDefault('assistant'), leader: resolveDefault('leader') })
+  }
+
+  /** Return the configured route for this role; dispatch must still confirm it through pin. */
+  defaultFor(role: TextWorkerDispatchRole): PinnedTextWorkerModel | undefined {
+    return this.#defaults[role]
   }
 
   /** Reject out-of-policy selections before consulting the Host; pin only an exact effort that is also allowed. */
@@ -132,4 +156,16 @@ export class TextWorkerModelPolicy {
     if (!pinned) throw notAllowed('The confirmed default reasoning effort is not configured for this text Worker route.')
     return pinned
   }
+}
+
+/** Leave unconfigured dispatch unchanged, but reject role defaults without an allow-list at apply time. */
+export function createTextWorkerModelPolicy(ctx: Context, entries?: readonly Required<TextWorkerModelSelection>[],
+  defaults?: TextWorkerDefaults): TextWorkerModelPolicy | undefined {
+  if (entries === undefined || entries.length === 0) {
+    if (defaults?.assistant != null || defaults?.leader != null) {
+      throw notAllowed('textWorkerDefaults requires a nonempty textWorkerRoutes list.')
+    }
+    return undefined
+  }
+  return new TextWorkerModelPolicy(ctx, entries, defaults)
 }

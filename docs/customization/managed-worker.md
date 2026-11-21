@@ -33,7 +33,7 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 ## 交代文字任务和取回成果
 
-1. 在新会话中选择 **SuperAgent Studio Assistant**，选择支持工具调用的模型，用普通消息提出一个独立的纯文字任务，例如「把这三条材料整理成一个简短比较表」。当前只转交该条请求，不自动带上过去的聊天、附件或文件；请把所需文字放在同一条消息。Worker 沿用 Assistant 当时选择的模型和思考深度，不具备业务工具。
+1. 在新会话中选择 **SuperAgent Studio Assistant**，选择支持工具调用的模型，用普通消息提出一个独立的纯文字任务，例如「把这三条材料整理成一个简短比较表」。当前只转交该条请求，不自动带上过去的聊天、附件或文件；请把所需文字放在同一条消息。Worker 不具备业务工具，其模型按[文字派工配置](<#限定普通文字-worker-的模型组合>)选择。
 2. 在原会话展开 **Worker result** 工具卡片，看 Worker 的原文和任务 ID。宿主同时保存产出 Bot、会话、执行轮次与消息位置。Assistant 可以报告任务状态，但卡片中的原文不靠它复述。
 3. 在这个会话用 `/studio-result` 取回最新任务，或在任意 Studio Assistant 会话用 `/studio-result <任务ID>` 取回指定任务。此命令不调用模型，不需要 Worker 在线。宿主重启后，已经保存的成果仍可读；未完成的任务显示为中断，不自动再派一遍。
 
@@ -41,7 +41,7 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 ### 限定普通文字 Worker 的模型组合
 
-`textWorkerRoutes` 省略或留空时不限制派工组合。要限制，在隔离 profile 的原有 Studio 条目中增加 `textWorkerRoutes`，保留 `stateDir` 和其他已设选项。下例只是配置形状：按 DSH 适配器的实际配置填写 Provider、模型和思考深度的 ID，不用显示名称代替，也不用填凭据。
+在隔离 profile 的原有 Studio 条目中，可用 `textWorkerRoutes` 限定可派工的组合，并用 `textWorkerDefaults` 分别给 Assistant 和 Leader 指定 Worker 的默认组合。保留 `stateDir` 和其他已设选项。下例只是配置形状：请填写实际的 Provider、模型和思考深度 ID，不用显示名称代替，也不用填凭据。
 
 ```yaml
 - id: dsh-superagent-managed-worker
@@ -50,13 +50,30 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
     stateDir: /absolute/path/to/managed-worker-state
     textWorkerRoutes:
       - provider: example-provider
-        model: example-model
+        model: example-writing-model
         reasoningEffort: low
+      - provider: example-provider
+        model: example-analysis-model
+        reasoningEffort: medium
+    textWorkerDefaults:
+      assistant:
+        provider: example-provider
+        model: example-writing-model
+        reasoningEffort: low
+      leader:
+        provider: example-provider
+        model: example-analysis-model
+        reasoningEffort: medium
 ```
 
-配置后，在 Assistant 或现任 Leader 会话选定清单中的组合，再交代一项普通文字任务或派工已有待办。清单只约束这些派工，不限制发起会话自己使用的模型。没选思考深度时，只有已注册适配器明确报告、且在清单中的默认深度才可用于派工。宿主为这次 Worker 固定核验过的深度，不按清单顺序挑选，也不自动换组合。分项调查、Advisor、文档、飞书收件及自动作业接续仍走各自的路线。
+配置了角色默认值后，照常向 Assistant 交代一项纯文字任务，或让现任 Leader 派工已有待办。发起会话仍用自己的模型，不需要切换到 Worker 的组合。省略某个角色或填 `null` 时，该角色的 Worker 继续沿用会话选择，并遵守清单。若会话未选思考深度，只接受适配器明确报告、且在清单中的默认深度。清单和默认值都不设时保持原行为。
 
-`TEXT_WORKER_MODEL_NOT_ALLOWED` 表示所用组合不在清单，请在发起会话选择清单中的精确组合。`TEXT_WORKER_MODEL_UNCONFIRMED` 表示宿主无法确认组合，例如模型未声明默认思考深度，或适配器在 Worker 调用模型前已不再支持固定的深度。请核对适配器的模型设置，必要时显式选择一个受支持且在清单内的深度。判断依据是适配器的元数据，不探测远端账户、额度或价格。
+这两个选项只影响 Assistant 的单项文字委派和现任 Leader 的手动文字派工。分项调查、Advisor、文档、飞书收件和自动作业接续仍走各自的路线。宿主核验并固定这次派工的组合，不按清单顺序挑选，也不在角色默认值不可用时回退到会话的模型。
+
+- **启用 Studio 时遇到 `TEXT_WORKER_MODEL_NOT_ALLOWED`：** 指定默认值时，`textWorkerRoutes` 不能为空。让默认值的三个字段与清单中同一行完全一致，或把该角色的默认值改为 `null`。
+- **派工时组合不在清单或无法核实（`TEXT_WORKER_MODEL_NOT_ALLOWED`／`TEXT_WORKER_MODEL_UNCONFIRMED`）：** 先核对适配器是否仍支持该组合。已设角色默认值时，改会话模型不会改变 Worker；如需换组合，请将默认值改为清单中另一条已核实的组合。未设时，可在发起会话显式选择一个受支持且在清单内的组合。
+
+宿主以适配器的元数据为准，不另行探测远端账户、额度或价格。
 
 修正后，Assistant 可以用一条新消息重新提交完整请求。Leader 先用 `/studio-project work <待办ID>` 核对状态：未派工或预留已释放时可派同一待办；如果 Worker 启动后已记为 `failed`，再次派同一 ID 只会返回旧记录，需要重新登记待办。
 
@@ -77,7 +94,7 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 也可以直接在 Leader 会话中操作：
 
 1. 在未绑定项目的 **SuperAgent Studio Leader** 会话中提交 `/studio-project create {"name":"资料整理","objective":"持续整理研究记录"}`。回执给出项目 ID、Leader Bot、当前会话及管理轮次 `1`。可用 `leaderBotId` 复用已有 Leader Bot，用 `originTaskId` 引用一个已经完成的文字任务；引用原成果不重新派工。
-2. 在当前 Leader 会话中用普通消息要求登记一项自包含的文字待办，将所需材料放在同一条消息里。登记保留原文与来源，不会启动 Worker。用 `/studio-project work` 可查看最近 20 项。需要执行时，让当前 Leader 派工指定待办 ID；Worker 沿用 Leader 当时的模型选择，并遵守已启用的[组合限制](<#限定普通文字-worker-的模型组合>)。普通派工只接收该待办的原文，不能用工具或修改文档。
+2. 在当前 Leader 会话中用普通消息要求登记一项自包含的文字待办，将所需材料放在同一条消息里。登记保留原文与来源，不会启动 Worker。用 `/studio-project work` 可查看最近 20 项。需要执行时，让当前 Leader 派工指定待办 ID；Worker 使用 Leader 的[派工默认组合](<#限定普通文字-worker-的模型组合>)；未设默认值时沿用该会话的模型选择。普通派工只接收该待办的原文，不能用工具或修改文档。
 3. 用 `/studio-project work <待办ID>` 查看原请求、状态和 Worker 的原始结果，不调用模型。在同一项目的 Leader 会话中，Worker 结束或宿主重启后仍可取回已保存结果。已经开始的工作中断后会留下状态，不会自动重跑。
 4. 要换管理会话，在从未绑定项目的 Leader 会话中提交 `/studio-project take <项目ID> <当前管理轮次>`。默认保留 Leader Bot；末尾可追加已有 Leader Bot ID 或 `new` 以换负责人。旧会话仍可用 `work` 查询本项目的工作记录，但不能再登记或派工。移交前尚未开始的保留名额会释放，由当前 Leader 决定是否继续原待办；已经开始的 Worker 可保存原出处的结果。
 

@@ -164,7 +164,7 @@ export class StudioProjectControl {
   /** Reserve once under current management and recheck both before the relay and at the Worker's first step. */
   private async runWork(agent: Agent, workId: string, signal: AbortSignal,
     automatic?: Pick<StudioJobAuto, 'permitId' | 'route'>, allowEvidence = false): Promise<StudioProjectWorkView> {
-    const selected = automatic?.route ?? this.workers.checkedRoute(agent)
+    const selected = automatic?.route ?? this.workers.checkedRoute(agent, 'leader')
     const pendingPin = automatic ? undefined : this.workers.pinTextWorkerRoute(selected, signal)
     const route = pendingPin ? await pendingPin : selected
     signal.throwIfAborted()

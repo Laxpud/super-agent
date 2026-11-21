@@ -8,8 +8,8 @@ import { SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { DRAFT_PREFERENCE_HEADER, parseDraftPreference } from './draft-preference-request.ts'
 import { DRAFT_TEXT_LIMIT, type ManagedResult, type ManagedWorkerStore, type StudioDraftResult, type StudioDraftTask } from './store.ts'
-import { sameTextWorkerModel as sameModelRoute, textWorkerModelError, type PinnedTextWorkerModel, type TextWorkerModelPolicy,
-  type TextWorkerModelSelection as ModelRoute } from './text-worker-model-policy.ts'
+import { sameTextWorkerModel as sameModelRoute, textWorkerModelError, type PinnedTextWorkerModel, type TextWorkerDispatchRole,
+  type TextWorkerModelPolicy, type TextWorkerModelSelection as ModelRoute } from './text-worker-model-policy.ts'
 
 export const ASSISTANT_PRESET = 'dsh-superagent-studio-assistant'
 export const DRAFT_DELEGATE = 'studio_delegate_draft'
@@ -105,10 +105,10 @@ interface WorkerAdmission {
   resultEvidence?: RelayContext
 }
 
-/** Use the caller's current configured route, never a provider/model supplied by the tool arguments. */
-export function draftWorkerRoute(agent: Agent): WorkerRoute {
+/** Use an owner-configured Worker default or the caller's native selection, never a tool argument. */
+export function draftWorkerRoute(agent: Agent, defaultModel?: PinnedTextWorkerModel): WorkerRoute {
   const cwd = agent.session.header.cwd
-  const model = (agent as Agent & { model?: { current(): ModelRoute | undefined } }).model?.current()
+  const model = defaultModel ?? (agent as Agent & { model?: { current(): ModelRoute | undefined } }).model?.current()
   if (!cwd || !isAbsolute(cwd) || !model?.provider || !model.model) throw new Error('Studio draft rejected: WORKSPACE_OR_MODEL_MISSING')
   return { cwd, model }
 }
@@ -214,9 +214,10 @@ export class StudioAssistant {
     readonly providerDenial: (provider: string) => string | undefined, private readonly memoryEnabled: boolean,
     private readonly hostStopping: AbortSignal, private readonly textWorkerModels?: TextWorkerModelPolicy) {}
 
-  /** Refuse a stopped route before reserving an execution. Do not select a different account on the caller's behalf. */
-  checkedRoute(agent: Agent): WorkerRoute {
-    const route = draftWorkerRoute(agent)
+  /** Check quota for the actual Worker route. Only ordinary manual dispatch can use a role's configured default. */
+  checkedRoute(agent: Agent, manualRole?: TextWorkerDispatchRole): WorkerRoute {
+    const defaultModel = manualRole ? this.textWorkerModels?.defaultFor(manualRole) : undefined
+    const route = draftWorkerRoute(agent, defaultModel)
     const denial = this.providerDenial(route.model.provider)
     if (denial) throw new Error(denial)
     return route
@@ -394,7 +395,7 @@ export class StudioAssistant {
 
   /** Reserve the Assistant task and Worker ID before starting the shared text runner. */
   private async delegate(agent: Agent, source: OwnerRequest, caller: AbortSignal): Promise<StudioDraftTask> {
-    const selected = this.checkedRoute(agent)
+    const selected = this.checkedRoute(agent, 'assistant')
     const pendingPin = this.pinTextWorkerRoute(selected, caller)
     const route = pendingPin ? await pendingPin : selected
     caller.throwIfAborted()
