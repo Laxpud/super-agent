@@ -6,7 +6,7 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 使用 DSH `0.2.2-rc.3` 的单所有者 Web 环境，以回环地址监听。不要给该环境配置 LiveShare、远程入口、共享所有者登录或非所有者的命令和会话写权限。操作员通过 DSH Web 自己的所有者认证；原生命令回调不另外识别自然人身份。不要把它部署到当前工作的 profile 里试用。
 
-下面的覆盖层适用于已经在隔离 profile 中安装本 bundle 的情况，此时 [bundle 补丁](../../cordis.patch.yml) 已提供这些条目。若只用源码树做开发验证，可用进程级 `--patch` 加载 bundle 补丁，并新增一个指向本地构建入口 `lib/managed-worker.js` 的临时 Host 条目；不要同时启用依赖包名解析的条目。`stateDir` 必须是受管入口专用的绝对目录，不应与旧执行器、其他实例或 Worker 工作目录共享。
+若已在隔离 profile 安装本 bundle，[bundle 补丁](../../cordis.patch.yml) 已提供以下条目，可以直接用这份覆盖层启用 Studio。未安装时，按下方的[源码试用方式](<#从源码树试用>)调整宿主条目。`stateDir` 必须是 Studio 专用的绝对目录，不应与旧执行器、其他实例或 Worker 工作目录共享。
 
 ```yaml
 - id: dsh-superagent
@@ -30,6 +30,31 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 - id: dsh-superagent-studio-leader-preset
   disabled: false
 ```
+
+### 从源码树试用
+
+先在源码树中构建 `lib/managed-worker.js`（`pnpm build`）。将上方覆盖层另存为 `studio-local.yml`，保留原型禁用项和三个预设启用项。只把不带 `-preset` 后缀的宿主条目替换成下面两段：旧的包名入口保持关闭，另用绝对路径加载本地构建。
+
+```yaml
+- id: dsh-superagent-managed-worker
+  disabled: true
+- insert:
+    - id: studio-local-host
+      name: /absolute/path/to/super-agent/lib/managed-worker.js
+      config:
+        stateDir: /absolute/path/to/studio-state
+```
+
+换成实际路径，用新的 `DSH_HOME`，并在分开的试用工作目录运行。先加载仓库补丁，再应用本地覆盖层：
+
+```sh
+DSH_HOME=/absolute/path/to/studio-test-home dsh --profile web \
+  --patch /absolute/path/to/super-agent/cordis.patch.yml \
+  --patch /absolute/path/to/studio-local.yml \
+  --host 127.0.0.1 --port 0 --no-open
+```
+
+把最后一行的 Web 参数整行换成 `--dump-config`，可以先查看合并后的配置，不启动 Web。正式启动时，`--port 0` 选用空闲端口，从本次启动输出打开回环地址。此方式不安装 bundle，不更新现有 profile。配置后续可选功能时，把新增字段放入 `studio-local-host` 的 `config`，保留 `stateDir`，不要重新启用包名入口。
 
 ## 交代文字任务和取回成果
 
