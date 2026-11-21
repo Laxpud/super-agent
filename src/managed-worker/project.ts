@@ -8,6 +8,7 @@ import { DRAFT_TIMEOUT_MS, draftWorkerRoute, ownerRequest, type StudioAssistant 
 import { botExperienceCommand } from './bot-experience.ts'
 import { sharedDocumentCoordinates } from './document-command.ts'
 import { projectArchiveCommand } from './project-archive.ts'
+import { projectDispatchDiagnosis } from './project-dispatch-diagnosis.ts'
 import { projectHandoffText } from './project-handoff.ts'
 import { projectJobContext, projectJobText } from './project-job.ts'
 import { PROJECT_NAME_LIMIT, PROJECT_RESULT_QUOTE_LIMIT, PROJECT_TEXT_LIMIT, sameJobRoute, type StudioJobAuto, type StudioJobRoute,
@@ -135,7 +136,8 @@ function documentDecisionText(history: NonNullable<StudioProjectDocument['scopeD
 }
 
 /** Return saved provenance, not a Leader rewrite. Only owner reads can include document or evidence-derived text. */
-function workText(view: StudioProjectWorkView, includeRequest = false, includeDocumentBody = false, includeDerivedBody = false): string {
+function workText(view: StudioProjectWorkView, includeRequest = false, includeDocumentBody = false, includeDerivedBody = false,
+  diagnoseDispatch = false): string {
   const { work, run, job, document, fact, resultUse } = view
   const execution = run ? `\nWorker Bot ${run.workerBotId}; Session ${run.workerSessionId}; execution epoch ${run.executionEpoch}; dispatched by Leader Session ${run.leaderSessionId} at management epoch ${run.managementEpoch}.` : ''
   const source = `\nOwner source: message ${work.sourceMessageId} in Leader Session ${work.leaderSessionId}.`
@@ -158,7 +160,10 @@ function workText(view: StudioProjectWorkView, includeRequest = false, includeDo
   const committed = document?.result
   const commit = committed ? `\n\nCommitted document by Worker Session ${committed.workerSessionId}; execution epoch ${committed.executionEpoch}; authorization version ${committed.authorizationVersion}; tool call ${committed.toolCallId}; saved at ${committed.at}.`
     + (includeDocumentBody ? `\n\n${committed.text}` : `\nRead the exact text with /studio-project work ${work.workId}.`) : ''
-  return `${workSummary(view)}${execution}${source}${reference}${sourceHold}${run?.failure ? `\nReason: ${run.failure}.` : ''}${detail}${decisions}${request}${result}${commit}`
+  // Explain only recognized saved outcomes in the live owner's detail; do not project raw failure strings there.
+  const diagnosis = diagnoseDispatch ? projectDispatchDiagnosis(view) : ''
+  const failure = diagnosis ? `\n\n${diagnosis}` : run?.failure ? `\nReason: ${run.failure}.` : ''
+  return `${workSummary(view)}${execution}${source}${reference}${sourceHold}${failure}${detail}${decisions}${request}${result}${commit}`
 }
 
 /** Show the Bot separately from the currently authorized Session and management epoch. */
@@ -461,13 +466,13 @@ export class StudioProjectControl {
     if (verb === 'work') {
       if (argument) {
         if (!id.safeParse(argument).success) return denied('INVALID_WORK_ID')
-        // Only native owner detail requests the selected model and correction history. The Store also checks current management.
+        // Native owner detail can show the selected model, correction history or saved dispatch diagnosis. Only the current Leader may see these.
         const ordinary = agent.session.header.origin !== 'subagent'
         const result = this.store.projects.readWork(agent.id, argument, ordinary)
         if (!result.ok) return denied(result.reason)
         const view = result.value
         const current = ordinary && this.store.projects.current(agent.id).ok
-        let text = workText(view, true, true, archiveEnabled) + modelSelectionText(view, this.workers.textWorkerSelectionEnabled)
+        let text = workText(view, true, true, archiveEnabled, current) + modelSelectionText(view, this.workers.textWorkerSelectionEnabled)
         if (current && this.workers.textWorkerSelectionEnabled && !view.document && !view.job && (!view.run || view.run.state === 'released')
           && (!view.modelSelection || view.modelSelection.state === 'cleared')) {
           text += `\n\nTo choose a model for one dispatch without starting a Worker, fill in one exact configured tuple:\n${useModelExample(view.work.workId)}`

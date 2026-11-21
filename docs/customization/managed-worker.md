@@ -117,6 +117,12 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 如果移交报轮次过时、命令重复，或回执不明，先在原 Leader 会话用 `/studio-project status` 核对当前会话和轮次，也可在新的 Leader 或 Studio Assistant 会话用 `/studio-project status <项目ID>` 查询。不要原样重发旧的移交命令。
 
+### 查看文字派工为何未完成
+
+在**现任 Leader 的普通 Web 会话**用 `/studio-project work <待办ID>` 查看文字待办。如果最近保存的派工记录是失败、中断或开始前释放，详情中的 **Saved dispatch diagnosis** 会显示执行轮次、已知原因和建议核对的事项。组合无法核实时，可检查适配器和已选组合；记录到额度停止时，可用 `/studio-quota status` 查看当前状态。如果只知道「未保存完整成果」，不能据此判断模型能力不足。
+
+说明只反映已保存的记录，不探测 Provider 是否恢复，也不改变待办或授权。预约释放表示该轮次没有进入 Studio 的运行状态，已用的一次性组合不会恢复；失败或中断后不能用同一待办 ID 重跑。如果后一次派工还没写入执行记录就被拒绝，详情仍会显示旧记录；请以那次拒绝的回执为准。
+
 ### 为一项待办选择一次派工模型
 
 配置 `textWorkerRoutes` 后，可在**现任 Leader 的普通 Web 会话**为尚未开始的文字待办固定一次派工组合。在 `/studio-project work <待办ID>` 找到命令模板，填入清单和 Leader 范围内的 Provider、模型与思考深度。例如：
