@@ -64,8 +64,9 @@ export interface WatchdogJob {
   observationVersion: number
   paused: boolean
   authorizationVersion: number
-  automatic?: 'granted' | 'consumed'
-  workState?: string
+  /** Only the grant for the current Leader and authorization version, without its permit ID or route. */
+  automatic?: { state: 'unused' } | { state: 'spent'; executionEpoch: number }
+  attempt?: Pick<WatchdogDispatch, 'state' | 'executionEpoch'>
 }
 
 export interface WatchdogExecution {
@@ -97,6 +98,7 @@ export const WATCHDOG_INDEXES = `
 
 type Row = Record<string, SQLOutputValue>
 type Management = Pick<WatchdogJob, 'projectId' | 'leaderSessionId' | 'managementEpoch'>
+type WatchdogDispatch = { state: Exclude<WatchdogExecution['state'], 'pending'>; sessionId: string; executionEpoch: number; reason?: string }
 type ExecutionKind = Exclude<WatchdogExecution['kind'], 'project'>
 type EntryPage = Pick<WatchdogSnapshot, 'entries' | 'truncated'>
 
@@ -213,14 +215,16 @@ function coordinates(row: Row): Pick<WatchdogExecution, 'sessionId' | 'execution
   return { sessionId, executionEpoch }
 }
 
-function latestDispatch(db: DatabaseSync, workId: string, projectId: string): Omit<WatchdogExecution, 'kind' | 'id'> | undefined {
+function latestDispatch(db: DatabaseSync, workId: string, projectId: string): WatchdogDispatch | undefined {
   const row = db.prepare(`SELECT state, project_id, worker_session_id AS session_id, execution_epoch, ${reasonColumn(true)}
     FROM studio_project_dispatch WHERE work_id = ? ORDER BY execution_epoch DESC LIMIT 1`).get(workId)
   if (!row) return
   const state = dispatchStates.find(value => value === row.state)
-  const { reason } = row
-  if (row.project_id !== projectId || state === undefined) throw new Error('Invalid Watchdog dispatch')
-  return { state, ...coordinates(row), ...(typeof reason === 'string' ? { reason } : {}) }
+  const { reason, session_id: sessionId, execution_epoch: executionEpoch } = row
+  if (row.project_id !== projectId || state === undefined || !isId(sessionId) || !isVersion(executionEpoch)) {
+    throw new Error('Invalid Watchdog dispatch')
+  }
+  return { state, sessionId, executionEpoch, ...(typeof reason === 'string' ? { reason } : {}) }
 }
 
 /** Read job evidence and only the presence/consumption of a current grant, never its route. */
@@ -237,12 +241,18 @@ function job(db: DatabaseSync, id: string): WatchdogJob {
   const grant = db.prepare(`SELECT consumed_execution_epoch FROM studio_project_job_auto WHERE work_id = ?
     AND authorization_version = ? AND project_id = ? AND management_epoch = ? AND leader_session_id = ?`)
     .get(id, authorizationVersion, leader.projectId, leader.managementEpoch, leader.leaderSessionId)
-  const consumed = grant?.consumed_execution_epoch
-  if (grant && consumed !== null && !isVersion(consumed)) throw new Error('Invalid Watchdog job grant')
-  const workState = latestDispatch(db, id, leader.projectId)?.state
+  const attempt = latestDispatch(db, id, leader.projectId)
+  let automatic: WatchdogJob['automatic']
+  if (grant) {
+    const { consumed_execution_epoch: consumed } = grant
+    if (consumed === null) automatic = { state: 'unused' }
+    else if (isVersion(consumed) && attempt && consumed <= attempt.executionEpoch) automatic = { state: 'spent', executionEpoch: consumed }
+    else throw new Error('Invalid Watchdog job grant')
+  }
+  // A released text reservation can predate the attachment. Retain its coordinates without inferring that it processed the job.
   return { kind: 'job', id, ...leader, unit, invocationId, state, observedAt, observationVersion,
-    paused: paused === 1, authorizationVersion, ...(grant ? { automatic: consumed === null ? 'granted' : 'consumed' } : {}),
-    ...(workState === undefined ? {} : { workState }) }
+    paused: paused === 1, authorizationVersion, ...(automatic ? { automatic } : {}),
+    ...(attempt ? { attempt: { state: attempt.state, executionEpoch: attempt.executionEpoch } } : {}) }
 }
 
 function projectWork(db: DatabaseSync, id: string): WatchdogExecution {

@@ -61,20 +61,33 @@ function documentHealth(entry: WatchdogDocument, captureUnconfirmed: boolean, ob
 }
 
 function jobHealth(entry: WatchdogJob, observe: ObserveSession): string {
+  const { id, paused, authorizationVersion, attempt, automatic } = entry
   const state = entry.state === 'running' ? 'Waiting on the recorded external invocation'
     : entry.state === 'unknown' ? 'External observation unknown, not a confirmed failure'
       : entry.state === 'failed' ? 'Recorded external failure' : 'External invocation recorded complete'
-  const facts = [`Job for work ${entry.id}: ${state}.`,
+  const facts = [`Job for work ${id}: ${state}.`,
     `${entry.unit} / ${entry.invocationId}; observation v${entry.observationVersion} at ${entry.observedAt}.`,
     `Project ${entry.projectId}; management epoch ${entry.managementEpoch}.`, observedSession('Current Leader', entry.leaderSessionId, observe)]
-  if (entry.paused) facts.push(`Owner paused post-processing (authorization v${entry.authorizationVersion}); this does not stop the job.`)
-  else facts.push(`Post-processing is not paused (authorization v${entry.authorizationVersion}).`)
-  if (entry.workState) facts.push(`Latest post-processing attempt: ${entry.workState}.`)
-  if (entry.automatic === 'consumed') facts.push('The current automatic grant has already been consumed.')
-  else if (entry.automatic === 'granted') facts.push('A current automatic grant is recorded, not proof that processing started.')
-  else if (entry.state === 'completed' && (!entry.workState || entry.workState === 'released')) {
-    facts.push('No post-processing start or current automatic grant is recorded.')
+  if (paused) facts.push(`Owner paused further post-processing (authorization v${authorizationVersion}); this does not stop the job or an already started attempt.`)
+  else facts.push(`Post-processing is not paused (authorization v${authorizationVersion}).`)
+
+  // A released reservation is text work history, not proof this job started post-processing.
+  if (attempt?.state === 'released') facts.push(`Latest text reservation (execution epoch ${attempt.executionEpoch}) was released before start.`)
+  else if (attempt) facts.push(`Post-processing attempt (execution epoch ${attempt.executionEpoch}): ${executionStatus[attempt.state]}.`)
+
+  const waiting = entry.state === 'completed' && !paused && (!attempt || attempt.state === 'released')
+  if (waiting) facts.push('No post-processing start is recorded.')
+  if (automatic?.state === 'spent') {
+    facts.push(`The current automatic grant was spent on execution epoch ${automatic.executionEpoch}; it cannot be reused.`)
+  } else if (automatic?.state === 'unused') {
+    facts.push('An unused automatic grant is recorded for the current Leader and authorization version.')
+    // This is evidence of an outstanding follow-up, not permission or a check of the live launch prerequisites.
+    if (waiting) facts.push('Whether it can start now depends on the Leader, model route and quota; this snapshot does not check launch readiness.')
+  } else {
+    facts.push('No automatic grant is recorded for the current Leader and authorization version.')
+    if (waiting) facts.push('The owner can decide whether follow-up is still needed.')
   }
+  facts.push(`In the current Leader Session, read the saved job with /studio-job status ${id} if job control is enabled, or /studio-project work ${id}.`)
   return facts.join(' ')
 }
 
