@@ -578,6 +578,7 @@ export class ManagedWorkerStore {
     }
     return this.snapshot(() => {
       const page = readWatchdogEntries(this.db, {
+        captureUnconfirmed: this.captureFault,
         task: id => this.task(id),
         pendingReview: id => this.instructions.hasPending(id),
         frozen: task => this.isFrozen(task),

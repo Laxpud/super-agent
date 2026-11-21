@@ -27,6 +27,8 @@ export interface WatchdogQuota {
   notice?: 'sending' | 'delivered' | 'unconfirmed'
 }
 
+type RefusalSource = { evidenceId: string; eventSeq: number }
+
 export interface WatchdogDocument {
   kind: 'document'
   id: string
@@ -40,6 +42,7 @@ export interface WatchdogDocument {
   recoveryPause?: boolean
   recovery?: DocumentFailure
   failureNotice?: DocumentFailureNotice
+  repeatedScopeRefusals?: [RefusalSource, RefusalSource]
   shared?: { baseVersion: number; headVersion: number }
   projectId?: string
   workId?: string
@@ -95,6 +98,7 @@ type ExecutionKind = Exclude<WatchdogExecution['kind'], 'project'>
 type EntryPage = Pick<WatchdogSnapshot, 'entries' | 'truncated'>
 
 interface DocumentEvidence {
+  captureUnconfirmed: boolean
   task(id: string): ManagedTask | undefined
   pendingReview(id: string): boolean
   frozen(task: ManagedTask): boolean
@@ -150,6 +154,26 @@ function workOrigin(db: DatabaseSync, id: string): string {
   return row.project_id
 }
 
+/** Read the latest two distinct native calls for the current approval. The indexed per-task ledger holds at most 64 rows. */
+function repeatedScopeRefusals(db: DatabaseSync, task: ManagedTask): WatchdogDocument['repeatedScopeRefusals'] {
+  const { taskId, workerSessionId, executionEpoch, authorizationVersion, sharedDocument } = task
+  // Old records without a native link cannot prove independent calls. A review finding an inconsistent comparison is not scope evidence.
+  const calls = db.prepare(`SELECT e.evidence_id, n.event_seq FROM studio_document_guard_evidence e
+    JOIN studio_document_guard_native_call n USING (evidence_id)
+    LEFT JOIN studio_document_guard_review r USING (evidence_id)
+    WHERE e.task_id = ? AND e.worker_session_id = ? AND e.execution_epoch = ? AND e.authorization_version = ?
+      AND e.document_id IS ? AND e.expected_version = ? AND e.phase = 'authorize' AND e.reason = 'ACTION_NOT_APPROVED'
+      AND (r.outcome IS NULL OR r.outcome = 'refusal-confirmed')
+    ORDER BY e.seq DESC`).iterate(taskId, workerSessionId, executionEpoch, authorizationVersion,
+    sharedDocument?.documentId ?? null, sharedDocument?.baseVersion ?? 1)
+  let latest: RefusalSource | undefined
+  for (const { evidence_id: evidenceId, event_seq: eventSeq } of calls) {
+    if (!isId(evidenceId) || (eventSeq !== 0 && !isVersion(eventSeq))) throw new Error('Invalid Watchdog document refusal source')
+    if (!latest) latest = { evidenceId, eventSeq }
+    else if (latest.eventSeq !== eventSeq) return [latest, { evidenceId, eventSeq }]
+  }
+}
+
 function document(db: DatabaseSync, id: string, evidence: DocumentEvidence): WatchdogDocument {
   const task = evidence.task(id)
   if (!task) throw new Error('Missing Watchdog document or binding')
@@ -163,11 +187,16 @@ function document(db: DatabaseSync, id: string, evidence: DocumentEvidence): Wat
   const recovery = evidence.recovery(task)
   // Retain the delivery result even after the task no longer exposes a recovery action.
   const failureNotice = evidence.failureNotice(id)
-  return { kind: 'document', id, sessionId, executionEpoch, authorizationVersion, documentVersion, paused,
-    pendingReview: evidence.pendingReview(id), pauseUnconfirmed: evidence.frozen(task),
+  const pendingReview = evidence.pendingReview(id)
+  const pauseUnconfirmed = evidence.frozen(task)
+  // A held, changed, or finished task can still have an audit trail, but there is no current progress concern to infer from it.
+  const repeated = documentVersion === 1 && !paused && !pendingReview && !pauseUnconfirmed && !evidence.captureUnconfirmed
+    && (!sharedDocument || sharedDocument.baseVersion === sharedDocument.headVersion) ? repeatedScopeRefusals(db, task) : undefined
+  return { kind: 'document', id, sessionId, executionEpoch, authorizationVersion, documentVersion, paused, pendingReview, pauseUnconfirmed,
     ...(recoveryPause ? { recoveryPause } : {}),
     ...(recovery ? { recovery } : {}),
     ...(failureNotice ? { failureNotice } : {}),
+    ...(repeated ? { repeatedScopeRefusals: repeated } : {}),
     ...(sharedDocument ? { shared: { baseVersion: sharedDocument.baseVersion, headVersion: sharedDocument.headVersion } } : {}),
     ...project }
 }

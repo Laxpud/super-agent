@@ -19,6 +19,7 @@ function observedSession(label: string, sessionId: string, observe: ObserveSessi
 
 function documentHealth(entry: WatchdogDocument, captureUnconfirmed: boolean, observe: ObserveSession, failureAlerts: boolean): string {
   const facts = [`Document ${entry.id}: snapshot v${entry.documentVersion}; execution epoch ${entry.executionEpoch}; authorization v${entry.authorizationVersion}.`]
+  let concern: string | undefined
   if (entry.projectId && entry.workId && entry.leaderSessionId && entry.managementEpoch) {
     facts.push(`Linked work ${entry.workId} in project ${entry.projectId}; management epoch ${entry.managementEpoch}.`,
       observedSession('Current Leader', entry.leaderSessionId, observe))
@@ -37,7 +38,12 @@ function documentHealth(entry: WatchdogDocument, captureUnconfirmed: boolean, ob
       const { evidenceId, turn, failureEventSeq } = entry.recovery
       facts.push(`Recovery evidence ${evidenceId}: current continuation ended with TRANSPORT (turn ${turn}, event ${failureEventSeq}).`,
         `To consider a paused replacement, open an unbound document Worker and use /studio-doc recover ${entry.id} ${evidenceId}.`)
-    } else if (!entry.paused && !entry.pendingReview && !captureUnconfirmed && !entry.pauseUnconfirmed
+    }
+    if (entry.repeatedScopeRefusals) {
+      const calls = entry.repeatedScopeRefusals.map(({ evidenceId, eventSeq }) => `Native call event ${eventSeq}:\n/studio-doc guard ${evidenceId}`).join('\n')
+      concern = 'Progress concern: Repeated scope refusals (ACTION_NOT_APPROVED) on at least two distinct calls in the current execution and authorization. This does not confirm task failure or that the requested effects were the same.\n'
+        + `To inspect the two most recent recorded calls, open current document Worker Session ${entry.sessionId} and run:\n${calls}`
+    } else if (!entry.recovery && !entry.paused && !entry.pendingReview && !captureUnconfirmed && !entry.pauseUnconfirmed
       && (!entry.shared || entry.shared.baseVersion === entry.shared.headVersion)) facts.push('Awaiting the current authorized document action.')
   }
   // A historical delivery remains visible after recovery, but is not a receipt for a newer failure.
@@ -51,7 +57,7 @@ function documentHealth(entry: WatchdogDocument, captureUnconfirmed: boolean, ob
     facts.push('No Feishu notice attempt recorded for the current evidence.')
   }
   facts.push(observedSession('Current Worker', entry.sessionId, observe))
-  return facts.join(' ')
+  return concern ? `${facts.join(' ')}\n${concern}` : facts.join(' ')
 }
 
 function jobHealth(entry: WatchdogJob, observe: ObserveSession): string {
@@ -129,6 +135,7 @@ export function watchdogCommand(store: ManagedWorkerStore, argument: string, obs
   if (captureUnconfirmed) header.push('A document instruction capture is unconfirmed in this Host run; document writes are held.')
   if (pauseUnconfirmed) header.push('A document pause is unconfirmed in this Host run; affected writes are held.')
   if (truncated.length) header.push(`Overview limited to ${WATCHDOG_PAGE_LIMIT} per category. More records exist for: ${truncated.join(', ')}. Use the exact ID to inspect one.`)
+  if (truncated.includes('document')) header.push('A document omitted from the overview may still have evidence. Use /studio-health document <task-id> to check it.')
   const sections = [...header, ...quotas.map(quotaHealth), ...entries.map(entry => renderEntry(entry, captureUnconfirmed, observe, failureAlerts))]
   if (!entries.length) sections.push('No matching task or job records in this snapshot; this is not a general health attestation.')
   return { kind: 'success', text: sections.join('\n') }
