@@ -53,6 +53,11 @@ function savedReason({ failure, state }: StudioProjectRun, job: StudioProjectWor
         reason: 'Studio recorded this outcome during Host restart recovery.',
         nextCheck: 'Check current project management and any saved model selection; the restart did not authorize work.',
       } : unconfirmed
+    case 'PROJECT_WORK_BLOCKED':
+      return state === 'released' ? {
+        reason: 'The owner blocked this work before the reservation reached Studio start.',
+        nextCheck: 'Review the saved obstacle and whether the work is still blocked in this work detail.',
+      } : unconfirmed
     case 'EXTERNAL_JOB_PAUSED':
     case 'EXTERNAL_JOB_NOT_COMPLETE':
       return job ? {

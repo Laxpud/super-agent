@@ -3,6 +3,7 @@ import type { DatabaseSync } from 'node:sqlite'
 import { readProjectDocument, type ProjectDocumentAccess } from './project-document-store.js'
 import { isJobState } from './project-job-store.js'
 import type { StudioProjectBinding, StudioProjectRun } from './project-store.ts'
+import { latestWorkBlockState } from './project-work-block-store.js'
 import type { SystemdJobState } from './systemd-job.ts'
 
 /** One work item's origin and bounded state, without request or result bodies. */
@@ -11,6 +12,8 @@ export interface ProjectHandoffItem {
   leaderSessionId: string
   managementEpoch: number
   sourceMessageId: string
+  /** An active owner hold, without the reason, condition, or command token. */
+  blocked?: true
   run?: {
     state: StudioProjectRun['state']
     managementEpoch: number
@@ -100,14 +103,17 @@ function isResult(value: unknown): value is NonNullable<NonNullable<ProjectHando
 
 /** Validate archived JSON and current projections with the same field, epoch, and state checks. */
 function checkedItem(value: unknown, maxEpoch: number): ProjectHandoffItem {
-  if (!hasFields(value, ['workId', 'leaderSessionId', 'managementEpoch', 'sourceMessageId'], ['run', 'document', 'job'])
+  if (!hasFields(value, ['workId', 'leaderSessionId', 'managementEpoch', 'sourceMessageId'], ['run', 'document', 'job', 'blocked'])
     || !isId(value.workId) || !isId(value.leaderSessionId) || !isVersion(value.managementEpoch)
     || value.managementEpoch > maxEpoch || !isId(value.sourceMessageId)) throw new Error('Invalid Studio handoff work coordinates')
-  const { run, document, job } = value
+  const { run, document, job, blocked } = value
   if (run !== undefined && (!hasFields(run, ['state', 'managementEpoch', 'executionEpoch', 'workerSessionId'], ['result'])
     || !isRunState(run.state) || !isVersion(run.managementEpoch) || run.managementEpoch < value.managementEpoch
     || run.managementEpoch > maxEpoch || !isVersion(run.executionEpoch) || !isId(run.workerSessionId)
     || (run.state === 'completed' ? !isResult(run.result) : run.result !== undefined))) throw new Error('Invalid Studio handoff run')
+  if (blocked !== undefined && (blocked !== true || document !== undefined || job !== undefined || (run && run.state !== 'released'))) {
+    throw new Error('Invalid Studio handoff text work block')
+  }
   if (document !== undefined && (!hasFields(document, ['taskId', 'workerSessionId', 'executionEpoch', 'authorizationVersion',
     'documentVersion', 'paused'], ['hold']) || !isId(document.taskId) || !isId(document.workerSessionId)
     || !isVersion(document.executionEpoch) || !isVersion(document.authorizationVersion) || typeof document.paused !== 'boolean'
@@ -163,9 +169,10 @@ function readItem(db: DatabaseSync, access: ProjectDocumentAccess, binding: Stud
   const run = readRun(db, binding.projectId, workId)
   const job = readJob(db, binding, workId)
   const document = readProjectDocument(db, access, { projectId: binding.projectId, workId }, false)
+  const blocked = latestWorkBlockState(db, workId) === 'active'
   const task = document?.task
   return checkedItem({ workId, leaderSessionId, managementEpoch, sourceMessageId,
-    ...(run === undefined ? {} : { run }), ...(job === undefined ? {} : { job }),
+    ...(blocked ? { blocked: true } : {}), ...(run === undefined ? {} : { run }), ...(job === undefined ? {} : { job }),
     ...(task ? { document: { taskId: task.taskId, workerSessionId: task.workerSessionId, executionEpoch: task.executionEpoch,
       authorizationVersion: task.authorizationVersion, documentVersion: task.documentVersion, paused: task.paused,
       ...(document.hold === undefined ? {} : { hold: document.hold }) } } : {}) }, maxEpoch)

@@ -9,7 +9,8 @@ function leader(binding: StudioProjectBinding): string {
 }
 
 /** Derive only a display label from the recorded states; it is not a dispatch or authorization decision. */
-function stateOf({ run, document, job }: ProjectHandoffItem): string {
+function stateOf({ run, document, job, blocked }: ProjectHandoffItem): string {
+  if (blocked) return 'blocked'
   if (run && run.state !== 'released') return run.state
   if (document) {
     if (document.documentVersion === 2) return 'document committed'
@@ -62,6 +63,7 @@ export function projectHandoffText({ record, current }: ProjectHandoffReview): s
     'Current state of the same work (read only):',
     leader(current.binding),
     ...(current.items.length ? current.items.map(workItem) : ['No recorded work IDs to recheck.']),
+    ...(current.items.some(item => item.blocked) ? ['Open /studio-project work <work-id> in the current Leader Session to check the saved condition for each blocked item.'] : []),
     '',
     'This record neither grants authorization nor starts work. Use /studio-project work [work-id] for other work or exact saved results, and check current authorization before continuing.',
   ].join('\n')

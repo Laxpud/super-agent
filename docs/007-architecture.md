@@ -362,9 +362,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/study-store.ts` | Retains exact study inputs and Worker evidence, gates synthesis on completed investigations, and never replays interrupted steps |
 | `src/managed-worker/project.ts` | Owner controls for project work and document links, with Leader tools to register and dispatch text work and inspect saved evidence |
 | `src/managed-worker/project-intake.ts` | Presents a source-bound Assistant proposal to the native Web answerer; only a positive owner answer can establish the project and its Leader Session |
-| `src/managed-worker/project-store.ts` | Persists current management, work and dispatch; rechecks the project, work type and any job hold at reservation and start |
+| `src/managed-worker/project-store.ts` | Persists current management, work and dispatch; rechecks the project, work type and any work block or job hold at reservation and start |
 | `src/managed-worker/project-dispatch-diagnosis.ts` | Explains known saved text dispatch outcomes in current Leader owner detail without exposing arbitrary failure strings, probing live state, or retrying |
-| `src/managed-worker/project-handoff-store.ts` | Captures bounded work coordinates and statuses in the transfer transaction and rechecks only those IDs under the current project binding |
+| `src/managed-worker/project-handoff-store.ts` | Captures bounded work coordinates and statuses, including active text work blocks without notes, in the transfer transaction; rechecks only those IDs under the current binding |
 | `src/managed-worker/project-handoff.ts` | Formats a read-only handoff review with historical state and current blockers or result coordinates in separate sections |
 | `src/managed-worker/project-archive.ts` | Handles owner-only commands for selecting, inspecting and tracing project facts without a model |
 | `src/managed-worker/project-archive-store.ts` | Stores fact revisions and excerpt coordinates under the stable project ID; checks management and exact saved Worker evidence before writes and reads |
@@ -373,6 +373,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/project-fact-use-store.ts` | Pins one fact revision to registered work without copying its excerpt; retains the native owner event and protects the immutable link |
 | `src/managed-worker/project-result-use-store.ts` | Pins one exact slice of a completed independent result to pending work in the same project; stores coordinates and a source fingerprint, not the text |
 | `src/managed-worker/project-work-model-store.ts` | Records native model choices and withdrawals for pending text work, and spends the exact choice alongside the one authorized dispatch epoch |
+| `src/managed-worker/project-work-block-store.ts` | Records native owner holds and exact clears on unstarted text work; atomically releases reservations and exposes status without copying decision notes |
 | `src/managed-worker/bot-experience.ts` | Handles owner-only commands for recording a reusable method and inspecting its applicability and provenance |
 | `src/managed-worker/bot-experience-store.ts` | Keys method revisions by stable Leader Bot and checks their exact project fact parents without returning source project text |
 | `src/managed-worker/project-document-store.ts` | Links project work to one authorized document task, reads its exact audited commit, and includes correction history only in an authorized owner detail read |

@@ -36,6 +36,7 @@ import { PROJECT_JOB_AUTO_SCHEMA } from './project-job-auto-store.js'
 import { PROJECT_JOB_SCHEMA } from './project-job-store.js'
 import { PROJECT_RESULT_USE_SCHEMA, projectResultCommandUsed } from './project-result-use-store.js'
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
+import { PROJECT_WORK_BLOCK_SCHEMA, projectWorkBlockCommandUsed } from './project-work-block-store.js'
 import { PROJECT_WORK_MODEL_SCHEMA, projectWorkModelCommandUsed } from './project-work-model-store.js'
 import { QUOTA_NOTICE_SCHEMA, QuotaNoticeStore, isQuotaNoticeMessageId, type StudioQuotaNotice } from './quota-notice-store.js'
 import { QUOTA_SCHEMA, QuotaStore, type StudioQuotaIncident } from './quota-store.js'
@@ -61,6 +62,7 @@ export { MEMORY_TEXT_LIMIT, PREFERENCE_CORRECTION_RECEIPT_PREFIX, PREFERENCE_PRO
   type PreferenceProposal, type PreferenceProposalInput, type PreferenceScopeChangeInput, type PreferenceScopeChangeReceipt,
   type StudioPreference } from './memory-store.js'
 export { PROJECT_FACT_QUOTE_LIMIT, isProjectFactKey, isProjectFactQuote, type ProjectFact } from './project-archive-store.js'
+export { PROJECT_WORK_BLOCK_TEXT_LIMIT, type ProjectWorkBlockView } from './project-work-block-store.js'
 export type { ProjectWorkFactUse } from './project-fact-use-store.js'
 export type { StudioQuotaNotice } from './quota-notice-store.js'
 export type { StudioQuotaIncident, StudioQuotaReason } from './quota-store.js'
@@ -422,6 +424,7 @@ export class ManagedWorkerStore {
         this.db.exec(PROJECT_FACT_USE_SCHEMA)
         this.db.exec(PROJECT_RESULT_USE_SCHEMA)
         this.db.exec(PROJECT_WORK_MODEL_SCHEMA)
+        this.db.exec(PROJECT_WORK_BLOCK_SCHEMA)
         this.db.exec(INSTRUCTION_SCHEMA)
         this.db.exec(FEISHU_DRAFT_SCHEMA)
         this.db.exec(FEISHU_DELIVERY_SCHEMA)
@@ -1765,6 +1768,7 @@ export class ManagedWorkerStore {
       || projectDocumentCommandUsed(this.db, commandId)
       || projectResultCommandUsed(this.db, commandId)
       || projectWorkModelCommandUsed(this.db, commandId)
+      || projectWorkBlockCommandUsed(this.db, commandId)
   }
 
   private actionUsed(sessionId: string, toolCallId: string): boolean {

@@ -15,6 +15,8 @@ import { appendWorkResultUse, PROJECT_RESULT_QUOTE_LIMIT, projectResultCommandUs
   workResultFingerprint, workResultUseView, type ProjectWorkResultUse, type WorkResultSource } from './project-result-use-store.js'
 import type { ManagedResult, StudioDraftResult } from './store.ts'
 import { assistantSourceUsed } from './study-store.js'
+import { appendWorkBlock, appendWorkBlockClear, isProjectWorkBlockText, latestWorkBlock, latestWorkBlockState,
+  projectWorkBlockCommandUsed, type ProjectWorkBlockView } from './project-work-block-store.js'
 import { appendWorkModel, appendWorkModelClear, appendWorkModelConsume, exactConsumedWorkModel, hasUnclearedWorkModel,
   isWorkModelSelectionId, latestWorkModel, projectWorkModelCommandUsed, readPinnedWorkModel, readWorkModelDispatch, sameWorkModel,
   workModelSourceUsed, workModelState, workModelView, type ProjectWorkModelDispatchIntent, type ProjectWorkModelSelection,
@@ -27,6 +29,7 @@ export type { ProjectDocumentDecision, ProjectDocumentDecisionHistory } from './
 export type { StudioProjectDocument } from './project-document-store.js'
 export type { StudioProjectJob } from './project-job-store.js'
 export { PROJECT_RESULT_QUOTE_LIMIT, type ProjectWorkResultUse } from './project-result-use-store.js'
+export { PROJECT_WORK_BLOCK_TEXT_LIMIT, type ProjectWorkBlockView } from './project-work-block-store.js'
 export type { ProjectWorkModelDispatch, ProjectWorkModelDispatchIntent, ProjectWorkModelSelection,
   ProjectWorkModelSelectionView } from './project-work-model-store.js'
 
@@ -98,6 +101,10 @@ export interface StudioProjectWorkView {
   fact?: ProjectWorkFactUse
   resultUse?: ProjectWorkResultUse
   modelSelection?: ProjectWorkModelSelectionView
+  /** Only present while an owner hold is active. */
+  blocked?: true
+  /** Latest decision, including a clear when recorded; only current native owner detail may include it. */
+  workBlock?: ProjectWorkBlockView
 }
 
 // The current epoch points to an immutable binding. Each binding also records the native command that created it.
@@ -709,6 +716,40 @@ export class ProjectStore {
     return { ...binding, workId, sourceMessageId, sourceRequestId, requestText }
   }
 
+  /** Host-only: hold standalone text work and release its still-unstarted reservation, if any. */
+  blockWork(leaderSessionId: string, workId: string, reason: string, resumeWhen: string, commandId: string): ManagedResult<ProjectWorkBlockView> {
+    if (!isId(leaderSessionId) || !isId(workId) || !isId(commandId)
+      || !isProjectWorkBlockText(reason) || !isProjectWorkBlockText(resumeWhen)) return deny('INVALID_INPUT')
+    return this.access.write(() => {
+      const actor = this.currentProject(leaderSessionId, true)
+      if (!actor.ok) return actor
+      if (!this.work(actor.value.projectId, workId)) return deny('WORK_NOT_FOUND')
+      if (this.commandUsed(commandId) || this.access.documentCommandUsed(commandId)) return deny('DUPLICATE_COMMAND')
+      if (latestWorkBlockState(this.db, workId) === 'active') return deny('PROJECT_WORK_BLOCK_ALREADY_ACTIVE')
+      if (this.workHasDocumentOrJob(workId)) return deny('PROJECT_WORK_BLOCK_TEXT_ONLY')
+      if (this.db.prepare(`SELECT 1 FROM studio_project_dispatch
+        WHERE work_id = ? AND state <> 'released' AND state <> 'reserved'`).get(workId)) {
+        return deny('WORK_ALREADY_DISPATCHED')
+      }
+      return accept(appendWorkBlock(this.db, actor.value, workId, reason, resumeWhen, commandId))
+    })
+  }
+
+  /** Host-only: clear the exact active block, including one inherited across handoff, without granting dispatch authority. */
+  unblockWork(leaderSessionId: string, workId: string, blockId: string, change: string, commandId: string): ManagedResult<ProjectWorkBlockView> {
+    if (!isId(leaderSessionId) || !isId(workId) || !isId(commandId) || !isProjectWorkBlockText(change)) return deny('INVALID_INPUT')
+    if (!isId(blockId)) return deny('PROJECT_WORK_BLOCK_NOT_CURRENT')
+    return this.access.write(() => {
+      const actor = this.currentProject(leaderSessionId, true)
+      if (!actor.ok) return actor
+      if (!this.work(actor.value.projectId, workId)) return deny('WORK_NOT_FOUND')
+      if (this.commandUsed(commandId) || this.access.documentCommandUsed(commandId)) return deny('DUPLICATE_COMMAND')
+      const block = latestWorkBlock(this.db, workId)
+      if (!block || block.cleared || block.blockId !== blockId) return deny('PROJECT_WORK_BLOCK_NOT_CURRENT')
+      return accept(appendWorkBlockClear(this.db, actor.value, block, change, commandId))
+    })
+  }
+
   /** Host-only: record a native owner's exact route without authorizing a dispatch. */
   bindWorkModel(leaderSessionId: string, workId: string, route: PinnedTextWorkerModel, commandId: string): ManagedResult<ProjectWorkModelSelection> {
     const pinned = readPinnedWorkModel(route)
@@ -756,9 +797,15 @@ export class ProjectStore {
     })
   }
 
-  /** No token can fall through to the ordinary route. An owner must explicitly dispatch after a withdrawal. */
+  /** Check the hold before model lookup; neither a clear nor an invalid token can fall through to the ordinary route. */
   private resolveWorkModelInTransaction(actor: StudioProjectBinding, workId: string, selectionId: string | undefined,
     explicitPlain: boolean, automatic = false): ManagedResult<ProjectWorkModelSelection | undefined> {
+    const block = latestWorkBlockState(this.db, workId)
+    if (block === 'active') return deny('PROJECT_WORK_BLOCKED')
+    // A separately armed future job still has to pass the existing grant checks in reserveWork.
+    if (block === 'cleared' && !automatic && selectionId === undefined && !explicitPlain) {
+      return deny('PROJECT_WORK_UNBLOCK_REQUIRES_OWNER')
+    }
     const model = latestWorkModel(this.db, workId)
     if (automatic && (selectionId !== undefined || (model && !model.cleared))) return deny('PROJECT_MODEL_SELECTION_REQUIRES_OWNER')
     if (selectionId === undefined) {
@@ -790,6 +837,7 @@ export class ProjectStore {
       const current = this.currentProject(leaderSessionId)
       if (!current.ok) return current
       if (!this.work(current.value.projectId, workId)) return deny('WORK_NOT_FOUND')
+      if (latestWorkBlockState(this.db, workId) === 'active') return deny('PROJECT_WORK_BLOCKED')
       if (hasUnclearedWorkModel(this.db, workId)) return deny('WORK_MODEL_TEXT_ONLY')
       if (readWorkFact(this.db, workId)) return deny('FACT_TEXT_WORK_ONLY')
       if (readWorkResultUse(this.db, workId)) return deny('RESULT_TEXT_WORK_ONLY')
@@ -806,6 +854,7 @@ export class ProjectStore {
     const { unit, invocationId } = ref
     if (!isId(unit) || !isId(invocationId) || !validSystemdJob({ unit, invocationId })) return deny('INVALID_INPUT')
     return this.withCurrentJobWork(leaderSessionId, workId, actor => {
+      if (latestWorkBlockState(this.db, workId) === 'active') return deny('PROJECT_WORK_BLOCKED')
       if (hasUnclearedWorkModel(this.db, workId)) return deny('WORK_MODEL_TEXT_ONLY')
       if (readWorkFact(this.db, workId)) return deny('FACT_TEXT_WORK_ONLY')
       if (readWorkResultUse(this.db, workId)) return deny('RESULT_TEXT_WORK_ONLY')
@@ -859,6 +908,7 @@ export class ProjectStore {
       return deny('INVALID_INPUT')
     }
     return this.withCurrentJobWork(leaderSessionId, workId, actor => {
+      if (latestWorkBlockState(this.db, workId) === 'active') return deny('PROJECT_WORK_BLOCKED')
       const job = readProjectJob(this.db, actor.projectId, workId)
       return job ? armProjectJob(this.db, actor, job, commandId, expectedAuthorizationVersion, approvedRoute, () => this.commandUsed(commandId))
         : deny('EXTERNAL_JOB_NOT_FOUND')
@@ -1064,6 +1114,7 @@ export class ProjectStore {
       // A started Worker can settle across handoff, but it cannot publish a result against stale evidence.
       const stored = this.exactRun(identity)
       if (!stored) return deny('STALE_EXECUTION')
+      if (stored.state === 'released' && stored.failure === 'PROJECT_WORK_BLOCKED') return deny('PROJECT_WORK_BLOCKED')
       if (stored.state !== 'running' && (stored.state !== 'reserved' || outcome)) return deny('WORK_NOT_RUNNING')
       const fact = outcome ? this.confirmWorkFact(stored) : undefined
       const source = this.confirmWorkResult(stored)
@@ -1081,7 +1132,7 @@ export class ProjectStore {
     })
   }
 
-  /** Read exact project work. Only an explicit owner read by the current Leader includes document decisions or a result-use body. */
+  /** Read exact project work. Only current native owner detail includes decision bodies or a result-use body. */
   readWork(sessionId: string, workId: string, ownerDetail = false): ManagedResult<StudioProjectWorkView> {
     if (!isId(sessionId) || !isId(workId)) return deny('INVALID_INPUT')
     return this.access.snapshot(() => {
@@ -1116,11 +1167,14 @@ export class ProjectStore {
     const job = readProjectJob(this.db, work.projectId, work.workId)
     const document = readProjectDocument(this.db, this.access, work, full, owner !== undefined)
     const model = owner && latestWorkModel(this.db, work.workId)
-    // Historical Leaders retain evidence provenance. Native model choices are only shown to the current Leader's owner.
+    const workBlock = owner && latestWorkBlock(this.db, work.workId)
+    // The public status has no reason, condition, or change. Historical Leaders retain evidence provenance only.
+    const blocked = owner ? workBlock !== undefined && !workBlock.cleared : latestWorkBlockState(this.db, work.workId) === 'active'
     const fact = pinned && { ...pinned, current: pinned.projectId === work.projectId && this.factQuote(pinned) !== undefined }
     const resultUse = pinnedResult && workResultUseView(pinnedResult, this.currentWorkResult(pinnedResult, work.projectId) !== undefined)
     return { work, ...this.workRunView(work, fact, includeFactResult, resultUse, owner !== undefined),
-      ...(job ? { job } : {}), ...(document ? { document } : {}), ...(model && owner ? { modelSelection: workModelView(model, owner) } : {}) }
+      ...(job ? { job } : {}), ...(document ? { document } : {}), ...(model && owner ? { modelSelection: workModelView(model, owner) } : {}),
+      ...(blocked ? { blocked: true } : {}), ...(workBlock ? { workBlock } : {}) }
   }
 
   private factQuote({ projectId, key, revision }: WorkFactSource): string | undefined {
@@ -1228,8 +1282,11 @@ export class ProjectStore {
     if (!current.ok) return current
     const stored = this.exactRun(identity)
     if (!stored) return deny('STALE_EXECUTION')
-    if (stored.state !== 'reserved') return deny('WORK_NOT_RESERVED')
     if (!this.work(stored.projectId, stored.workId)) return deny('WORK_NOT_FOUND')
+    // A clear never revives the exact attempt the hold released, even if a later reservation exists.
+    if ((stored.state === 'released' && stored.failure === 'PROJECT_WORK_BLOCKED')
+      || latestWorkBlockState(this.db, stored.workId) === 'active') return deny('PROJECT_WORK_BLOCKED')
+    if (stored.state !== 'reserved') return deny('WORK_NOT_RESERVED')
     const model = this.confirmWorkModelRun(stored)
     if (!model.ok) return model
     const fact = this.confirmWorkFact(stored)
@@ -1311,6 +1368,7 @@ export class ProjectStore {
       || projectDocumentCommandUsed(this.db, commandId)
       || projectResultCommandUsed(this.db, commandId)
       || projectWorkModelCommandUsed(this.db, commandId)
+      || projectWorkBlockCommandUsed(this.db, commandId)
   }
 
   /** Scope exact IDs and latest lookups to the originating Session, not the shared Assistant Bot. */
