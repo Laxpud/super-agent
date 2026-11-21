@@ -156,7 +156,7 @@ export function apply(context: Context, config: Config): void {
   if (feishuConfig) validateFeishuInbox(feishuConfig)
   if (feishuTextInbox) validateFeishuTextRoute(feishuTextInbox)
   const combinedFeishu = feishuTextInbox?.documentCorrections === true
-  const combinedFeishuScope = feishuTextInbox && combinedFeishu ? feishuSourceScope(feishuTextInbox) : undefined
+  const feishuTextScope = feishuTextInbox ? { scope: feishuSourceScope(feishuTextInbox), documentCorrections: combinedFeishu } : undefined
   if (quotaFeishuAlerts && (!feishuConfig || !quotaPools.length)) throw new Error('Studio quota notices require a dedicated Feishu inbox and quota pools')
   if (documentFailureFeishuAlerts && (!documentRecovery || !feishuConfig)) {
     throw new Error('Studio document failure notices require document recovery and a dedicated Feishu inbox')
@@ -179,10 +179,10 @@ export function apply(context: Context, config: Config): void {
   let store: ManagedWorkerStore
   try {
     store = new ManagedWorkerStore(join(stateDir, 'managed-worker.sqlite'), quotaPools.map(pool => pool.id),
-      quotaNoticeScope, combinedFeishuScope, documentFailureNoticeScope)
+      quotaNoticeScope, feishuTextScope, documentFailureNoticeScope)
   }
   catch (error) { unlock(); throw error }
-  if (feishuTextInbox && !store.feishuDraftScopeAvailable(feishuSourceScope(feishuTextInbox))) {
+  if (feishuTextScope && !store.feishuDraftScopeAvailable(feishuTextScope.scope)) {
     // Only the explicit combined configuration can share an existing document chat.
     try { store.finishRun() } finally { try { store.close() } finally { unlock() } }
     throw new Error('Studio Feishu text requires an unbound chat or an available combined inbox')
@@ -227,7 +227,7 @@ export function apply(context: Context, config: Config): void {
   const preferenceChanges = memory ? new StudioPreferenceChange(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal) : undefined
   const delivery = new AgentDelivery(ctx)
   const continuations = documentContinuations ? new StudioDocumentContinuation(ctx, store, delivery, ready, channelStop.signal) : undefined
-  const feishuText = feishuTextInbox ? new StudioFeishuText(store, drafts, feishuTextInbox, channelStop.signal, channelReady, combinedFeishu) : undefined
+  const feishuText = feishuTextInbox ? new StudioFeishuText(store, drafts, feishuTextInbox, channelStop.signal, channelReady) : undefined
   const feishu = feishuConfig && new StudioFeishuInbox(ctx, store, stateDir, feishuConfig, channelReady, feishuText,
     !!feishuDocumentInbox || combinedFeishu, failureNoticeReady,
     continuations && ((source, intent, signal) => continuations.receiveFeishu(source, intent, signal)))

@@ -357,8 +357,9 @@ export class ManagedWorkerStore {
   private readonly frozenSessions = new Set<string>()
   private readonly feishuDrafts = new FeishuDraftStore(() => this.db, this.#runId, isDraftText)
   private readonly feishuDeliveries = new FeishuDeliveryStore(() => this.db, this.#runId)
-  // Only fresh draft claims grant a synchronous start attempt. Unused grants expire, but the SQLite claims remain.
+  // Only the configured text chat can claim a draft. Its synchronous start grant expires, but the SQLite claim remains.
   private readonly pendingFeishuDraftClaims = new Map<string, number>()
+  private readonly feishuCombinedScope?: string
   private readonly instructions = new InstructionStore(() => this.db)
   private readonly documentRecovery = new DocumentRecoveryStore({
     db: () => this.db,
@@ -391,10 +392,11 @@ export class ManagedWorkerStore {
 
   /** Open the database under the host directory lock. Do not enable actions until the recovery transaction has committed. */
   constructor(path: string, quotaPoolIds: readonly string[] = [], private readonly quotaNoticeScope?: string,
-    private readonly feishuCombinedScope?: string, private readonly documentFailureNoticeScope?: string) {
+    private readonly feishuText?: Readonly<{ scope: string; documentCorrections: boolean }>, private readonly documentFailureNoticeScope?: string) {
     if (!isId(path) || path === ':memory:') throw new Error('Managed Worker requires a persistent SQLite path')
     if (quotaNoticeScope !== undefined && !isId(quotaNoticeScope)) throw new Error('Invalid Studio quota notice scope')
-    if (feishuCombinedScope !== undefined && !isId(feishuCombinedScope)) throw new Error('Invalid Studio Feishu combined scope')
+    if (feishuText !== undefined && !isId(feishuText.scope)) throw new Error('Invalid Studio Feishu text scope')
+    this.feishuCombinedScope = feishuText?.documentCorrections === true ? feishuText.scope : undefined
     if (documentFailureNoticeScope !== undefined && !isId(documentFailureNoticeScope)) throw new Error('Invalid Studio document failure notice scope')
     this.quota = new QuotaStore(quotaPoolIds, () => this.db, operation => this.write(operation), operation => this.snapshot(operation))
     const file = resolve(path)
@@ -857,13 +859,14 @@ export class ManagedWorkerStore {
     return { text, messageId, eventSeq, turn }
   }
 
-  /** Claim a combined-scope text route before parsing or checking quota. A duplicate never grants another attempt. */
+  /** Claim the text route before checking its body, quota, or Worker availability. A refusal does not free the message ID. */
   claimFeishuTextDelivery(source: StudioFeishuInstruction, route: 'draft' | 'result'): ManagedResult<{ claimed: boolean }> {
     const result = this.write<ReturnType<typeof feishuDeliveryCoordinates>>(() => {
       const delivery = feishuDeliveryCoordinates(source)
       if (!delivery || (route !== 'draft' && route !== 'result')) return deny('INVALID_INPUT')
       const { sourceScope, requestId } = delivery
-      if (sourceScope !== this.feishuCombinedScope) return deny('FEISHU_COMBINED_SCOPE_REQUIRED')
+      if (sourceScope !== this.feishuText?.scope) return deny('FEISHU_TEXT_SCOPE_REQUIRED')
+      if (this.hasExclusiveFeishuDocument(sourceScope)) return deny('FEISHU_DOCUMENT_BOUND')
       if (this.feishuDeliverySeen(sourceScope, requestId)) return accept(undefined)
       this.feishuDeliveries.insert(delivery, route)
       return accept(delivery)
@@ -881,30 +884,26 @@ export class ManagedWorkerStore {
   /** Reserve one execution for an authenticated Feishu text delivery before launching a Worker. */
   startFeishuDraft(input: StudioFeishuInstruction, requestText: string, workerSessionId: string):
     ManagedResult<{ task: StudioFeishuDraftTask; created: boolean }> {
-    const delivery = input?.sourceScope === this.feishuCombinedScope ? feishuDeliveryCoordinates(input) : undefined
+    const delivery = feishuDeliveryCoordinates(input)
+    if (!delivery) return deny('INVALID_INPUT')
+    if (delivery.sourceScope !== this.feishuText?.scope) return deny('FEISHU_TEXT_SCOPE_REQUIRED')
     // Consume the opportunity before checking the body, busy state, or Worker binding; a refusal must not be retryable.
-    const freshClaim = !!delivery && this.pendingFeishuDraftClaims.get(delivery.requestId) === delivery.sourceTimeMs
+    const freshClaim = this.pendingFeishuDraftClaims.get(delivery.requestId) === delivery.sourceTimeMs
     if (freshClaim) this.pendingFeishuDraftClaims.delete(delivery.requestId)
     const source = feishuDraftSource(input, isDraftText)
-    if (!source) return deny('INVALID_INPUT')
+    if (!source || delivery.sourceScope !== source.sourceScope || delivery.requestId !== source.requestId
+      || delivery.sourceTimeMs !== source.sourceTimeMs) return deny('INVALID_INPUT')
     return this.write<{ task: StudioFeishuDraftTask; created: boolean }>(() => {
       const scope = source.sourceScope
       // A redelivery can return its original task without starting anything, even after a routing change.
       const existing = this.feishuDrafts.duplicate(scope, source.requestId)
       if (existing) return accept({ task: existing, created: false })
-      // A continuation claim is not a text task. Reject it in both modes before considering a new reservation.
-      if (feishuDocumentContinuationSeen(this.db, scope, source.requestId)) return deny('FEISHU_DELIVERY_ALREADY_ROUTED')
-      const combined = scope === this.feishuCombinedScope
-      if (combined) {
-        if (!freshClaim || delivery.requestId !== source.requestId || delivery.sourceTimeMs !== source.sourceTimeMs
-          || !this.feishuDeliveries.currentDraft(source)) return deny('FEISHU_DELIVERY_ALREADY_ROUTED')
-        if (this.instructions.feishuLate(scope, source.sourceTimeMs) || this.feishuDeliveries.actionLate(scope, source.sourceTimeMs)) {
-          return deny('FEISHU_MESSAGE_LATE')
-        }
-      } else {
-        // A first route chosen in combined mode still owns the ID after reverting to a legacy configuration.
-        if (this.feishuDeliveries.has(scope, source.requestId)) return deny('FEISHU_DELIVERY_ALREADY_ROUTED')
-        if (this.instructions.feishuTask(scope) !== undefined) return deny('FEISHU_DOCUMENT_BOUND')
+      if (!freshClaim || !this.feishuDeliveries.currentDraft(source)) return deny('FEISHU_DELIVERY_ALREADY_ROUTED')
+      if (this.hasExclusiveFeishuDocument(scope)) return deny('FEISHU_DOCUMENT_BOUND')
+      // Only the combined inbox orders a draft against other claimed actions, not just saved text tasks.
+      if (scope === this.feishuCombinedScope
+        && (this.instructions.feishuLate(scope, source.sourceTimeMs) || this.feishuDeliveries.actionLate(scope, source.sourceTimeMs))) {
+        return deny('FEISHU_MESSAGE_LATE')
       }
       if (this.feishuDrafts.late(scope, source.sourceTimeMs)) return deny('FEISHU_MESSAGE_LATE')
       if (this.feishuDrafts.busy(scope)) return deny('FEISHU_TEXT_BUSY')
@@ -961,11 +960,16 @@ export class ManagedWorkerStore {
     return this.feishuDrafts.binding(sessionId)
   }
 
-  /** Only the configured combined scope may route text when bound to a document; the Host must own this run. */
+  /** Check that the configured text chat can start listening. Recheck the binding when claiming or starting work. */
   feishuDraftScopeAvailable(scope: string): boolean {
-    if (!isId(scope)) return false
-    const result = this.snapshot(() => accept(scope === this.feishuCombinedScope || this.instructions.feishuTask(scope) === undefined))
+    if (this.feishuText?.scope !== scope) return false
+    const result = this.snapshot(() => accept(!this.hasExclusiveFeishuDocument(scope)))
     return result.ok && result.value
+  }
+
+  /** Only the explicitly combined chat can route text while bound to a document. */
+  private hasExclusiveFeishuDocument(scope: string): boolean {
+    return scope !== this.feishuCombinedScope && this.instructions.feishuTask(scope) !== undefined
   }
 
   /** Check permanent secondary roles without reentering any facade's transaction. */
@@ -1038,7 +1042,7 @@ export class ManagedWorkerStore {
     })
   }
 
-  /** Let the legacy text-only Host skip deliveries owned by the continuation route, including after reconfiguration. */
+  /** Suppress the text-only usage hint for a delivery already owned by the continuation route. */
   feishuDocumentContinuationSeen(scope: string, requestId: string): ManagedResult<boolean> {
     if (!isId(scope) || !isId(requestId)) return deny('INVALID_INPUT')
     return this.snapshot(() => accept(feishuDocumentContinuationSeen(this.db, scope, requestId)))

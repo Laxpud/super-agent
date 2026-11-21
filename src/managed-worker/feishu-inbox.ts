@@ -211,8 +211,8 @@ export class StudioFeishuInbox {
     // Classify the reserved namespace even if the original text is too large to retain. Never turn a malformed text command into a correction.
     const command = this.text && content !== undefined ? feishuTextCommand(content) : undefined
     if (this.text && (command || !this.documentCorrections)) {
-      if (!this.documentCorrections) {
-        // Standalone text skips the combined route claim. A continuation from a previous configuration must stay claimed.
+      if (!command) {
+        // Explicit commands check all prior routes in their claim transaction. Keep old continuations silent even without a command.
         const seen = this.store.feishuDocumentContinuationSeen(this.scope, source.requestId)
         if (!seen.ok) {
           this.ctx.logger.warn('Studio could not confirm the Feishu message route')

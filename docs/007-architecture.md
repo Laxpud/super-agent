@@ -411,7 +411,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot, routes the configured owner's private chat to enabled text, review or continuation paths, and sends best-effort plain-text receipts |
 | `src/managed-worker/feishu-text.ts` | Routes explicit single-message text commands to a restricted Worker or exact result retrieval without rerunning completed work |
 | `src/managed-worker/feishu-draft-store.ts` | Preserves Feishu input, task and Worker identities, and result provenance; deduplicates deliveries under the shared SQLite run fence |
-| `src/managed-worker/feishu-delivery-store.ts` | Fixes the first route for each combined-inbox delivery and retains those claims across restarts and mode changes |
+| `src/managed-worker/feishu-delivery-store.ts` | Claims text commands in both inbox modes and document deliveries in the combined inbox; retains the first route across restarts and mode changes |
 | `src/managed-worker/instruction-store.ts` | Preserves Feishu task links, original deliveries and review receipts, including replacements narrowed to a subset of approved changes; pending inputs hold writes even when the listeners are off |
 | `src/managed-worker/document-command.ts` | Owner-only commands for inspecting, creating and editing a shared document, and for selecting a task's exact base revision |
 | `src/managed-worker/document-guard.ts` | Distinguishes scope refusals, state holds and unconfirmed checks in tool feedback; formats owner-only evidence queries |

@@ -47,16 +47,15 @@ export class StudioFeishuText {
   private readonly work = new Set<Promise<void>>()
 
   constructor(private readonly store: ManagedWorkerStore, private readonly workers: StudioAssistant,
-    private readonly config: FeishuTextRoute, private readonly stopping: AbortSignal, private readonly allowed: () => boolean,
-    private readonly combined: boolean) {}
+    private readonly config: FeishuTextRoute, private readonly stopping: AbortSignal, private readonly allowed: () => boolean) {}
 
   async drain(): Promise<void> { await Promise.all(this.work) }
 
   /** Accept only the explicit text route, never a document correction or a guessed task. */
   receive(source: StudioFeishuInstruction, command: FeishuTextCommand | undefined, reply: Reply): void {
-    if (this.stopping.aborted || !this.allowed() || !this.store.feishuDraftScopeAvailable(source.sourceScope)) return
-    if (this.combined && command) {
-      // Pin the accepted route before processing its arguments. A rejected command cannot become a later correction or dispatch.
+    if (this.stopping.aborted || !this.allowed()) return
+    if (command) {
+      // Persist the first route before interpreting arguments or checking whether work may start, even in text-only mode.
       const claim = this.store.claimFeishuTextDelivery(source, command.kind)
       if (!claim.ok) { reply('Studio could not confirm this message route. No text action was started.'); return }
       if (!claim.value.claimed) return
