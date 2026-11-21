@@ -93,10 +93,18 @@ function executionHealth(entry: WatchdogExecution, observe: ObserveSession): str
   const label = entry.kind === 'project' ? 'Project text work' : entry.kind === 'feishu' ? 'Feishu task'
     : entry.kind === 'draft' ? 'Web draft' : entry.kind === 'study' ? 'Study' : 'Advice'
   const status = entry.kind === 'project' && entry.state === 'pending' ? 'no text dispatch recorded' : executionStatus[entry.state]
-  const facts = [`${label} ${entry.id}: ${status}.`]
-  if (entry.reason) facts.push(`Recorded reason: ${entry.reason}.`)
+  const block = entry.kind === 'project' ? entry.ownerBlock : undefined
+  // Keep a past release separate from the current owner decision. A later running or finished dispatch leads with its execution state.
+  const hold = block === 'active' ? 'blocked by owner'
+    : block === 'cleared' && (entry.state === 'pending' || entry.state === 'released') ? 'owner block cleared' : undefined
+  const facts = [`${label} ${entry.id}: ${hold ?? status}.`]
+  if (hold) facts.push(`Text dispatch history: ${status}.`)
+  if (entry.reason === 'PROJECT_WORK_BLOCKED') facts.push('An owner block released that reservation before it started.')
+  else if (entry.reason) facts.push(`Recorded reason: ${entry.reason}.`)
+  if (block === 'cleared') facts.push(hold ? 'Clearing the block did not authorize dispatch.' : 'An earlier owner block was cleared; that did not authorize dispatch.')
   if (entry.projectId && entry.leaderSessionId && entry.managementEpoch) facts.push(`Project ${entry.projectId}; management epoch ${entry.managementEpoch}.`,
     observedSession('Current Leader', entry.leaderSessionId, observe))
+  if (block) facts.push(`For the saved condition, use /studio-project work ${entry.id} in the current Leader Session.`)
   if (entry.sessionId && (entry.state === 'reserved' || entry.state === 'running')) {
     if (entry.executionEpoch) facts.push(`Execution epoch ${entry.executionEpoch}.`)
     facts.push(observedSession(entry.kind === 'advice' ? 'Advisor' : 'Worker', entry.sessionId, observe))
@@ -136,6 +144,7 @@ export function watchdogCommand(store: ManagedWorkerStore, argument: string, obs
   if (pauseUnconfirmed) header.push('A document pause is unconfirmed in this Host run; affected writes are held.')
   if (truncated.length) header.push(`Overview limited to ${WATCHDOG_PAGE_LIMIT} per category. More records exist for: ${truncated.join(', ')}. Use the exact ID to inspect one.`)
   if (truncated.includes('document')) header.push('A document omitted from the overview may still have evidence. Use /studio-health document <task-id> to check it.')
+  if (truncated.includes('project')) header.push('Some project holds may be outside this overview. Use /studio-health project <work-id> to check one.')
   const sections = [...header, ...quotas.map(quotaHealth), ...entries.map(entry => renderEntry(entry, captureUnconfirmed, observe, failureAlerts))]
   if (!entries.length) sections.push('No matching task or job records in this snapshot; this is not a general health attestation.')
   return { kind: 'success', text: sections.join('\n') }

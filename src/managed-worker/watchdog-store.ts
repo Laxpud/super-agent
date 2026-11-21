@@ -3,6 +3,7 @@ import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
 import type { DocumentFailureNotice } from './document-failure-notice-store.js'
 import type { DocumentFailure } from './document-recovery-store.js'
 import { isJobState } from './project-job-store.js'
+import { latestWorkBlockState } from './project-work-block-store.js'
 import type { StudioQuotaIncident } from './quota-store.js'
 import type { ManagedTask } from './store.js'
 import { validSystemdJob } from './systemd-job.js'
@@ -77,6 +78,8 @@ export interface WatchdogExecution {
   leaderSessionId?: string
   managementEpoch?: number
   reason?: string
+  /** Latest project text block status, independent of the last reservation or execution. */
+  ownerBlock?: 'active' | 'cleared'
 }
 
 export type WatchdogEntry = WatchdogDocument | WatchdogJob | WatchdogExecution
@@ -116,10 +119,11 @@ const dispatchStates = [...adviceStates, 'released'] as const
 const jobStates = ['unknown', 'running', 'failed', 'completed'] as const
 
 // Compare in SQL so arbitrary failure strings never leave storage, even when a row is inspected by exact ID.
-const reasonColumn = `CASE
+const reasonColumn = (projectDispatch = false) => `CASE
   WHEN state IN ('interrupted', 'released') AND failure = 'HOST_RESTARTED' THEN 'HOST_RESTARTED'
   WHEN state = 'released' AND failure = 'STALE_MANAGEMENT' THEN 'STALE_MANAGEMENT'
   WHEN state = 'released' AND failure = 'EXTERNAL_JOB_PAUSED' THEN 'EXTERNAL_JOB_PAUSED'
+  ${projectDispatch ? "WHEN state = 'released' AND failure = 'PROJECT_WORK_BLOCKED' THEN 'PROJECT_WORK_BLOCKED'" : ''}
   END AS reason`
 
 type ExecutionSource = { table: string; id: string; states: readonly WatchdogExecution['state'][]; coordinates: string }
@@ -210,7 +214,7 @@ function coordinates(row: Row): Pick<WatchdogExecution, 'sessionId' | 'execution
 }
 
 function latestDispatch(db: DatabaseSync, workId: string, projectId: string): Omit<WatchdogExecution, 'kind' | 'id'> | undefined {
-  const row = db.prepare(`SELECT state, project_id, worker_session_id AS session_id, execution_epoch, ${reasonColumn}
+  const row = db.prepare(`SELECT state, project_id, worker_session_id AS session_id, execution_epoch, ${reasonColumn(true)}
     FROM studio_project_dispatch WHERE work_id = ? ORDER BY execution_epoch DESC LIMIT 1`).get(workId)
   if (!row) return
   const state = dispatchStates.find(value => value === row.state)
@@ -243,9 +247,13 @@ function job(db: DatabaseSync, id: string): WatchdogJob {
 
 function projectWork(db: DatabaseSync, id: string): WatchdogExecution {
   const leader = management(db, workOrigin(db, id))
-  // This is the work's text dispatch state, not the separately projected document or external job state.
+  // The last attempt stays historical after a block is set or cleared. Read only the current block status, not owner notes.
   const attempt = latestDispatch(db, id, leader.projectId) ?? { state: 'pending' as const }
-  return { kind: 'project', id, ...leader, ...attempt }
+  const ownerBlock = latestWorkBlockState(db, id)
+  if (ownerBlock === 'active' && attempt.state !== 'pending' && attempt.state !== 'released') {
+    throw new Error('An active owner block conflicts with the saved Studio text dispatch')
+  }
+  return { kind: 'project', id, ...leader, ...attempt, ...(ownerBlock === undefined ? {} : { ownerBlock }) }
 }
 
 function execution(db: DatabaseSync, kind: ExecutionKind, source: ExecutionSource, row: Row): WatchdogExecution {
@@ -288,13 +296,13 @@ function projectPage(db: DatabaseSync): WatchdogExecution[] {
     WHERE state IN ('reserved', 'running') ORDER BY work_id LIMIT ?`).all(pageSize)
   const entries = active.map(row => projectWork(db, requiredId(row)))
   if (entries.length === pageSize) return entries
-  // No index can order pending work by the absence of a related dispatch. Read a bounded recent window and
-  // prioritize pending items within it. If the window cannot contain all work, the extra row proves truncation.
+  // Prioritize holds and pending work within a bounded recent window, without scanning historical block records.
+  // If the window cannot contain all project work, the extra row proves truncation.
   const seen = new Set(entries.map(entry => entry.id))
+  const order = (entry: WatchdogExecution) => entry.ownerBlock === 'active' ? 0 : entry.state === 'pending' ? 1 : 2
   const recent = db.prepare('SELECT work_id AS id FROM studio_project_work ORDER BY rowid DESC LIMIT ?').all(pageSize)
-    .map(requiredId).filter(id => !seen.has(id)).map(id => projectWork(db, id))
-  return [...entries, ...recent.filter(entry => entry.state === 'pending'), ...recent.filter(entry => entry.state !== 'pending')]
-    .slice(0, pageSize)
+    .map(requiredId).filter(id => !seen.has(id)).map(id => projectWork(db, id)).sort((a, b) => order(a) - order(b))
+  return [...entries, ...recent].slice(0, pageSize)
 }
 
 function entriesFor(db: DatabaseSync, kind: WatchdogKind, documents: DocumentEvidence, id?: string): WatchdogEntry[] {
@@ -315,7 +323,7 @@ function entriesFor(db: DatabaseSync, kind: WatchdogKind, documents: DocumentEvi
       return db.prepare('SELECT 1 FROM studio_project_work WHERE work_id = ?').get(id) ? [projectWork(db, id)] : []
     default: {
       const source = executionSources[kind]
-      const select = `SELECT ${source.id} AS id, state, ${source.coordinates}, ${reasonColumn} FROM ${source.table}`
+      const select = `SELECT ${source.id} AS id, state, ${source.coordinates}, ${reasonColumn()} FROM ${source.table}`
       const rows = id === undefined ? statePage(db, select, source.id, source.states) : db.prepare(`${select} WHERE ${source.id} = ?`).all(id)
       return rows.map(row => execution(db, kind, source, row))
     }
