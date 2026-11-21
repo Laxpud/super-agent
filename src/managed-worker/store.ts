@@ -9,8 +9,11 @@ import { BOT_EXPERIENCE_SCHEMA, BotExperienceStore } from './bot-experience-stor
 import { DOCUMENT_CONTINUATION_SCHEMA, appendDocumentContinuationClaim, feishuDocumentContinuationLate, feishuDocumentContinuationSeen,
   readDocumentContinuationSource, type DocumentContinuationSelection, type DocumentContinuationSource } from './document-continuation-store.js'
 import { DOCUMENT_FAILURE_NOTICE_SCHEMA, DocumentFailureNoticeStore, type DocumentFailureNotice } from './document-failure-notice-store.js'
-import { DOCUMENT_GUARD_SCHEMA, documentGuardCategory, isDocumentGuardToolCallId, readDocumentGuardEvidence, retainDocumentGuard,
-  type DocumentGuardCapture, type DocumentGuardEvidence, type DocumentGuardScope } from './document-guard-store.js'
+import { DOCUMENT_GUARD_REVIEW_SCHEMA, appendDocumentGuardReview, documentGuardReviewUsed, readDocumentGuardReviewReceipt,
+  readDocumentGuardReviewSource, type DocumentGuardReviewReceipt, type DocumentGuardReviewSource } from './document-guard-review-store.js'
+import { DOCUMENT_GUARD_SCHEMA, documentGuardCategory, isDocumentGuardToolCallId, matchesDocumentGuardNativeCall,
+  readDocumentGuardEvidence, readDocumentGuardEvidenceById, readDocumentGuardNativeCall, retainDocumentGuard,
+  type DocumentGuardCapture, type DocumentGuardEvidence, type DocumentGuardNativeCall, type DocumentGuardScope } from './document-guard-store.js'
 import { DOCUMENT_RECOVERY_SCHEMA, DocumentRecoveryStore, type DocumentFailure, type DocumentFailureInput } from './document-recovery-store.js'
 import { parseDraftPreference } from './draft-preference-request.js'
 import { DRAFT_PREFERENCE_SCHEMA, appendDraftPreference, currentDraftCitation, draftPreferenceText, pinnedDraftPreference,
@@ -43,7 +46,8 @@ import { WATCHDOG_INDEXES, readWatchdogEntries, readWatchdogTarget,
 export { EXPERIENCE_TEXT_LIMIT, isExperienceText, type BotExperience } from './bot-experience-store.js'
 export type { DocumentContinuationSelection, DocumentContinuationSource } from './document-continuation-store.js'
 export type { DocumentFailureNotice } from './document-failure-notice-store.js'
-export { documentGuardCategory, type DocumentGuardCapture, type DocumentGuardEvidence } from './document-guard-store.js'
+export type { DocumentGuardReviewReceipt, DocumentGuardReviewSource } from './document-guard-review-store.js'
+export { documentGuardCategory, type DocumentGuardCapture, type DocumentGuardEvidence, type DocumentGuardNativeCall } from './document-guard-store.js'
 export type { DocumentFailure, DocumentFailureInput } from './document-recovery-store.js'
 export type { StudioDraftPreference } from './draft-preference-store.js'
 export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
@@ -421,6 +425,7 @@ export class ManagedWorkerStore {
         this.db.exec(DOCUMENT_CONTINUATION_SCHEMA)
         this.db.exec(DOCUMENT_RECOVERY_SCHEMA)
         this.db.exec(DOCUMENT_GUARD_SCHEMA)
+        this.db.exec(DOCUMENT_GUARD_REVIEW_SCHEMA)
         this.db.exec(DOCUMENT_FAILURE_NOTICE_SCHEMA)
         this.documentFailureNotices.recoverSending()
         this.db.exec(QUOTA_SCHEMA)
@@ -1586,15 +1591,75 @@ export class ManagedWorkerStore {
     })
   }
 
+  /** Check the current review fence without loading either the approved text or the native action. */
+  previewDocumentGuardReview(sessionId: string, evidenceId: string, expectedAuthorizationVersion: number):
+  ManagedResult<DocumentGuardEvidence & { nativeCall: DocumentGuardNativeCall }> {
+    if (!isId(sessionId) || !isId(evidenceId) || !isVersion(expectedAuthorizationVersion)) return deny('INVALID_INPUT')
+    return this.snapshot(() => this.eligibleDocumentGuardReview(sessionId, evidenceId, expectedAuthorizationVersion))
+  }
+
+  /** Recheck eligibility under the write lock and compare the Host-verified original action without issuing a permit. */
+  reviewDocumentGuard(sessionId: string, evidenceId: string, expectedAuthorizationVersion: number, commandId: string,
+    source: DocumentGuardReviewSource): ManagedResult<DocumentGuardReviewReceipt> {
+    if (!isId(sessionId) || !isId(evidenceId) || !isVersion(expectedAuthorizationVersion) || !isId(commandId)) return deny('INVALID_INPUT')
+    return this.write(() => {
+      const result = this.eligibleDocumentGuardReview(sessionId, evidenceId, expectedAuthorizationVersion, commandId)
+      if (!result.ok) return result
+      const { taskId, workerSessionId, executionEpoch, toolCallId, nativeCall, expectedVersion } = result.value
+      const verified = readDocumentGuardReviewSource(source)
+      if (!verified || verified.toolCallId !== toolCallId || !matchesDocumentGuardNativeCall(nativeCall, verified)) {
+        return deny('GUARD_REVIEW_SOURCE_UNCONFIRMED')
+      }
+      const input = documentAction(verified.action)
+      if (!input || input.expectedVersion !== expectedVersion) return deny('GUARD_REVIEW_SOURCE_UNCONFIRMED')
+      // This is an independent UTF-16 comparison, not the SQLite equality used by authorize. Either outcome leaves the refusal in force.
+      const outcome = input.text === this.documentTargets(taskId).approvedText ? 'comparison-inconsistent' : 'refusal-confirmed'
+      return accept(appendDocumentGuardReview(this.db, { evidenceId, taskId, workerSessionId, executionEpoch,
+        authorizationVersion: expectedAuthorizationVersion, commandId, outcome }))
+    })
+  }
+
+  /** Read a past comparison from the current document Worker's task, even if authorization or execution has since changed. */
+  readDocumentGuardReview(sessionId: string, evidenceId: string): ManagedResult<DocumentGuardReviewReceipt | undefined> {
+    if (!isId(sessionId) || !isId(evidenceId)) return deny('INVALID_INPUT')
+    return this.snapshot(() => {
+      const current = this.currentTask(sessionId)
+      if (!current.ok) return current
+      if (this.studioSessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
+      return accept(readDocumentGuardReviewReceipt(this.db, current.value.taskId, evidenceId))
+    })
+  }
+
+  /** Shared metadata-only checks for preview and execution. The caller already holds the appropriate transaction. */
+  private eligibleDocumentGuardReview(sessionId: string, evidenceId: string, expectedAuthorizationVersion: number, commandId?: string):
+  ManagedResult<DocumentGuardEvidence & { nativeCall: DocumentGuardNativeCall }> {
+    const current = this.documentContinuationTask(sessionId, expectedAuthorizationVersion)
+    if (!current.ok) return current
+    const { taskId, workerSessionId, executionEpoch, sharedDocument } = current.value
+    const evidence = readDocumentGuardEvidenceById(this.db, taskId, evidenceId)
+    if (!evidence?.nativeCall || evidence.phase !== 'authorize' || evidence.reason !== 'ACTION_NOT_APPROVED'
+      || evidence.workerSessionId !== workerSessionId || evidence.executionEpoch !== executionEpoch
+      || evidence.documentId !== sharedDocument?.documentId || evidence.expectedVersion !== (sharedDocument?.baseVersion ?? 1)) {
+      return deny('GUARD_REVIEW_NOT_ELIGIBLE')
+    }
+    if (evidence.authorizationVersion !== expectedAuthorizationVersion) return deny('STALE_AUTHORIZATION')
+    if (documentGuardReviewUsed(this.db, taskId, expectedAuthorizationVersion, evidenceId, commandId)) return deny('GUARD_REVIEW_LIMIT_REACHED')
+    return accept({ ...evidence, nativeCall: evidence.nativeCall })
+  }
+
   /** Retain a known failure without changing the original outcome, even if auditing itself fails. */
   private captureDocumentGuard(capture: DocumentGuardCapture, reason: string, action: unknown, phase: 'authorize' | 'commit',
     workerSessionId: string, toolCallId: string, observed?: DocumentGuardScope): void {
     if (!documentGuardCategory(reason) || types.isProxy(capture) || !documentAction(action)) return
+    // Only a completed authorization comparison can bind the Host's confirmed native coordinates.
+    const link = observed && phase === 'authorize' && reason === 'ACTION_NOT_APPROVED'
+      ? Object.getOwnPropertyDescriptor(capture, 'nativeCall') : undefined
+    const nativeCall = link && Object.hasOwn(link, 'value') ? readDocumentGuardNativeCall(link.value) : undefined
     // The failing snapshot or write has ended. Resolve only the immutable binding if it could not observe a task.
     const result: ManagedResult<NonNullable<DocumentGuardCapture['retention']>> = !isDocumentGuardToolCallId(toolCallId)
       ? accept({ kind: 'not-retained', reason: 'origin-unconfirmed' }) : this.write(() => {
         const scope = observed ?? this.binding(workerSessionId)
-        return accept(scope ? retainDocumentGuard(this.db, { ...scope, workerSessionId, toolCallId, phase, reason })
+        return accept(scope ? retainDocumentGuard(this.db, { ...scope, workerSessionId, toolCallId, phase, reason }, nativeCall)
           : { kind: 'not-retained', reason: 'origin-unconfirmed' })
       })
     const retention = result.ok ? result.value : { kind: 'not-retained', reason: 'unavailable' } as const

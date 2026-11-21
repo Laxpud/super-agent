@@ -17,6 +17,7 @@ import { documentStartArgs, sharedDocumentCommand, sharedDocumentCoordinates, sh
 import { StudioDocumentFailureNotices } from './document-failure-notices.ts'
 import { documentContinuationIntent } from './document-continuation-intent.ts'
 import { StudioDocumentContinuation } from './document-continuation.ts'
+import { DOCUMENT_WRITE_TOOL as TOOL, GUARD_REVIEW_HINT, documentGuardReviewCommand, documentWriteActionSchema, observeDocumentGuardCall } from './document-guard-review.ts'
 import type { DocumentGuardCapture } from './document-guard-store.ts'
 import { DOCUMENT_GUARD_HINT, documentGuardCommand, documentGuardFeedback } from './document-guard.ts'
 import { StudioDocumentRecovery } from './document-recovery.ts'
@@ -75,10 +76,8 @@ export const Config = s.object({
 type Config = ReturnType<typeof Config>
 
 const PRESET = 'dsh-superagent-managed-worker'
-const TOOL = 'studio_write_document'
 const TEXT_LIMIT = 32_000
 const version = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
-const writeSchema = z.strictObject({ expectedVersion: version.describe('The document revision approved for this task.'), text: z.string().max(TEXT_LIMIT) })
 
 interface CommandResult { kind: 'success' | 'error'; text: string }
 interface CommandInput { agent: Agent; commandId: string; rawInput: string; signal: AbortSignal }
@@ -294,7 +293,7 @@ export function apply(context: Context, config: Config): void {
           () => preferenceIntake?.install(agent) ?? (() => {})) : role !== 'document-worker' ? drafts.install(agent, role) : agent.ctx.tools.register({
         name: TOOL,
         description: 'Replace the text of the managed document bound to this worker, using its approved text and version.',
-        parameters: z.toJSONSchema(writeSchema),
+        parameters: z.toJSONSchema(documentWriteActionSchema),
         output: {
           schema: { type: 'object', properties: { documentVersion: { type: 'integer' }, documentId: { type: 'string' } }, required: ['documentVersion'] },
           render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
@@ -337,7 +336,9 @@ export function apply(context: Context, config: Config): void {
       || (exec.name === PROPOSE_PREFERENCE && preferenceIntake?.available(agent)))) return undefined
     if (role === 'leader') return projects.guard(agent, exec.name)
     if (role !== 'document-worker' || exec.name !== TOOL) return 'Studio tool denied: INVALID_EXECUTION'
-    const capture: DocumentGuardCapture = {}
+    // Only the call that actually reached this Guard can be cited in a corrective review.
+    const nativeCall = observeDocumentGuardCall(agent, exec.callId, exec.arguments)
+    const capture: DocumentGuardCapture = nativeCall ? { nativeCall } : {}
     const result = store.authorize(agent.id, exec.arguments, exec.callId, capture)
     if (!result.ok) return documentGuardFeedback(result.reason, capture)
     permits.set(exec.token, result.value)
@@ -406,8 +407,8 @@ export function apply(context: Context, config: Config): void {
   // DSH Web authorizes commands.execute through its native remote access checks. Document authorization stays user-only.
   ctx.effect(() => ctx.commands.register({
     name: 'studio-doc',
-    description: 'Manage a document task in its Worker Session. Use /studio-doc guard to read past checks without approving or retrying a write.',
-    input: { hint: `status | ${DOCUMENT_GUARD_HINT} | doc-new <JSON> | doc-read <document-id> [revision] | doc-save <JSON> | start <JSON> | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review [<instruction-id> <authorization-version> <unchanged|pause>] | narrow <JSON> | continue <authorization-version> | feishu-status | bind-feishu`
+    description: 'Manage a document task in its Worker Session. Use /studio-doc guard to read past checks, including how to request a bounded review without retrying the write.',
+    input: { hint: `status | ${DOCUMENT_GUARD_HINT} | ${GUARD_REVIEW_HINT} | doc-new <JSON> | doc-read <document-id> [revision] | doc-save <JSON> | start <JSON> | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review [<instruction-id> <authorization-version> <unchanged|pause>] | narrow <JSON> | continue <authorization-version> | feishu-status | bind-feishu`
       + (recovery ? ' | recover <task-id> <evidence-id>' : '') },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
@@ -415,10 +416,12 @@ export function apply(context: Context, config: Config): void {
       if (!available || !controlReady(ctx)) return rejected('CONTROL_UNAVAILABLE')
       if (rawInput.length > TEXT_LIMIT * 12 + 128) return rejected('INPUT_TOO_LARGE')
       const [, verb, argument = ''] = /^\s*(\S+)(?:\s+([\s\S]*))?$/.exec(rawInput.trim()) ?? []
-      if (!ready(agent, 'document-worker')) return verb === 'guard'
-        ? { kind: 'error', text: 'Cannot read document guard evidence: MANAGED_SESSION_REQUIRED. Open the document Worker currently bound to this task in Studio Web.' }
+      if (!ready(agent, 'document-worker')) return verb === 'guard' || verb === 'guard-review'
+        ? { kind: 'error', text: 'MANAGED_SESSION_REQUIRED. Open the document Worker currently bound to this task in Studio Web.' }
         : rejected('MANAGED_SESSION_REQUIRED')
       if (verb === 'guard') return documentGuardCommand(store, agent.id, argument)
+      if (verb === 'guard-review') return documentGuardReviewCommand(ctx, store, agent, commandId, argument,
+        AbortSignal.any([signal, channelStop.signal]), () => ready(agent, 'document-worker'))
       // Only explicit continuation wakes the Worker. Review, replacement, and other controls do not cancel the old turn.
       if (verb === 'recover') return recovery ? recovery.command(agent, argument, commandId, signal) : rejected('DOCUMENT_RECOVERY_DISABLED')
       if (verb === 'continue') return continueDocument(delivery, store, agent, argument, signal, () => ready(agent, 'document-worker'))

@@ -406,7 +406,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/instruction-store.ts` | Preserves Feishu task links, original deliveries and review receipts, including replacements narrowed to a subset of approved changes; pending inputs hold writes even when the listeners are off |
 | `src/managed-worker/document-command.ts` | Owner-only commands for inspecting, creating and editing a shared document, and for selecting a task's exact base revision |
 | `src/managed-worker/document-guard.ts` | Distinguishes scope refusals, state holds and unconfirmed checks in tool feedback; formats owner-only evidence queries |
-| `src/managed-worker/document-guard-store.ts` | Retains bounded, immutable coordinates for checks that did not admit a document write, without storing document text or granting permits |
+| `src/managed-worker/document-guard-store.ts` | Retains bounded, immutable coordinates and exact native call links for document guard evidence, without storing document text or granting permits |
+| `src/managed-worker/document-guard-review.ts` | Confirms the original call in the durable Worker log and requests an independent comparison against the same approved scope without replaying the call |
+| `src/managed-worker/document-guard-review-store.ts` | Records one immutable corrective comparison per task and authorization version, pinned to the original denial and native call |
 | `src/managed-worker/document-recovery.ts` | Correlates a verified document continuation with its native terminal error and requests live owner consent to replace that execution once |
 | `src/managed-worker/document-recovery-store.ts` | Pins failure evidence to the current Host, task, execution and authorization; spends it atomically with a paused transfer and audit receipt |
 | `src/managed-worker/document-failure-notices.ts` | Wakes on confirmed document failures or a verified Feishu connection and sends bounded evidence references to the configured owner without inference |

@@ -1,5 +1,6 @@
 /** Describe the document check's own outcome and expose its metadata to the owner, not to a model tool. */
 import { z } from 'zod'
+import { guardReviewBlockHint } from './document-guard-review.ts'
 import { documentGuardCategory, type DocumentGuardCapture, type DocumentGuardEvidence } from './document-guard-store.ts'
 import { sharedDocumentError } from './document-command.ts'
 import type { ManagedWorkerStore } from './store.ts'
@@ -34,6 +35,7 @@ function formatEvidence(entry: DocumentGuardEvidence): string {
   const checked = `Authorization ${authorizationVersion === undefined ? 'not confirmed in this check' : `v${authorizationVersion}`}.`
     + (documentId === undefined ? '' : ` Shared document ${documentId}.`)
     + (expectedVersion === undefined ? '' : ` Expected document version in the call or permit: ${expectedVersion}.`)
+    + (entry.nativeCall === undefined ? '' : ` Native call event ${entry.nativeCall.eventSeq} (turn ${entry.nativeCall.turn}, step ${entry.nativeCall.step}).`)
   return `Evidence ${evidenceId}: ${labels[category]} (${reason}). ${phase === 'authorize' ? 'Guard check' : 'Commit recheck'}, ${at}.\n${origin}\n${checked}`
 }
 
@@ -54,8 +56,28 @@ export function documentGuardCommand(store: ManagedWorkerStore, sessionId: strin
   const notes = [
     ...(limited ? ['The retention limit has been reached; later checks may not be present.'] : []),
     ...(more ? ['Only recent records are shown. Use an exact evidence ID from the original tool feedback to open an older one.'] : []),
+    ...(!argument && items.some(item => item.reason === 'ACTION_NOT_APPROVED' && item.phase === 'authorize')
+      ? ['To see whether an explicit scope refusal can be reviewed, open it with /studio-doc guard <evidence-id>.'] : []),
     'Evidence describes a past check. It is not approval, and reading it does not retry a write.',
   ]
+  const entry = argument ? items[0] : undefined
+  if (entry?.reason === 'ACTION_NOT_APPROVED' && entry.phase === 'authorize') {
+    const review = store.readDocumentGuardReview(sessionId, entry.evidenceId)
+    if (!review.ok) notes.unshift('The corrective review record could not be read. This does not change the original refusal.')
+    else if (review.value) notes.unshift(`Corrective review ${review.value.reviewId}, ${review.value.at}: ${review.value.outcome === 'refusal-confirmed'
+      ? 'the original refusal was confirmed' : 'the original comparison was inconsistent'}. No permit was issued.`)
+    else if (!entry.nativeCall) notes.unshift('This refusal has no confirmed native call link and cannot be reviewed here.')
+    else if (entry.workerSessionId !== sessionId || entry.executionEpoch !== task.executionEpoch || entry.authorizationVersion !== task.authorizationVersion) {
+      notes.unshift('This refusal is from an earlier execution or authorization. It is evidence only, not a basis for reviewing a current write.')
+    } else {
+      const eligibility = store.previewDocumentGuardReview(sessionId, entry.evidenceId, task.authorizationVersion)
+      if (eligibility.ok) notes.unshift(`If the Guard misread the approved replacement for this version, request a comparison when the Worker is idle:\n/studio-doc guard-review ${entry.evidenceId} ${task.authorizationVersion}\nAt most one review can be recorded for this task and authorization version.`)
+      else {
+        const hint = guardReviewBlockHint(eligibility.reason)
+        notes.unshift(`A review is not available: ${eligibility.reason}.${hint ? ` ${hint}` : ''}`)
+      }
+    }
+  }
   return { kind: 'success', text: [`Document guard evidence for task ${task.taskId}. Current execution epoch ${task.executionEpoch}; authorization v${task.authorizationVersion}.`,
     ...(items.length ? items.map(formatEvidence) : ['No recorded observations in this view. This does not confirm approval.']), ...notes,
   ].join('\n\n') }

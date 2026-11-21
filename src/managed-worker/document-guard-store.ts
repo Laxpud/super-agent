@@ -1,6 +1,7 @@
 /** Retain bounded metadata about actual document guard outcomes, never an approval or a document body. */
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
+import { types } from 'node:util'
 
 const categories = {
   ACTION_NOT_APPROVED: 'denied',
@@ -33,8 +34,16 @@ export function documentGuardCategory(reason: string): 'denied' | 'state' | 'unc
 type DocumentGuardRetention = { kind: 'retained'; evidenceId: string }
   | { kind: 'not-retained'; reason: 'limit' | 'unavailable' | 'origin-unconfirmed' }
 
-/** Optional Host-owned output for a single guard call. It does not affect the guard result. */
+/** Coordinates of the native call in the exact Worker's own Session log. */
+export interface DocumentGuardNativeCall {
+  eventSeq: number
+  turn: number
+  step: number
+}
+
+/** Host-owned holder for a single guard call. Supply coordinates only after matching the original call and arguments. */
 export interface DocumentGuardCapture {
+  nativeCall?: DocumentGuardNativeCall
   retention?: DocumentGuardRetention
 }
 
@@ -60,6 +69,7 @@ export type DocumentGuardEvidence = DocumentGuardObservation & {
   category: DocumentGuardCategory
   reason: DocumentGuardReason
   at: string
+  nativeCall?: DocumentGuardNativeCall
 }
 
 // The cap spans all execution epochs of a task. Reject new inserts rather than deleting old evidence.
@@ -103,14 +113,56 @@ export const DOCUMENT_GUARD_SCHEMA = `
     BEGIN SELECT RAISE(ABORT, 'Studio document guard evidence is immutable'); END;
   CREATE TRIGGER IF NOT EXISTS studio_document_guard_no_delete BEFORE DELETE ON studio_document_guard_evidence
     BEGIN SELECT RAISE(ABORT, 'Studio document guard evidence is immutable'); END;
+  CREATE TABLE IF NOT EXISTS studio_document_guard_native_call (
+    evidence_id TEXT PRIMARY KEY REFERENCES studio_document_guard_evidence (evidence_id) DEFERRABLE INITIALLY DEFERRED,
+    event_seq INTEGER NOT NULL CHECK (event_seq BETWEEN 0 AND 9007199254740991),
+    turn INTEGER NOT NULL CHECK (turn BETWEEN 1 AND 9007199254740991),
+    step INTEGER NOT NULL CHECK (step BETWEEN 1 AND 9007199254740991)
+  ) STRICT;
+  -- Insert the link first and fulfill its deferred foreign key with a new refusal in the same transaction.
+  -- An existing refusal, including a legacy row, can never acquire a link.
+  CREATE TRIGGER IF NOT EXISTS studio_document_guard_native_call_append BEFORE INSERT ON studio_document_guard_native_call
+    WHEN EXISTS (SELECT 1 FROM studio_document_guard_evidence WHERE evidence_id = NEW.evidence_id)
+      OR EXISTS (SELECT 1 FROM studio_document_guard_native_call WHERE evidence_id = NEW.evidence_id)
+    BEGIN SELECT RAISE(ABORT, 'Studio document guard native calls must accompany new evidence'); END;
+  CREATE TRIGGER IF NOT EXISTS studio_document_guard_native_call_eligible BEFORE INSERT ON studio_document_guard_evidence
+    WHEN (NEW.phase <> 'authorize' OR NEW.reason <> 'ACTION_NOT_APPROVED'
+      OR NEW.authorization_version IS NULL OR NEW.expected_version IS NULL)
+      AND EXISTS (SELECT 1 FROM studio_document_guard_native_call WHERE evidence_id = NEW.evidence_id)
+    BEGIN SELECT RAISE(ABORT, 'Only an observed authorization refusal may include a native call'); END;
+  CREATE TRIGGER IF NOT EXISTS studio_document_guard_native_call_no_update BEFORE UPDATE ON studio_document_guard_native_call
+    BEGIN SELECT RAISE(ABORT, 'Studio document guard native calls are immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS studio_document_guard_native_call_no_delete BEFORE DELETE ON studio_document_guard_native_call
+    BEGIN SELECT RAISE(ABORT, 'Studio document guard native calls are immutable'); END;
 `
 
 type Row = Record<string, SQLOutputValue>
 const fields = `evidence_id, task_id, worker_session_id, execution_epoch, authorization_version, document_id,
   expected_version, tool_call_id, phase, category, reason, at`
+const selectEvidence = `SELECT ${fields}, native.event_seq, native.turn, native.step FROM studio_document_guard_evidence
+  LEFT JOIN studio_document_guard_native_call native USING (evidence_id)`
 const isId = (value: unknown): value is string => typeof value === 'string'
   && value.length > 0 && value.isWellFormed() && !value.includes('\0')
 const isVersion = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 1
+
+function nativeCoordinates(eventSeq: unknown, turn: unknown, step: unknown): DocumentGuardNativeCall | undefined {
+  if ((eventSeq === 0 || isVersion(eventSeq)) && isVersion(turn) && isVersion(step)) return { eventSeq, turn, step }
+}
+
+/** Copy the Host's own data properties without invoking accessors. No other source fields are retained. */
+export function readDocumentGuardNativeCall(value: unknown): DocumentGuardNativeCall | undefined {
+  if (!value || typeof value !== 'object' || types.isProxy(value)) return
+  const [eventSeq, turn, step] = ['eventSeq', 'turn', 'step'].map(key => {
+    const field = Object.getOwnPropertyDescriptor(value, key)
+    return field && Object.hasOwn(field, 'value') ? field.value as unknown : undefined
+  })
+  return nativeCoordinates(eventSeq, turn, step)
+}
+
+/** An absent link only matches another absent link; the tool call ID alone does not confirm a replayed event. */
+export function matchesDocumentGuardNativeCall(left: DocumentGuardNativeCall | undefined, right: DocumentGuardNativeCall | undefined): boolean {
+  return left?.eventSeq === right?.eventSeq && left?.turn === right?.turn && left?.step === right?.step
+}
 
 /** Verify the opaque native ID without truncating it or allowing controls into a displayed evidence record. */
 export function isDocumentGuardToolCallId(value: unknown): value is string {
@@ -121,14 +173,17 @@ export function isDocumentGuardToolCallId(value: unknown): value is string {
 function readEvidence(row: Row): DocumentGuardEvidence {
   const { evidence_id: evidenceId, task_id: taskId, worker_session_id: workerSessionId, execution_epoch: executionEpoch,
     authorization_version: authorizationVersion, document_id: documentId, expected_version: expectedVersion,
-    tool_call_id: toolCallId, phase, category, reason, at } = row
+    tool_call_id: toolCallId, phase, category, reason, at, event_seq: eventSeq, turn, step } = row
   if (!isId(evidenceId) || !isId(taskId) || !isId(workerSessionId) || !isVersion(executionEpoch) || !isDocumentGuardToolCallId(toolCallId) || !isId(at)
     || (authorizationVersion !== null && !isVersion(authorizationVersion)) || (documentId !== null && !isId(documentId))
     || (expectedVersion !== null && !isVersion(expectedVersion)) || (phase !== 'authorize' && phase !== 'commit')
     || !isGuardReason(reason) || categories[reason] !== category) throw new Error('Invalid Studio document guard evidence')
+  const nativeCall = nativeCoordinates(eventSeq, turn, step)
+  if (nativeCall ? phase !== 'authorize' || reason !== 'ACTION_NOT_APPROVED' || authorizationVersion === null || expectedVersion === null
+    : eventSeq !== null || turn !== null || step !== null) throw new Error('Invalid Studio document guard native call')
   return { evidenceId, taskId, workerSessionId, executionEpoch, toolCallId, phase, category, reason, at,
     ...(authorizationVersion === null ? {} : { authorizationVersion }), ...(documentId === null ? {} : { documentId }),
-    ...(expectedVersion === null ? {} : { expectedVersion }) }
+    ...(expectedVersion === null ? {} : { expectedVersion }), ...(nativeCall ? { nativeCall } : {}) }
 }
 
 /** The native call key identifies the input. Compare retained coordinates, not a copy or hash of that input. */
@@ -144,40 +199,54 @@ function atLimit(db: DatabaseSync, taskId: string): boolean {
 }
 
 /** Append under a separate run-fenced write. Exact replays reuse their ID even after the task reaches the cap. */
-export function retainDocumentGuard(db: DatabaseSync, observation: DocumentGuardObservation): DocumentGuardRetention {
+export function retainDocumentGuard(db: DatabaseSync, observation: DocumentGuardObservation, nativeCall?: DocumentGuardNativeCall): DocumentGuardRetention {
   const { taskId, workerSessionId, executionEpoch, authorizationVersion, documentId, expectedVersion, toolCallId, phase, reason } = observation
   const category = documentGuardCategory(reason)
   if (!category || !isDocumentGuardToolCallId(toolCallId)) return { kind: 'not-retained', reason: 'origin-unconfirmed' }
-  const existing = db.prepare(`SELECT ${fields} FROM studio_document_guard_evidence
-    WHERE worker_session_id = ? AND tool_call_id = ? AND phase = ?`).get(workerSessionId, toolCallId, phase)
+  const existing = db.prepare(`${selectEvidence} WHERE worker_session_id = ? AND tool_call_id = ? AND phase = ?`)
+    .get(workerSessionId, toolCallId, phase)
   if (existing) {
     const prior = readEvidence(existing)
-    return matchesObservation(prior, observation) ? { kind: 'retained', evidenceId: prior.evidenceId }
-      : { kind: 'not-retained', reason: 'origin-unconfirmed' }
+    return matchesObservation(prior, observation) && matchesDocumentGuardNativeCall(prior.nativeCall, nativeCall)
+      ? { kind: 'retained', evidenceId: prior.evidenceId } : { kind: 'not-retained', reason: 'origin-unconfirmed' }
   }
   if (atLimit(db, taskId)) return { kind: 'not-retained', reason: 'limit' }
   const evidenceId = randomUUID()
   const at = new Date().toISOString()
+  if (nativeCall) {
+    const { eventSeq, turn, step } = nativeCall
+    const link = db.prepare('INSERT INTO studio_document_guard_native_call (evidence_id, event_seq, turn, step) VALUES (?, ?, ?, ?)')
+      .run(evidenceId, eventSeq, turn, step)
+    if (link.changes !== 1 && link.changes !== 1n) throw new Error('Studio document guard native call insert did not affect exactly one row')
+  }
   const { changes } = db.prepare(`INSERT INTO studio_document_guard_evidence (${fields}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(evidenceId, taskId, workerSessionId, executionEpoch, authorizationVersion ?? null, documentId ?? null, expectedVersion ?? null,
       toolCallId, phase, category, reason, at)
   if (changes !== 1 && changes !== 1n) throw new Error('Studio document guard evidence insert did not affect exactly one row')
-  // Confirm the exact row before the audit transaction commits; a trigger cannot substitute another observation.
-  const row = db.prepare(`SELECT ${fields} FROM studio_document_guard_evidence WHERE evidence_id = ?`).get(evidenceId)
+  // Confirm both pieces before the audit transaction commits; no partial or substituted observation may survive.
+  const row = db.prepare(`${selectEvidence} WHERE evidence_id = ?`).get(evidenceId)
   if (!row) throw new Error('Studio document guard evidence could not be verified')
   const saved = readEvidence(row)
-  if (saved.at !== at || !matchesObservation(saved, observation)) throw new Error('Studio document guard evidence did not match the observation')
+  if (saved.at !== at || !matchesObservation(saved, observation) || !matchesDocumentGuardNativeCall(saved.nativeCall, nativeCall)) {
+    throw new Error('Studio document guard evidence did not match the observation')
+  }
   return { kind: 'retained', evidenceId }
+}
+
+/** Read one exact observation and its optional link within the caller's task snapshot. */
+export function readDocumentGuardEvidenceById(db: DatabaseSync, taskId: string, evidenceId: string): DocumentGuardEvidence | undefined {
+  const row = db.prepare(`${selectEvidence} WHERE task_id = ? AND evidence_id = ?`).get(taskId, evidenceId)
+  return row ? readEvidence(row) : undefined
 }
 
 /** Read at most twelve observations in retention order, or one exact ID scoped to the caller's task snapshot. */
 export function readDocumentGuardEvidence(db: DatabaseSync, taskId: string, evidenceId?: string):
 { items: DocumentGuardEvidence[]; limited: boolean; more?: boolean } | undefined {
   if (evidenceId !== undefined) {
-    const row = db.prepare(`SELECT ${fields} FROM studio_document_guard_evidence WHERE task_id = ? AND evidence_id = ?`).get(taskId, evidenceId)
-    return row ? { items: [readEvidence(row)], limited: atLimit(db, taskId) } : undefined
+    const evidence = readDocumentGuardEvidenceById(db, taskId, evidenceId)
+    return evidence ? { items: [evidence], limited: atLimit(db, taskId) } : undefined
   }
-  const rows = db.prepare(`SELECT ${fields} FROM studio_document_guard_evidence WHERE task_id = ? ORDER BY seq DESC LIMIT ?`)
+  const rows = db.prepare(`${selectEvidence} WHERE task_id = ? ORDER BY seq DESC LIMIT ?`)
     .all(taskId, PAGE_LIMIT + 1)
   return { items: rows.slice(0, PAGE_LIMIT).map(readEvidence), limited: atLimit(db, taskId),
     ...(rows.length > PAGE_LIMIT ? { more: true } : {}) }
