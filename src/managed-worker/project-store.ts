@@ -9,7 +9,9 @@ import { appendWorkFact, readWorkFact, type ProjectWorkFactUse, type WorkFactSou
 import { captureProjectHandoff, readProjectHandoff, type ProjectHandoffReview } from './project-handoff-store.js'
 import { armProjectJob, consumeJobAuto, consumedJobAuto, jobAutoPage, projectJobAutoCommandUsed, readAutoReservation,
   readJobRoute, sameJobRoute, type StudioJobAuto, type StudioJobRoute } from './project-job-auto-store.js'
-import { attachProjectJob, isConfirmedJobState, isJobState, observeProjectJob, observeWatchedProjectJob, projectJobCommandUsed,
+import { appendJobCandidate, hasJobCandidate, jobCandidateCommandUsed, readJobCandidate,
+  type StudioJobCandidate } from './project-job-candidate-store.js'
+import { attachProjectJob, isJobState, observeProjectJob, observeWatchedProjectJob, projectJobCommandUsed,
   readProjectJob, setProjectJobPaused, watchedJobPage, type StudioProjectJob } from './project-job-store.js'
 import { appendWorkResultUse, PROJECT_RESULT_QUOTE_LIMIT, projectResultCommandUsed, readWorkResultUse,
   workResultFingerprint, workResultUseView, type ProjectWorkResultUse, type WorkResultSource } from './project-result-use-store.js'
@@ -23,7 +25,7 @@ import { appendWorkModel, appendWorkModelClear, appendWorkModelConsume, exactCon
   type ProjectWorkModelSelectionView } from './project-work-model-store.js'
 import { appendWorkTermination, readWorkTermination, readWorkTerminationInput,
   type ProjectWorkTerminationInput } from './project-work-termination-store.js'
-import { validSystemdJob, type SystemdJobRef, type SystemdJobState } from './systemd-job.js'
+import { sameSystemdJob, validSystemdJob, type SystemdJobRef, type SystemdJobState } from './systemd-job.js'
 import type { PinnedTextWorkerModel } from './text-worker-model-policy.js'
 
 export { sameJobRoute, type StudioJobAuto, type StudioJobRoute } from './project-job-auto-store.js'
@@ -95,11 +97,16 @@ export interface StudioProjectRun {
   failure?: string
 }
 
+/** A saved clue is not an observation or a confirmed external dependency. */
+export type StudioProjectJobLink = { kind: 'attached'; job: StudioProjectJob } | { kind: 'unconfirmed'; candidate: StudioJobCandidate }
+
 /** Registered work, its latest dispatch (including a release), and any external job or document attachment. */
 export interface StudioProjectWorkView {
   work: StudioProjectWork
   run?: StudioProjectRun
   job?: StudioProjectJob
+  /** Show only the hold in model and list views; the exact candidate is read through the owner job command. */
+  jobUnconfirmed?: true
   document?: StudioProjectDocument
   fact?: ProjectWorkFactUse
   resultUse?: ProjectWorkResultUse
@@ -691,7 +698,9 @@ export class ProjectStore {
       }
       if (readWorkFact(this.db, workId)) return deny('FACT_TEXT_WORK_ONLY')
       if (projectDocumentAttached(this.db, workId)) return deny('WORK_HAS_DOCUMENT_TASK')
-      if (this.db.prepare('SELECT 1 FROM studio_project_job WHERE work_id = ?').get(workId)) return deny('RESULT_TEXT_WORK_ONLY')
+      if (hasJobCandidate(this.db, workId) || this.db.prepare('SELECT 1 FROM studio_project_job WHERE work_id = ?').get(workId)) {
+        return deny('RESULT_TEXT_WORK_ONLY')
+      }
       if (sourceWorkId === workId) return deny('RESULT_SOURCE_UNAVAILABLE')
       const evidence = this.readWorkEvidence(projectId, sourceWorkId, null)
       if (!evidence) return deny('RESULT_SOURCE_UNAVAILABLE')
@@ -805,6 +814,7 @@ export class ProjectStore {
     explicitPlain: boolean, automatic = false): ManagedResult<ProjectWorkModelSelection | undefined> {
     const block = latestWorkBlockState(this.db, workId)
     if (block === 'active') return deny('PROJECT_WORK_BLOCKED')
+    if (hasJobCandidate(this.db, workId)) return deny('EXTERNAL_JOB_NOT_CONFIRMED')
     // A separately armed future job still has to pass the existing grant checks in reserveWork.
     if (block === 'cleared' && !automatic && selectionId === undefined && !explicitPlain) {
       return deny('PROJECT_WORK_UNBLOCK_REQUIRES_OWNER')
@@ -827,7 +837,8 @@ export class ProjectStore {
   }
 
   private workHasDocumentOrJob(workId: string): boolean {
-    return projectDocumentAttached(this.db, workId) || !!this.db.prepare('SELECT 1 FROM studio_project_job WHERE work_id = ?').get(workId)
+    return projectDocumentAttached(this.db, workId) || hasJobCandidate(this.db, workId)
+      || !!this.db.prepare('SELECT 1 FROM studio_project_job WHERE work_id = ?').get(workId)
   }
 
   /** Host-only: link an existing version 1 task with an exact owner authorization version; neither grant nor start execution. */
@@ -841,6 +852,7 @@ export class ProjectStore {
       if (!current.ok) return current
       if (!this.work(current.value.projectId, workId)) return deny('WORK_NOT_FOUND')
       if (latestWorkBlockState(this.db, workId) === 'active') return deny('PROJECT_WORK_BLOCKED')
+      if (hasJobCandidate(this.db, workId)) return deny('EXTERNAL_JOB_NOT_CONFIRMED')
       if (hasUnclearedWorkModel(this.db, workId)) return deny('WORK_MODEL_TEXT_ONLY')
       if (readWorkFact(this.db, workId)) return deny('FACT_TEXT_WORK_ONLY')
       if (readWorkResultUse(this.db, workId)) return deny('RESULT_TEXT_WORK_ONLY')
@@ -849,34 +861,77 @@ export class ProjectStore {
     })
   }
 
-  /** Pin only an already observed invocation, without creating or controlling the external job. */
-  attachJob(leaderSessionId: string, workId: string, commandId: string, ref: SystemdJobRef,
-    state: Exclude<SystemdJobState, 'unknown'>): ManagedResult<StudioProjectJob> {
-    if (!isId(leaderSessionId) || !isId(workId) || !isId(commandId) || !isConfirmedJobState(state)
-      || !ref || typeof ref !== 'object') return deny('INVALID_INPUT')
-    const { unit, invocationId } = ref
-    if (!isId(unit) || !isId(invocationId) || !validSystemdJob({ unit, invocationId })) return deny('INVALID_INPUT')
-    return this.withCurrentJobWork(leaderSessionId, workId, actor => {
-      if (latestWorkBlockState(this.db, workId) === 'active') return deny('PROJECT_WORK_BLOCKED')
-      if (hasUnclearedWorkModel(this.db, workId)) return deny('WORK_MODEL_TEXT_ONLY')
-      if (readWorkFact(this.db, workId)) return deny('FACT_TEXT_WORK_ONLY')
-      if (readWorkResultUse(this.db, workId)) return deny('RESULT_TEXT_WORK_ONLY')
-      if (projectDocumentAttached(this.db, workId)) return deny('WORK_HAS_DOCUMENT_TASK')
-      return attachProjectJob(this.db, actor, workId, commandId, { unit, invocationId }, state, () => this.commandUsed(commandId))
+  /** Record a clue or confirm an attachment. The observation may not outlive its candidate or Leader. */
+  recordJobAttachment(leaderSessionId: string, workId: string, commandId: string, ref: SystemdJobRef,
+    state: SystemdJobState, expectedCandidateId?: string): ManagedResult<StudioProjectJobLink> {
+    if (!isId(leaderSessionId) || !isId(workId) || !isId(commandId) || !isJobState(state) || !validSystemdJob(ref)
+      || (expectedCandidateId !== undefined && !isId(expectedCandidateId))) return deny('INVALID_INPUT')
+    const reference = { unit: ref.unit, invocationId: ref.invocationId }
+    return this.withCurrentJobWork<StudioProjectJobLink>(leaderSessionId, workId, actor => {
+      const candidate = readJobCandidate(this.db, actor.projectId, workId)
+      if (candidate?.candidateId !== expectedCandidateId || (candidate && !sameSystemdJob(candidate.ref, reference))) {
+        return deny('STALE_JOB_CANDIDATE')
+      }
+      if (state === 'unknown' && candidate) return accept({ kind: 'unconfirmed', candidate })
+      const eligible = this.jobAttachmentEligibility(workId)
+      if (!eligible.ok) return eligible
+      if (state === 'unknown') {
+        const saved = this.saveJobCandidate(actor, workId, commandId, reference)
+        return saved.ok ? accept({ kind: 'unconfirmed', candidate: saved.value }) : saved
+      }
+      // A successful attachment retires the candidate for dispatch but preserves the original clue.
+      const attached = attachProjectJob(this.db, actor, workId, commandId, reference, state,
+        () => this.commandUsed(commandId) || this.access.documentCommandUsed(commandId))
+      return attached.ok ? accept({ kind: 'attached', job: attached.value }) : attached
     })
   }
 
-  /** Read a pinned invocation for a current or historical Leader without granting control. */
-  readJob(leaderSessionId: string, workId: string): ManagedResult<StudioProjectJob | undefined> {
+  /** Correct the supplied identity without checking systemd or lifting the hold on this work. */
+  replaceJobCandidate(leaderSessionId: string, workId: string, commandId: string, expectedCandidateId: string,
+    ref: SystemdJobRef): ManagedResult<StudioJobCandidate> {
+    if (!isId(leaderSessionId) || !isId(workId) || !isId(commandId) || !isId(expectedCandidateId) || !validSystemdJob(ref)) {
+      return deny('INVALID_INPUT')
+    }
+    const reference = { unit: ref.unit, invocationId: ref.invocationId }
+    return this.withCurrentJobWork(leaderSessionId, workId, actor => {
+      const candidate = readJobCandidate(this.db, actor.projectId, workId)
+      if (candidate?.candidateId !== expectedCandidateId) return deny('STALE_JOB_CANDIDATE')
+      if (sameSystemdJob(candidate.ref, reference)) return accept(candidate)
+      const eligible = this.jobAttachmentEligibility(workId)
+      return eligible.ok ? this.saveJobCandidate(actor, workId, commandId, reference) : eligible
+    })
+  }
+
+  /** Do not repurpose work that already carries another owner decision or input binding. */
+  private jobAttachmentEligibility(workId: string): ManagedResult<void> {
+    if (latestWorkBlockState(this.db, workId) === 'active') return deny('PROJECT_WORK_BLOCKED')
+    if (hasUnclearedWorkModel(this.db, workId)) return deny('WORK_MODEL_TEXT_ONLY')
+    if (readWorkFact(this.db, workId)) return deny('FACT_TEXT_WORK_ONLY')
+    if (readWorkResultUse(this.db, workId)) return deny('RESULT_TEXT_WORK_ONLY')
+    if (projectDocumentAttached(this.db, workId)) return deny('WORK_HAS_DOCUMENT_TASK')
+    return accept(undefined)
+  }
+
+  private saveJobCandidate(actor: StudioProjectBinding, workId: string, commandId: string, ref: SystemdJobRef): ManagedResult<StudioJobCandidate> {
+    if (this.commandUsed(commandId) || this.access.documentCommandUsed(commandId)) return deny('DUPLICATE_COMMAND')
+    if (this.hasNonreleasedDispatch(workId)) return deny('WORK_ALREADY_DISPATCHED')
+    if (readProjectJob(this.db, actor.projectId, workId)) return deny('WORK_ALREADY_HAS_EXTERNAL_JOB')
+    return accept(appendJobCandidate(this.db, actor, workId, commandId, ref))
+  }
+
+  /** Read the saved clue or attachment in one snapshot, without granting control to a prior Leader. */
+  readJobLink(leaderSessionId: string, workId: string): ManagedResult<StudioProjectJobLink | undefined> {
     if (!isId(leaderSessionId) || !isId(workId)) return deny('INVALID_INPUT')
-    try {
+    return this.access.snapshot<StudioProjectJobLink | undefined>(() => {
       const binding = this.binding(leaderSessionId)
       if (!binding) return deny('SESSION_NOT_BOUND')
       const work = this.work(binding.projectId, workId)
-      return work ? accept(readProjectJob(this.db, work.projectId, workId)) : deny('WORK_NOT_FOUND')
-    } catch {
-      return deny('STORAGE_ERROR')
-    }
+      if (!work) return deny('WORK_NOT_FOUND')
+      const job = readProjectJob(this.db, work.projectId, workId)
+      if (job) return accept({ kind: 'attached', job })
+      const candidate = readJobCandidate(this.db, work.projectId, workId)
+      return accept(candidate && { kind: 'unconfirmed', candidate })
+    })
   }
 
   /** Merge the Host's versioned observation; this does not grant or withdraw permission to continue. */
@@ -934,8 +989,8 @@ export class ProjectStore {
   }
 
   /** Resolve current management and work membership under the same write lock as the job mutation. */
-  private withCurrentJobWork(leaderSessionId: string, workId: string,
-    operation: (actor: StudioProjectBinding) => ManagedResult<StudioProjectJob>): ManagedResult<StudioProjectJob> {
+  private withCurrentJobWork<T>(leaderSessionId: string, workId: string,
+    operation: (actor: StudioProjectBinding) => ManagedResult<T>): ManagedResult<T> {
     return this.access.write(() => {
       const current = this.currentProject(leaderSessionId)
       if (!current.ok) return current
@@ -1193,7 +1248,8 @@ export class ProjectStore {
     const fact = pinned && { ...pinned, current: pinned.projectId === work.projectId && this.factQuote(pinned) !== undefined }
     const resultUse = pinnedResult && workResultUseView(pinnedResult, this.currentWorkResult(pinnedResult, work.projectId) !== undefined)
     return { work, ...this.workRunView(work, fact, includeFactResult, resultUse, owner !== undefined),
-      ...(job ? { job } : {}), ...(document ? { document } : {}), ...(model && owner ? { modelSelection: workModelView(model, owner) } : {}),
+      ...(job ? { job } : hasJobCandidate(this.db, work.workId) ? { jobUnconfirmed: true } : {}),
+      ...(document ? { document } : {}), ...(model && owner ? { modelSelection: workModelView(model, owner) } : {}),
       ...(blocked ? { blocked: true } : {}), ...(workBlock ? { workBlock } : {}) }
   }
 
@@ -1306,6 +1362,7 @@ export class ProjectStore {
     // A clear never revives the exact attempt the hold released, even if a later reservation exists.
     if ((stored.state === 'released' && stored.failure === 'PROJECT_WORK_BLOCKED')
       || latestWorkBlockState(this.db, stored.workId) === 'active') return deny('PROJECT_WORK_BLOCKED')
+    if (hasJobCandidate(this.db, stored.workId)) return deny('EXTERNAL_JOB_NOT_CONFIRMED')
     if (stored.state !== 'reserved') return deny('WORK_NOT_RESERVED')
     const model = this.confirmWorkModelRun(stored)
     if (!model.ok) return model
@@ -1384,6 +1441,7 @@ export class ProjectStore {
   private commandUsed(commandId: string): boolean {
     return !!this.db.prepare('SELECT 1 FROM studio_project_binding WHERE command_id = ?').get(commandId)
       || projectJobCommandUsed(this.db, commandId)
+      || jobCandidateCommandUsed(this.db, commandId)
       || projectJobAutoCommandUsed(this.db, commandId)
       || projectDocumentCommandUsed(this.db, commandId)
       || projectResultCommandUsed(this.db, commandId)

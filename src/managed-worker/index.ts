@@ -35,7 +35,7 @@ import { parseProjectFactRequest } from './project-fact-request.ts'
 import { PROJECT_HANDOFF_HINT } from './project-handoff.ts'
 import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
 import { StudioProjectJobMonitor } from './project-job-monitor.ts'
-import { StudioProjectJobControl } from './project-job.ts'
+import { STUDIO_JOB_HINT, StudioProjectJobControl } from './project-job.ts'
 import { LEADER_PRESET, PROJECT_MODEL_CLEAR_HINT, PROJECT_MODEL_USE_HINT, PROJECT_RESULT_USE_HINT, PROJECT_WORK_BLOCK_HINT,
   StudioProjectControl, isLeaderTool } from './project.ts'
 import { StudioQuotaNotices } from './quota-notices.ts'
@@ -554,8 +554,8 @@ export function apply(context: Context, config: Config): void {
   }))
   if (projectJobs) ctx.effect(() => ctx.commands.register({
     name: 'studio-job',
-    description: 'Attach or observe an existing external job, or pause its project work without stopping the job.',
-    input: { hint: 'attach <work-id> <unit> <invocation-id> | status/check <work-id> | pause/resume/auto <work-id> <authorization-version>' },
+    description: 'Check or link an external job, keep an unconfirmed reference, or pause project work without stopping its job.',
+    input: { hint: STUDIO_JOB_HINT },
     recordInput: false,
     handler: ({ agent, commandId, rawInput, signal }) => projectJobs.command(agent, commandId, rawInput, signal),
   }))

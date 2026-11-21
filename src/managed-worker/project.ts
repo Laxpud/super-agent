@@ -86,8 +86,8 @@ function modelDispatchLine(workId: string, selectionId: string): string {
 
 /** Render selection provenance only in the native owner detail, never as a model tool argument. */
 function modelSelectionText(view: StudioProjectWorkView, enabled: boolean): string {
-  const { work: { workId }, run, modelSelection, blocked } = view
-  if (!modelSelection) return ''
+  const { work: { workId }, run, modelSelection, blocked, jobUnconfirmed } = view
+  if (!modelSelection || jobUnconfirmed) return ''
   const { selectionId, route, state, executionEpoch } = modelSelection
   const status = `\n\nWorker model selection ${selectionId}: ${state}.\nProvider / model / reasoning effort: ${modelTupleText(route)}.`
     + (executionEpoch === undefined ? '' : ` Reserved for execution epoch ${executionEpoch}.`)
@@ -121,10 +121,11 @@ export function isLeaderTool(name: string): boolean {
 }
 
 /** Summarize work without showing native owner notes or changing its execution authority. */
-function workSummary({ work, run, job, document, fact, resultUse, blocked }: StudioProjectWorkView): string {
+function workSummary({ work, run, job, jobUnconfirmed, document, fact, resultUse, blocked }: StudioProjectWorkView): string {
   const pending = document ? document.task.documentVersion === 2 ? 'document committed'
     : document.hold ? `document action held (${document.hold})` : 'awaiting document action'
-    : !job ? 'pending' : job.paused ? 'post-processing paused' : job.state === 'completed'
+    : jobUnconfirmed ? 'external job reference unconfirmed (dispatch held)' : !job ? 'pending'
+    : job.paused ? 'post-processing paused' : job.state === 'completed'
       ? 'ready for post-processing' : `awaiting successful external job (${job.state})`
   const state = blocked ? 'blocked' : !run || run.state === 'released' ? pending : run.state
   const reference = fact ? ` Project fact ${fact.key} v${fact.revision}${fact.current ? '.' : ' is no longer current (FACT_NOT_CURRENT).'}`
@@ -164,7 +165,8 @@ function workText(view: StudioProjectWorkView, includeRequest = false, includeDo
   const { work, run, job, document, fact, resultUse } = view
   const execution = run ? `\nWorker Bot ${run.workerBotId}; Session ${run.workerSessionId}; execution epoch ${run.executionEpoch}; dispatched by Leader Session ${run.leaderSessionId} at management epoch ${run.managementEpoch}.` : ''
   const source = `\nOwner source: message ${work.sourceMessageId} in Leader Session ${work.leaderSessionId}.`
-  const detail = job ? `\n\n${projectJobText(job)}` : document ? `\n\n${documentText(document)}` : ''
+  const detail = job ? `\n\n${projectJobText(job)}` : document ? `\n\n${documentText(document)}`
+    : view.jobUnconfirmed ? `\n\nSee /studio-job status ${work.workId} for the saved reference. No job has been attached.` : ''
   const decisions = !includeDocumentBody || !document ? '' : document.scopeDecisions ? documentDecisionText(document.scopeDecisions)
     : '\n\nDocument scope history is available only in the current Leader Session. Use /studio-project status to find it.'
   const request = includeRequest ? `\n\nRegistered request:\n${work.requestText}` : ''
@@ -408,7 +410,7 @@ export class StudioProjectControl {
   /** Changing the choice does not clear a work block. Only suggest dispatch when the work is not held. */
   private modelDispatchHint(agent: Agent, workId: string, dispatch: string): string {
     const state = this.store.projects.readWork(agent.id, workId)
-    if (!state.ok || state.value.blocked) return `\n\nCheck the current work state with /studio-project work ${workId} before dispatching.`
+    if (!state.ok || state.value.blocked || state.value.jobUnconfirmed) return `\n\nCheck the current work state with /studio-project work ${workId} before dispatching.`
     return `\n\nWhen ready, send a fresh standalone message:\n${dispatch}`
   }
 
@@ -546,12 +548,12 @@ export class StudioProjectControl {
         const result = this.store.projects.readWork(agent.id, argument, ordinary)
         if (!result.ok) return denied(result.reason)
         const view = result.value
-        const { work: { workId }, run, document, job, blocked, workBlock, modelSelection } = view
+        const { work: { workId }, run, document, job, jobUnconfirmed, blocked, workBlock, modelSelection } = view
         const current = ordinary && this.store.projects.current(agent.id).ok
         let text = workText(view, true, true, archiveEnabled, current)
         if (current && workBlock) text += workBlockText(workId, workBlock)
         text += modelSelectionText(view, this.workers.textWorkerSelectionEnabled)
-        if (current && !document && !job && !blocked && (!run || run.state === 'released' || run.state === 'reserved')) {
+        if (current && !document && !job && !jobUnconfirmed && !blocked && (!run || run.state === 'released' || run.state === 'reserved')) {
           text += `\n\nTo record an obstacle and hold this unstarted work, fill in:\n${blockWorkExample(workId)}`
           if (run?.state !== 'reserved') {
             if (workBlock?.cleared && !modelSelection && view.fact?.current !== false && view.resultUse?.current !== false) {

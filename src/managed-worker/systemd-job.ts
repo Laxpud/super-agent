@@ -28,6 +28,11 @@ export function validSystemdJob(ref: SystemdJobRef): boolean {
     && ref.invocationId !== '00000000000000000000000000000000'
 }
 
+/** Compare both coordinates; systemd can reuse a service name for a different invocation. */
+export function sameSystemdJob(left: SystemdJobRef, right: SystemdJobRef): boolean {
+  return left.unit === right.unit && left.invocationId === right.invocationId
+}
+
 function readState(stdout: string, ref: SystemdJobRef): SystemdJobState {
   // Accept one complete set of properties. Reject repeated keys or extra lines instead
   // of letting a later line override the identity or state of the observed invocation.

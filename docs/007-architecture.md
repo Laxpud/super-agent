@@ -379,8 +379,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/bot-experience-store.ts` | Keys method revisions by stable Leader Bot and checks their exact project fact parents without returning source project text |
 | `src/managed-worker/project-document-store.ts` | Links project work to one authorized document task, reads its exact audited commit, and includes correction history only in an authorized owner detail read |
 | `src/managed-worker/project-document-decision-store.ts` | Projects recent applied scope corrections after attachment, with original source and Worker coordinates, without copying message or document text |
-| `src/managed-worker/project-job.ts` | Owner controls to pin an existing external job, observe it, and authorize or pause its post-processing without stopping the job |
+| `src/managed-worker/project-job.ts` | Owner controls to retain an unconfirmed reference, pin a verified external job, observe it, and authorize or pause its post-processing without stopping the job |
 | `src/managed-worker/project-job-monitor.ts` | Checks bounded batches of pinned jobs without Agents, then defers automatic dispatch to the exact active Leader and approved model route |
+| `src/managed-worker/project-job-candidate-store.ts` | Retains unconfirmed invocation references separately from verified attachments, holding dispatch until the exact reference is verified |
 | `src/managed-worker/project-job-store.ts` | Stores one pinned invocation per work item, preserving the first confirmed terminal observation and independent authorization versions |
 | `src/managed-worker/project-job-auto-store.ts` | Keeps one-use continuation permits bound to management, authorization and route; spends the permit atomically with its exact reservation |
 | `src/managed-worker/project-job-start-store.ts` | Captures the pinned job and authorization at the stored start transition; compares start evidence with exact owner pause records without inferring adapter activity |
