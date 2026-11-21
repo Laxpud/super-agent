@@ -17,6 +17,8 @@ import { documentStartArgs, sharedDocumentCommand, sharedDocumentCoordinates, sh
 import { StudioDocumentFailureNotices } from './document-failure-notices.ts'
 import { documentContinuationIntent } from './document-continuation-intent.ts'
 import { StudioDocumentContinuation } from './document-continuation.ts'
+import type { DocumentGuardCapture } from './document-guard-store.ts'
+import { DOCUMENT_GUARD_HINT, documentGuardCommand, documentGuardFeedback } from './document-guard.ts'
 import { StudioDocumentRecovery } from './document-recovery.ts'
 import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, feishuSourceScope, validateFeishuInbox } from './feishu-inbox.ts'
 import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './feishu-text.ts'
@@ -304,8 +306,9 @@ export function apply(context: Context, config: Config): void {
           // Use only the permit issued through the tool pipeline. Even after the Guard allows a call, the write transaction checks the current execution epoch.
           if (!permit || exec.agent !== agent || !ready(agent, 'document-worker')
             || permit.workerSessionId !== agent.id || permit.toolCallId !== exec.callId) throw new Error('Managed write denied: INVALID_EXECUTION')
-          const result = store.commit(permit, action)
-          if (!result.ok) throw new Error(`Managed write denied: ${sharedDocumentError(result.reason)?.text ?? result.reason}`)
+          const capture: DocumentGuardCapture = {}
+          const result = store.commit(permit, action, capture)
+          if (!result.ok) throw new Error(documentGuardFeedback(result.reason, capture))
           return result.value
         },
       })
@@ -317,7 +320,10 @@ export function apply(context: Context, config: Config): void {
     const { agent } = exec
     let role: StudioRole | undefined
     try { role = agent && (scopes.get(agent)?.role ?? roleOf(agent)) }
-    catch { return 'Studio tool denied: STORAGE_ERROR' }
+    catch {
+      // Role storage can fail before seeing a document binding; never invent provenance for that check.
+      return exec.name === TOOL ? documentGuardFeedback('STORAGE_ERROR', {}) : 'Studio tool denied: STORAGE_ERROR'
+    }
     if (!role || !agent) return exec.name === TOOL || exec.name === PROPOSE_PROJECT || exec.name === PROPOSE_PREFERENCE || isAssistantTool(exec.name)
       || isStudyTool(exec.name) || isLeaderTool(exec.name) || isAdvisorTool(exec.name) ? 'Studio tool denied: INVALID_EXECUTION' : undefined
     if (!ready(agent, role) || exec.parent !== undefined) return 'Studio tool denied: INVALID_EXECUTION'
@@ -331,8 +337,9 @@ export function apply(context: Context, config: Config): void {
       || (exec.name === PROPOSE_PREFERENCE && preferenceIntake?.available(agent)))) return undefined
     if (role === 'leader') return projects.guard(agent, exec.name)
     if (role !== 'document-worker' || exec.name !== TOOL) return 'Studio tool denied: INVALID_EXECUTION'
-    const result = store.authorize(agent.id, exec.arguments, exec.callId)
-    if (!result.ok) return `Managed write denied: ${sharedDocumentError(result.reason)?.text ?? result.reason}`
+    const capture: DocumentGuardCapture = {}
+    const result = store.authorize(agent.id, exec.arguments, exec.callId, capture)
+    if (!result.ok) return documentGuardFeedback(result.reason, capture)
     permits.set(exec.token, result.value)
     return undefined
   }))
@@ -399,16 +406,19 @@ export function apply(context: Context, config: Config): void {
   // DSH Web authorizes commands.execute through its native remote access checks. Document authorization stays user-only.
   ctx.effect(() => ctx.commands.register({
     name: 'studio-doc',
-    description: 'Manage a document task in this managed worker Session.',
-    input: { hint: 'doc-new <JSON> | doc-read <document-id> [revision] | doc-save <JSON> | start <JSON> | status | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review [<instruction-id> <authorization-version> <unchanged|pause>] | narrow <JSON> | continue <authorization-version> | feishu-status | bind-feishu'
+    description: 'Manage a document task in its Worker Session. Use /studio-doc guard to read past checks without approving or retrying a write.',
+    input: { hint: `status | ${DOCUMENT_GUARD_HINT} | doc-new <JSON> | doc-read <document-id> [revision] | doc-save <JSON> | start <JSON> | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review [<instruction-id> <authorization-version> <unchanged|pause>] | narrow <JSON> | continue <authorization-version> | feishu-status | bind-feishu`
       + (recovery ? ' | recover <task-id> <evidence-id>' : '') },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()
       if (!available || !controlReady(ctx)) return rejected('CONTROL_UNAVAILABLE')
-      if (!ready(agent, 'document-worker')) return rejected('MANAGED_SESSION_REQUIRED')
       if (rawInput.length > TEXT_LIMIT * 12 + 128) return rejected('INPUT_TOO_LARGE')
       const [, verb, argument = ''] = /^\s*(\S+)(?:\s+([\s\S]*))?$/.exec(rawInput.trim()) ?? []
+      if (!ready(agent, 'document-worker')) return verb === 'guard'
+        ? { kind: 'error', text: 'Cannot read document guard evidence: MANAGED_SESSION_REQUIRED. Open the document Worker currently bound to this task in Studio Web.' }
+        : rejected('MANAGED_SESSION_REQUIRED')
+      if (verb === 'guard') return documentGuardCommand(store, agent.id, argument)
       // Only explicit continuation wakes the Worker. Review, replacement, and other controls do not cancel the old turn.
       if (verb === 'recover') return recovery ? recovery.command(agent, argument, commandId, signal) : rejected('DOCUMENT_RECOVERY_DISABLED')
       if (verb === 'continue') return continueDocument(delivery, store, agent, argument, signal, () => ready(agent, 'document-worker'))

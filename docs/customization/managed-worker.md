@@ -214,6 +214,16 @@ Assistant 和工具卡只显示回执。用 `/studio-result <任务ID>` 取回�
 3. **移交到新 Worker。** 新建一个尚未绑定任务的同预设会话，在那里提交 `/studio-doc transfer <任务ID> <当前执行轮次>`。移交保留已登记的文档内容范围和暂停状态；旧会话不能再写入。
 4. **恢复暂停的任务。** 核对任务和写入范围后，在当前 Worker 会话中提交状态或移交回执给出的 `/studio-doc resume <授权版本>`；过时的版本不能恢复写入。收到 `Execution resumed` 只表示重新允许写入，不会重跑旧动作。用回执中的新版本执行 `/studio-doc continue <授权版本>`。
 
+### 查看文档写入为何未放行
+
+文档 Worker 的工具回执区分以下情况，不把它们报成写入成功：
+
+- **明确超出批准范围**（例如 `ACTION_NOT_APPROVED`）：待写正文不符合本任务的授权。改写命令或换调用方式不会改变授权。
+- **当前任务状态阻止写入**（例如 `TASK_PAUSED`、`STALE_AUTHORIZATION` 或 `SHARED_DOCUMENT_CONFLICT`）：先用 `/studio-doc status`、`/studio-doc inbox` 核对实际轮次、授权和待核对消息；不要沿用旧批准。
+- **技术上无法确认**（例如 `STORAGE_ERROR`、`INSTRUCTION_UNCONFIRMED`）：这不是业务范围拒绝。恢复后先核对文档和任务实际状态，再决定是否需要继续；不按旧回执自动重试。
+
+在**当前文档 Worker 的 Web 会话**用 `/studio-doc guard` 查看该任务最近的证据，或加上工具反馈中的完整证据 ID 查看一条。记录只保留轮次、当次检查或原许可的授权版本、目标版本（若已核对）、调用编号、阶段和原因，不复制正文。每项任务最多保留 64 条，跨执行轮次共用；达到上限或存储无法确认时，回执会说明未保留新证据。查询不调用模型，也不重新审核、解除暂停或授予写入权限。
+
 ### 多个任务修改同一文档
 
 在 **SuperAgent managed document Worker** 会话中，用 `/studio-doc doc-new {"text":"起始正文"}` 创建共享文档，回执给出文档 ID 和修订 `1`。这一步不创建任务，也不授予 Worker 写入权。`/studio-doc doc-read <文档ID> [修订号]` 可查看正文；省略修订号则读取当前版本。

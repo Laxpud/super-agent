@@ -9,6 +9,8 @@ import { BOT_EXPERIENCE_SCHEMA, BotExperienceStore } from './bot-experience-stor
 import { DOCUMENT_CONTINUATION_SCHEMA, appendDocumentContinuationClaim, feishuDocumentContinuationLate, feishuDocumentContinuationSeen,
   readDocumentContinuationSource, type DocumentContinuationSelection, type DocumentContinuationSource } from './document-continuation-store.js'
 import { DOCUMENT_FAILURE_NOTICE_SCHEMA, DocumentFailureNoticeStore, type DocumentFailureNotice } from './document-failure-notice-store.js'
+import { DOCUMENT_GUARD_SCHEMA, documentGuardCategory, isDocumentGuardToolCallId, readDocumentGuardEvidence, retainDocumentGuard,
+  type DocumentGuardCapture, type DocumentGuardEvidence, type DocumentGuardScope } from './document-guard-store.js'
 import { DOCUMENT_RECOVERY_SCHEMA, DocumentRecoveryStore, type DocumentFailure, type DocumentFailureInput } from './document-recovery-store.js'
 import { parseDraftPreference } from './draft-preference-request.js'
 import { DRAFT_PREFERENCE_SCHEMA, appendDraftPreference, currentDraftCitation, draftPreferenceText, pinnedDraftPreference,
@@ -41,6 +43,7 @@ import { WATCHDOG_INDEXES, readWatchdogEntries, readWatchdogTarget,
 export { EXPERIENCE_TEXT_LIMIT, isExperienceText, type BotExperience } from './bot-experience-store.js'
 export type { DocumentContinuationSelection, DocumentContinuationSource } from './document-continuation-store.js'
 export type { DocumentFailureNotice } from './document-failure-notice-store.js'
+export { documentGuardCategory, type DocumentGuardCapture, type DocumentGuardEvidence } from './document-guard-store.js'
 export type { DocumentFailure, DocumentFailureInput } from './document-recovery-store.js'
 export type { StudioDraftPreference } from './draft-preference-store.js'
 export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
@@ -417,6 +420,7 @@ export class ManagedWorkerStore {
         this.db.exec(SHARED_DOCUMENT_SCHEMA)
         this.db.exec(DOCUMENT_CONTINUATION_SCHEMA)
         this.db.exec(DOCUMENT_RECOVERY_SCHEMA)
+        this.db.exec(DOCUMENT_GUARD_SCHEMA)
         this.db.exec(DOCUMENT_FAILURE_NOTICE_SCHEMA)
         this.documentFailureNotices.recoverSending()
         this.db.exec(QUOTA_SCHEMA)
@@ -1485,13 +1489,17 @@ export class ManagedWorkerStore {
   }
 
   /** Issue a permit for the current epoch, exact document version, and approved text without writing the document. */
-  authorize(sessionId: string, action: unknown, toolCallId: string): ManagedResult<ManagedWritePermit> {
+  authorize(sessionId: string, action: unknown, toolCallId: string, capture?: DocumentGuardCapture): ManagedResult<ManagedWritePermit> {
     if (!isId(sessionId) || !isId(toolCallId)) return deny('INVALID_INPUT')
-    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-    return this.snapshot(() => {
+    let scope: DocumentGuardScope | undefined
+    const result = this.captureFault ? deny('INSTRUCTION_UNCONFIRMED') : this.snapshot(() => {
       const current = this.currentTask(sessionId)
       if (!current.ok) return current
       const task = current.value
+      // Observe only this snapshot's exact Worker and shared target, never the state found by the later audit write.
+      const { taskId, executionEpoch, authorizationVersion, sharedDocument } = task
+      if (capture) scope = { taskId, executionEpoch, authorizationVersion,
+        ...(sharedDocument ? { documentId: sharedDocument.documentId } : {}) }
       // Even if conflicting role bindings exist, Studio Sessions cannot receive document permits.
       if (this.studioSessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
       if (task.documentVersion === 1 && sharedDocumentConflict(task)) return deny('SHARED_DOCUMENT_CONFLICT')
@@ -1500,25 +1508,27 @@ export class ManagedWorkerStore {
       if (this.actionUsed(sessionId, toolCallId)) return deny('DUPLICATE_ACTION')
       const input = documentAction(action)
       if (!input) return deny('INVALID_ACTION')
+      // Report the actual requested version when reached, including a version that failed the comparison.
+      if (scope) scope.expectedVersion = input.expectedVersion
       if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
-      const expectedVersion = task.sharedDocument?.baseVersion ?? 1
-      if (input.expectedVersion !== expectedVersion) return deny(task.sharedDocument ? 'SHARED_DOCUMENT_CONFLICT' : 'VERSION_CONFLICT')
-      if (!this.textApproved(task.taskId, input.text)) return deny('ACTION_NOT_APPROVED')
-      const { taskId, executionEpoch, authorizationVersion, sharedDocument } = task
+      const expectedVersion = sharedDocument?.baseVersion ?? 1
+      if (input.expectedVersion !== expectedVersion) return deny(sharedDocument ? 'SHARED_DOCUMENT_CONFLICT' : 'VERSION_CONFLICT')
+      if (!this.textApproved(taskId, input.text)) return deny('ACTION_NOT_APPROVED')
       const permit: ManagedWritePermit = Object.freeze({ taskId, workerSessionId: sessionId, executionEpoch, authorizationVersion,
         toolCallId, expectedVersion, text: input.text, ...(sharedDocument ? { documentId: sharedDocument.documentId } : {}) })
       this.#permits.set(permit, false)
       return accept(permit)
     })
+    if (capture && !result.ok) this.captureDocumentGuard(capture, result.reason, action, 'authorize', sessionId, toolCallId, scope)
+    return result
   }
 
   /** With the write lock held, recheck ownership, the permit, the action, and the document. Commit the one allowed change from version 1 to 2 with its audit record. */
-  commit(permit: ManagedWritePermit, action: unknown): ManagedResult<{ documentVersion: number; documentId?: string }> {
+  commit(permit: ManagedWritePermit, action: unknown, capture?: DocumentGuardCapture): ManagedResult<{ documentVersion: number; documentId?: string }> {
     const spent = this.#permits.get(permit)
     if (spent === undefined) return deny('INVALID_PERMIT')
-    if (spent) return deny('DUPLICATE_ACTION')
-    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-    const result = this.write<{ documentVersion: number; documentId?: string }>(() => {
+    const early = spent ? deny('DUPLICATE_ACTION') : this.captureFault ? deny('INSTRUCTION_UNCONFIRMED') : undefined
+    const result = early ?? this.write<{ documentVersion: number; documentId?: string }>(() => {
       const current = this.currentTask(permit.workerSessionId)
       if (!current.ok || current.value.taskId !== permit.taskId || current.value.executionEpoch !== permit.executionEpoch) return deny('STALE_EXECUTION')
       if (this.studioSessionBound(permit.workerSessionId)) return deny('SESSION_ALREADY_BOUND')
@@ -1552,7 +1562,45 @@ export class ManagedWorkerStore {
       return accept(shared ? { documentVersion: committedVersion, documentId: shared.documentId } : { documentVersion: 2 })
     })
     if (result.ok) this.#permits.set(permit, true)
+    else if (capture) {
+      // A genuine frozen permit is the origin even after transfer or when the commit could not inspect current state.
+      const { workerSessionId, toolCallId, taskId, executionEpoch, authorizationVersion, documentId, expectedVersion } = permit
+      this.captureDocumentGuard(capture, result.reason, action, 'commit', workerSessionId, toolCallId,
+        { taskId, executionEpoch, authorizationVersion, expectedVersion, ...(documentId === undefined ? {} : { documentId }) })
+    }
     return result
+  }
+
+  /** Read only the exact current document Worker's task, including evidence from its previous executions. */
+  readDocumentGuard(sessionId: string, evidenceId?: string): ManagedResult<{
+    task: ManagedTask; items: DocumentGuardEvidence[]; limited: boolean; more?: boolean
+  }> {
+    if (!isId(sessionId) || (evidenceId !== undefined && !isId(evidenceId))) return deny('INVALID_INPUT')
+    return this.snapshot(() => {
+      const current = this.currentTask(sessionId)
+      if (!current.ok) return current
+      if (this.studioSessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
+      const task = current.value
+      const evidence = readDocumentGuardEvidence(this.db, task.taskId, evidenceId)
+      return evidence ? accept({ task, ...evidence }) : deny('DOCUMENT_GUARD_EVIDENCE_NOT_FOUND')
+    })
+  }
+
+  /** Retain a known failure without changing the original outcome, even if auditing itself fails. */
+  private captureDocumentGuard(capture: DocumentGuardCapture, reason: string, action: unknown, phase: 'authorize' | 'commit',
+    workerSessionId: string, toolCallId: string, observed?: DocumentGuardScope): void {
+    if (!documentGuardCategory(reason) || types.isProxy(capture) || !documentAction(action)) return
+    // The failing snapshot or write has ended. Resolve only the immutable binding if it could not observe a task.
+    const result: ManagedResult<NonNullable<DocumentGuardCapture['retention']>> = !isDocumentGuardToolCallId(toolCallId)
+      ? accept({ kind: 'not-retained', reason: 'origin-unconfirmed' }) : this.write(() => {
+        const scope = observed ?? this.binding(workerSessionId)
+        return accept(scope ? retainDocumentGuard(this.db, { ...scope, workerSessionId, toolCallId, phase, reason })
+          : { kind: 'not-retained', reason: 'origin-unconfirmed' })
+      })
+    const retention = result.ok ? result.value : { kind: 'not-retained', reason: 'unavailable' } as const
+    // The capture is an output holder, not an opportunity to invoke a setter during the guard call.
+    try { Object.defineProperty(capture, 'retention', { value: retention, writable: true, enumerable: true, configurable: true }) }
+    catch { /* A read-only holder must not replace the guard result. */ }
   }
 
   /** Use a write lock for mutations and a deferred transaction for read-only snapshots. Roll back on rejection or error. */
