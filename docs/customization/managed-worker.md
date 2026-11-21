@@ -461,7 +461,7 @@ quotaPools:
 
 配置了额度池和[专用飞书入口](<#飞书私聊登记>)后，可在同一宿主 `config` 中启用 `quotaFeishuAlerts: true`。默认不发通知。机器人和连接验证通过后，Studio 使用 [lark-cli 的私聊发送接口](<https://github.com/larksuite/cli/blob/main/skills/lark-im/references/lark-im-messages-send.md>)，仅向配置的 `ownerOpenId` 发送系统通知，不从聊天内容选取收件人，不向群聊发送。
 
-通知只包含已确认的额度故障、受影响的池和路由，以及 Web 状态查询方式；不附带任务正文、日志或恢复依据。Studio 为每次故障持久登记至多一次发送尝试。没能确认送达时，`/studio-quota status` 会显示当前故障的发送状态；宿主不会因超时、重启或发不出去而盲目重发。没有配置或尚未验证飞书时，仍可在 Web 查询停池状态。
+通知只包含已确认的额度故障、受影响的池和路由，以及 Web 状态查询方式；不附带任务正文、日志或恢复依据。Studio 对每次故障至多尝试发送一次，发出前先保存发送记录。若已登记发送尝试，但宿主在保存回执前退出，重启后 `/studio-quota status` 显示「送达未确认」，不会自动重发。消息可能已经到达，可在原私聊核对；通知状态不改变额度停止。没有配置或尚未验证飞书时，仍可在 Web 查询停池状态。
 
 ## 用 Watchdog 查看运行状态
 
