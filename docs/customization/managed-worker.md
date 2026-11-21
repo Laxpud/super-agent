@@ -451,6 +451,28 @@ Studio 只把 CLI 明确标为 `text` 的消息正文当作纯文字输入。富
 
 无论是否兼顾文档更正，Studio 都先按消息 ID 登记文字命令，再检查参数、额度和 Worker 是否空闲。已登记的消息重投不会变成新指令，重启或切换模式也不例外。旧版纯文字模式未登记的拒绝不在这项保护内。
 
+#### 现场验收飞书与 Web 的成果交接
+
+准备好[专用机器人 CLI 与测试私聊](<#飞书私聊登记>)后，按[源码试用步骤](<#从源码树试用>)准备独立 Web profile。启动前，在 `studio-local-host` 的 `config` 中保留 `stateDir`，加入以下设置并替换示例值。`cwd` 使用另一个空的试用工作目录；`provider` 和 `model` 填在独立 profile 中已配置且获准试用的路线 ID。不需要启用 `feishuDocumentInbox`、文档更正或额度通知。
+
+```yaml
+feishuTextInbox:
+  cli: /absolute/path/to/studio-lark-cli
+  appId: cli_example
+  botOpenId: ou_studiobot
+  ownerOpenId: ou_studioowner
+  chatId: oc_studiochat
+  cwd: /absolute/path/to/studio-test-workspace
+  provider: example-provider-id
+  model: example-model-id
+```
+
+1. 先用 `--dump-config` 看配置是否落在唯一启用的 `studio-local-host`，原型监听仍关闭。正式启动后，在 **SuperAgent managed document Worker** 会话用 `/studio-doc feishu-status` 确认监听就绪；无需登记或绑定文档。监听就绪还不是飞书送达证据。
+2. 在测试私聊只发送一次普通文字：`draft: 用三列表格比较虚构的甲、乙方案，只列数据。甲耗时 4 小时、需 2 人；乙耗时 6 小时、需 1 人。表头为方案、耗时、人数。` 在飞书原消息的回复串核对实际回复、任务 ID 和保存的结果。若没有回复，先用 `/studio-result feishu` 查找，不重发本次输入。
+3. 等文字 Worker 结束后，在独立 Web 页打开一个**新**的 Studio Assistant 会话，用 `/studio-result <同一任务ID>`。通过条件是飞书实际收到结果或可用的取回指引，Web 返回同一任务的已保存正文和 Worker 出处，不再派工。只有 Web 取回成功而飞书没收到回复时，记录为取回通过、真实发件未确认，别算作整条链路通过。记录任务 ID、两端状态与正文是否一致，不附密钥或私人聊天。
+
+退出试用宿主后，专用 CLI 的本地事件进程可能仍在。用**配置中的同一 CLI 路径**看 [`event status --current`](<https://github.com/larksuite/cli/blob/v1.0.90/cmd/event/status.go#L23-L41>)。只有确认是本次试用启动的专用应用、且已无消费者，才用该 CLI 的 [`event stop`](<https://github.com/larksuite/cli/blob/v1.0.90/cmd/event/stop.go#L46-L71>) 停止当前应用的事件进程，再查状态；不加 `--all` 或 `--force`，不要停止原有应用或改动密钥。
+
 #### 同一个私聊兼顾文档更正
 
 在 `feishuTextInbox` 中另设 `documentCorrections: true`（默认关闭），不要同时配置 `feishuDocumentInbox`。如果从文档专用配置切换，沿用同一状态目录及四个身份 ID，再补上文字任务的目录和模型配置；无需重新绑定原任务。已有文字任务的私聊也可按上文用 `/studio-doc bind-feishu` 绑定一个原文档任务。
