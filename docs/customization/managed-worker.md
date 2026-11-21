@@ -39,6 +39,27 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 文字请求和结果各限 32,000 个 UTF-16 代码单元。三分钟内未完成时，宿主会请求取消 Worker，再关闭其会话。超时、失败或没有完整文字时，不把中间内容当作完成。文字任务不授予任何文档写入权，也不用于运行外部长作业。
 
+### 限定普通文字 Worker 的模型组合
+
+`textWorkerRoutes` 省略或留空时不限制派工组合。要限制，在隔离 profile 的原有 Studio 条目中增加 `textWorkerRoutes`，保留 `stateDir` 和其他已设选项。下例只是配置形状：按 DSH 适配器的实际配置填写 Provider、模型和思考深度的 ID，不用显示名称代替，也不用填凭据。
+
+```yaml
+- id: dsh-superagent-managed-worker
+  disabled: false
+  config:
+    stateDir: /absolute/path/to/managed-worker-state
+    textWorkerRoutes:
+      - provider: example-provider
+        model: example-model
+        reasoningEffort: low
+```
+
+配置后，在 Assistant 或现任 Leader 会话选定清单中的组合，再交代一项普通文字任务或派工已有待办。清单只约束这些派工，不限制发起会话自己使用的模型。没选思考深度时，只有已注册适配器明确报告、且在清单中的默认深度才可用于派工。宿主为这次 Worker 固定核验过的深度，不按清单顺序挑选，也不自动换组合。分项调查、Advisor、文档、飞书收件及自动作业接续仍走各自的路线。
+
+`TEXT_WORKER_MODEL_NOT_ALLOWED` 表示所用组合不在清单，请在发起会话选择清单中的精确组合。`TEXT_WORKER_MODEL_UNCONFIRMED` 表示宿主无法确认组合，例如模型未声明默认思考深度，或适配器在 Worker 调用模型前已不再支持固定的深度。请核对适配器的模型设置，必要时显式选择一个受支持且在清单内的深度。判断依据是适配器的元数据，不探测远端账户、额度或价格。
+
+修正后，Assistant 可以用一条新消息重新提交完整请求。Leader 先用 `/studio-project work <待办ID>` 核对状态：未派工或预留已释放时可派同一待办；如果 Worker 启动后已记为 `failed`，再次派同一 ID 只会返回旧记录，需要重新登记待办。
+
 ### 未立项的分项调查与整合
 
 在 Studio Assistant 中明确要求「分别检查两份记录，然后比较结论」，把共同要求和两至三份可区分的原始材料放进同一条消息。Assistant 只选择原消息中的要求和材料片段；片段不能重叠，也不能凭复述补齐缺失材料。这个流程不创建项目或 Leader，不访问附件、文件和网络。
@@ -56,7 +77,7 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 也可以直接在 Leader 会话中操作：
 
 1. 在未绑定项目的 **SuperAgent Studio Leader** 会话中提交 `/studio-project create {"name":"资料整理","objective":"持续整理研究记录"}`。回执给出项目 ID、Leader Bot、当前会话及管理轮次 `1`。可用 `leaderBotId` 复用已有 Leader Bot，用 `originTaskId` 引用一个已经完成的文字任务；引用原成果不重新派工。
-2. 在当前 Leader 会话中用普通消息要求登记一项自包含的文字待办，将所需材料放在同一条消息里。登记保留原文与来源，不会启动 Worker。用 `/studio-project work` 可查看最近 20 项。需要执行时，让当前 Leader 派工指定待办 ID；Worker 沿用 Leader 当时选择的模型和思考深度，只接收该待办的原文，不能用工具或修改文档。
+2. 在当前 Leader 会话中用普通消息要求登记一项自包含的文字待办，将所需材料放在同一条消息里。登记保留原文与来源，不会启动 Worker。用 `/studio-project work` 可查看最近 20 项。需要执行时，让当前 Leader 派工指定待办 ID；Worker 沿用 Leader 当时的模型选择，并遵守已启用的[组合限制](<#限定普通文字-worker-的模型组合>)。普通派工只接收该待办的原文，不能用工具或修改文档。
 3. 用 `/studio-project work <待办ID>` 查看原请求、状态和 Worker 的原始结果，不调用模型。在同一项目的 Leader 会话中，Worker 结束或宿主重启后仍可取回已保存结果。已经开始的工作中断后会留下状态，不会自动重跑。
 4. 要换管理会话，在从未绑定项目的 Leader 会话中提交 `/studio-project take <项目ID> <当前管理轮次>`。默认保留 Leader Bot；末尾可追加已有 Leader Bot ID 或 `new` 以换负责人。旧会话仍可用 `work` 查询本项目的工作记录，但不能再登记或派工。移交前尚未开始的保留名额会释放，由当前 Leader 决定是否继续原待办；已经开始的 Worker 可保存原出处的结果。
 

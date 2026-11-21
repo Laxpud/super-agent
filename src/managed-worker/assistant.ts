@@ -8,11 +8,15 @@ import { SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { DRAFT_PREFERENCE_HEADER, parseDraftPreference } from './draft-preference-request.ts'
 import { DRAFT_TEXT_LIMIT, type ManagedResult, type ManagedWorkerStore, type StudioDraftResult, type StudioDraftTask } from './store.ts'
+import { sameTextWorkerModel as sameModelRoute, textWorkerModelError, type PinnedTextWorkerModel, type TextWorkerModelPolicy,
+  type TextWorkerModelSelection as ModelRoute } from './text-worker-model-policy.ts'
 
 export const ASSISTANT_PRESET = 'dsh-superagent-studio-assistant'
 export const DRAFT_DELEGATE = 'studio_delegate_draft'
 const DRAFT_READ = 'studio_read_draft'
 export const DRAFT_TIMEOUT_MS = 180_000
+const UNCONFIRMED_TEXT_ROUTE_FAILURES = new Set(['NO_ADAPTER', 'UNSUPPORTED_REASONING_EFFORT', 'INVALID_MODEL_INFO',
+  'INVALID_MODEL_REASONING', 'INVALID_PREPARED_CALL'])
 const delegateSchema = z.strictObject({})
 const readSchema = z.strictObject({ taskId: z.uuid().optional() })
 const outputSchema = z.strictObject({ title: z.string(), receipt: z.string(), text: z.string() })
@@ -46,7 +50,6 @@ const RELAYS = {
   },
 } as const satisfies Record<RelayKind, { prefix: string; label: string; heading: string }>
 
-interface ModelRoute { provider: string; model: string; reasoningEffort?: string }
 interface WorkerHandle { agent: Agent; dispose(): Promise<void> }
 /** The installed rc.3 factory owns the Session and drains its persisted events on dispose. */
 interface DraftRuntime {
@@ -69,27 +72,25 @@ export type RestrictedTextRole = 'draft-worker' | 'advisor'
 type RelayKind = typeof RELAY_KINDS[number]
 interface ProtectedRelayStream {
   kind: RelayKind
-  relay: UserMessage
   route: Readonly<ModelRoute>
   recheck(): void
-  stepSignal?: AbortSignal
+}
+interface TextWorkerModelFence {
+  route: PinnedTextWorkerModel
+  requireExact(confirmed: boolean): void
 }
 interface DraftInput {
-  messageId: string
+  message: UserMessage
   role: RestrictedTextRole
   enter(selection?: Readonly<ModelRoute>): void
   reject(error: unknown): void
   turn?: number
+  stepSignal?: AbortSignal
   stream?: ProtectedRelayStream
+  modelFence?: TextWorkerModelFence
 }
 
-interface WorkerRoute { cwd: string; model: ModelRoute }
-
-/** The native step must use the pinned Advisor selection rather than a model chosen by the caller or picker. */
-function sameModelRoute(expected: ModelRoute, selection?: Readonly<ModelRoute>): boolean {
-  return selection?.provider === expected.provider && selection.model === expected.model
-    && selection.reasoningEffort === expected.reasoningEffort
-}
+interface WorkerRoute { cwd: string; model: ModelRoute; pinnedModel?: PinnedTextWorkerModel }
 interface RelayContext { load(): ManagedResult<{ text: string }>; check(): string | undefined }
 interface WorkerAdmission {
   /** Return a rejection reason if the pending assignment no longer belongs to the sender. */
@@ -211,7 +212,7 @@ export class StudioAssistant {
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore, private readonly workerPreset: string,
     private readonly assistantReady: (agent: Agent) => boolean, private readonly textReady: (agent: Agent, role: RestrictedTextRole) => boolean,
     readonly providerDenial: (provider: string) => string | undefined, private readonly memoryEnabled: boolean,
-    private readonly hostStopping: AbortSignal) {}
+    private readonly hostStopping: AbortSignal, private readonly textWorkerModels?: TextWorkerModelPolicy) {}
 
   /** Refuse a stopped route before reserving an execution. Do not select a different account on the caller's behalf. */
   checkedRoute(agent: Agent): WorkerRoute {
@@ -219,6 +220,19 @@ export class StudioAssistant {
     const denial = this.providerDenial(route.model.provider)
     if (denial) throw new Error(denial)
     return route
+  }
+
+  /** Pin the effective effort before reserving manual text work. Leave other routes and disabled policy unchanged. */
+  pinTextWorkerRoute(route: WorkerRoute, caller: AbortSignal): Promise<WorkerRoute> | undefined {
+    if (!this.textWorkerModels) return
+    const signal = AbortSignal.any([caller, this.stopping.signal, this.hostStopping])
+    return this.textWorkerModels.pin(route.model, signal).then(model => {
+      signal.throwIfAborted()
+      const denial = this.providerDenial(model.provider)
+      if (denial) throw new Error(denial)
+      // Pass the verified default as an explicit effort so a later adapter default cannot change the Worker's route.
+      return { cwd: route.cwd, model, pinnedModel: model }
+    })
   }
 
   stop(): void { this.stopping.abort() }
@@ -235,19 +249,23 @@ export class StudioAssistant {
     const input = this.drafts.get(agent)
     if (!input || input.turn !== undefined) return false
     const assignments = messages.filter(message => !isNativeContext(message))
-    if (assignments.length !== 1 || assignments[0]?.id !== input.messageId) return false
+    if (assignments.length !== 1 || assignments[0]?.id !== input.message.id) return false
     try {
       if (!this.textReady(agent, input.role)) throw new Error('Restricted text admission changed')
-      const stream = input.stream
+      const { stream, modelFence } = input
+      if (modelFence) {
+        signal.throwIfAborted()
+        modelFence.requireExact(input.role === 'draft-worker' && sameRelay(assignments[0], input.message) && sameModelRoute(modelFence.route, selection))
+      }
       if (stream) {
         signal.throwIfAborted()
-        if (input.role !== 'draft-worker' || !sameRelay(assignments[0], stream.relay) || !sameModelRoute(stream.route, selection)) {
+        if (input.role !== 'draft-worker' || !sameRelay(assignments[0], input.message) || !sameModelRoute(stream.route, selection)) {
           throw invalidRelay(stream.kind, 'INVALID_MODEL_INPUT')
         }
       }
       input.enter(selection)
       input.turn = turn
-      if (stream) stream.stepSignal = signal
+      input.stepSignal = signal
       return true
     } catch (error) {
       // A rejected step never emits the matching model message. Wake the collector so it can dispose this Worker.
@@ -282,18 +300,25 @@ export class StudioAssistant {
     const kinds = RELAY_KINDS.filter(kind => pinned.includes(kind) || tagged.includes(kind)
       || inherited.some(message => relayKind(message) === kind))
     const [kind] = kinds
+    const input = agent && this.drafts.get(agent)
+    const modelFence = input?.modelFence
+    const relay = kind || modelFence ? options.messages.filter(message => message.role !== 'system' && !isNativeContext(message)) : []
+    const toolFree = !(kind || modelFence) || (!options.tools?.length && !options.toolHistory?.tools.length && !options.toolHistory?.updates.length)
+    // The native loop passes the resolved call after adapter preparation. Match the exact admitted step's signal;
+    // the loop's request marker is private to its physical dsh-llm package instance and cannot identify a bundle's calls.
+    if (modelFence && agent && input) {
+      modelFence.requireExact(input.role === 'draft-worker' && input.turn !== undefined
+        && this.textReady(agent, input.role) && !!options.signal && options.signal === input.stepSignal && !options.signal.aborted
+        && sameModelRoute(modelFence.route, options) && toolFree && relay.length === 1 && sameRelay(relay[0]!, input.message))
+    }
     if (kind) {
-      const input = agent && this.drafts.get(agent)
       const stream = input?.stream
-      const relay = options.messages.filter(message => message.role !== 'system' && !isNativeContext(message))
-      // A history marker can require the fence, but only the exact pinned kind and live admission can pass it.
-      // Effort was checked at pre-step; the native call can now include the adapter's default effort.
+      // Without a model policy, the protected relay allows the native call to materialize the adapter's default effort.
       if (kinds.length !== 1 || !pinned.includes(kind) || tagged.length !== 1 || tagged[0] !== kind
         || !agent || !input || stream?.kind !== kind || input.role !== 'draft-worker' || input.turn === undefined || !this.textReady(agent, input.role)
-        || !options.signal || options.signal !== stream.stepSignal || options.signal.aborted
+        || !options.signal || options.signal !== input.stepSignal || options.signal.aborted
         || options.provider !== stream.route.provider || options.model !== stream.route.model
-        || options.tools?.length || options.toolHistory?.tools.length || options.toolHistory?.updates.length
-        || relay.length !== 1 || !sameRelay(relay[0]!, stream.relay)) {
+        || !toolFree || relay.length !== 1 || !sameRelay(relay[0]!, input.message)) {
         // Throw before starting the native attempt instead of returning a provider failure that the loop may retry.
         throw invalidRelay(kind, 'INVALID_MODEL_REQUEST')
       }
@@ -369,9 +394,12 @@ export class StudioAssistant {
 
   /** Reserve the Assistant task and Worker ID before starting the shared text runner. */
   private async delegate(agent: Agent, source: OwnerRequest, caller: AbortSignal): Promise<StudioDraftTask> {
-    const route = this.checkedRoute(agent)
+    const selected = this.checkedRoute(agent)
+    const pendingPin = this.pinTextWorkerRoute(selected, caller)
+    const route = pendingPin ? await pendingPin : selected
     caller.throwIfAborted()
     this.stopping.signal.throwIfAborted()
+    if (pendingPin && !this.assistantReady(agent)) throw new Error('Studio draft rejected: ASSISTANT_UNAVAILABLE')
     const workerId = SessionId(randomUUID())
     const { task, created } = unwrap(this.store.startDraft({ ...source, assistantSessionId: agent.id, workerSessionId: workerId }, this.memoryEnabled))
     if (!created) return task
@@ -400,7 +428,8 @@ export class StudioAssistant {
     const kinds = RELAY_KINDS.filter(kind => sources[kind] !== undefined)
     const [kind] = kinds
     const context = kind && sources[kind]
-    if (context) signals.push(this.hostStopping)
+    const pinnedModel = route.pinnedModel
+    if (context || pinnedModel) signals.push(this.hostStopping)
     const signal = AbortSignal.any(signals)
     let handle: WorkerHandle | undefined
     let result: StudioDraftResult | undefined
@@ -410,9 +439,20 @@ export class StudioAssistant {
       const reason = this.providerDenial(route.model.provider) ?? check?.()
       if (reason) { failure = reason; throw new Error(reason) }
     }
+    const modelFence: TextWorkerModelFence | undefined = pinnedModel && {
+      route: pinnedModel,
+      requireExact: confirmed => {
+        authorize()
+        if (!confirmed) {
+          failure = 'TEXT_WORKER_MODEL_UNCONFIRMED'
+          throw textWorkerModelError('The native Worker request did not match the pinned model route and assignment.')
+        }
+      },
+    }
     try {
       // A frozen source belongs to one draft Worker only; never combine sources or relay them to an Advisor.
-      authorize(() => kinds.length > 1 || (context && role !== 'draft-worker') ? 'INVALID_MODEL_INPUT' : undefined)
+      authorize(() => kinds.length > 1 || ((context || modelFence) && role !== 'draft-worker') ? 'INVALID_MODEL_INPUT' : undefined)
+      modelFence?.requireExact(sameModelRoute(modelFence.route, route.model))
       // The factory finishes mounting and classifying the persisted role before the runner supplies any work.
       handle = await createStudioSession(this.ctx, workerId, this.workerPreset, route, signal)
       if (!this.textReady(handle.agent, role)) throw new Error('Restricted text admission changed')
@@ -431,13 +471,13 @@ export class StudioAssistant {
       const id = MessageId((kind ? RELAYS[kind].prefix : '') + randomUUID())
       const message = freezeMessage<UserMessage>({ id, role: 'user', content, source })
       const stream: ProtectedRelayStream | undefined = kind && context ? {
-        kind, relay: message, route: Object.freeze({ ...route.model }), recheck: () => authorize(() => context.check()),
+        kind, route: Object.freeze({ ...route.model }), recheck: () => authorize(() => context.check()),
       } : undefined
       result = await this.capture(handle.agent, message, role, signal, selection => authorize(() => {
         if (role === 'advisor' && !sameModelRoute(route.model, selection)) return 'ADVISOR_ROUTE_CHANGED'
         // Keep the preference check here; project evidence checks require the running execution claimed by beforeEnter.
         return admission.beforeEnter?.() ?? sources.preference?.check()
-      }), stream)
+      }), stream, modelFence)
       if (!result && failure === 'WORKER_FAILED') failure = 'NO_COMPLETE_WORKER_TEXT'
     } catch {
       // Keep the admission reason; other runtime failures need not reveal provider or host details in a project result.
@@ -454,9 +494,9 @@ export class StudioAssistant {
 
   /** Capture by exact Session and admitted turn. A stream delta, failed turn, or unrelated follow-up cannot become a saved result. */
   private async capture(agent: Agent, message: UserMessage, role: RestrictedTextRole, signal: AbortSignal,
-    enter: DraftInput['enter'], stream?: ProtectedRelayStream): Promise<StudioDraftResult | undefined> {
+    enter: DraftInput['enter'], stream?: ProtectedRelayStream, modelFence?: TextWorkerModelFence): Promise<StudioDraftResult | undefined> {
     const settled = Promise.withResolvers<StudioDraftResult | undefined>()
-    const input: DraftInput = { messageId: message.id, role, enter, reject: settled.reject, ...(stream ? { stream } : {}) }
+    const input: DraftInput = { message, role, enter, reject: settled.reject, ...(stream ? { stream } : {}), ...(modelFence ? { modelFence } : {}) }
     let final: StudioDraftResult | undefined
     const remove = this.ctx.on('session/event', (session, event) => {
       if (session !== agent.session) return
@@ -469,7 +509,12 @@ export class StudioAssistant {
         const text = !event.data.interrupted && textOnly(event.data.message.content.filter(block => block.type !== 'reasoning'))
         final = text ? { text, messageId: event.data.message.id, eventSeq: event.seq, turn: input.turn } : undefined
       } else if (event.type === 'turn/end' && event.data.turn === input.turn) {
-        settled.resolve(event.data.reason.kind === 'completed' ? final : undefined)
+        const { reason } = event.data
+        // Native preparation can reject the pinned effort before any stream is constructed. Keep that failure distinct from empty output.
+        if (modelFence && reason.kind === 'error' && UNCONFIRMED_TEXT_ROUTE_FAILURES.has(reason.error.code)) {
+          try { modelFence.requireExact(false) } catch (error) { settled.reject(error); return }
+        }
+        settled.resolve(reason.kind === 'completed' ? final : undefined)
       }
     })
     const abort = () => settled.reject(signal.reason)

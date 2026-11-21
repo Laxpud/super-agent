@@ -41,6 +41,7 @@ import { StudioQuotaNotices } from './quota-notices.ts'
 import { QuotaPoolConfig, StudioQuotaControl, quotaProviderMap } from './quota.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
 import { StudioStudy, isStudyTool, studyOutput } from './study.ts'
+import { TextWorkerModelPolicy, TextWorkerRouteConfig } from './text-worker-model-policy.ts'
 import { watchdogCommand } from './watchdog.ts'
 
 export const name = 'dsh-superagent-managed-worker'
@@ -54,6 +55,8 @@ export const Config = s.object({
     .description('Opt-in route for independent, tool-free Advisor consultations; null disables new consultations.'),
   memory: s.boolean().default(false)
     .description('Enable owner preferences, explicit references in text work, project archives and Bot experiences. Saved preferences and project facts are never applied automatically.'),
+  textWorkerRoutes: s.array(TextWorkerRouteConfig).max(64).default([])
+    .description('Allow only these exact provider/model/effort combinations for manual Web Assistant and Leader text dispatch. Empty keeps the existing route selection.'),
   feishuDocumentInbox: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
     .description('Optional, separately configured single-owner Feishu inbox for a managed document.'),
   feishuTextInbox: s.union([s.const(null), FeishuTextInboxConfig]).default(null)
@@ -138,6 +141,7 @@ export function apply(context: Context, config: Config): void {
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
   if (documentRecovery && !watchdog) throw new Error('Studio document recovery requires watchdog for evidence lookup')
   const advisoryModel = advisor ? advisorSelection(advisor) : undefined
+  const textWorkerModels = config.textWorkerRoutes?.length ? new TextWorkerModelPolicy(ctx, config.textWorkerRoutes) : undefined
   if (systemdJobPollSeconds !== 0 && (!systemdJobInbox || !Number.isInteger(systemdJobPollSeconds) || systemdJobPollSeconds < 5 || systemdJobPollSeconds > 300)) {
     throw new Error('Studio job watcher requires systemdJobInbox and a polling interval of 5–300 seconds')
   }
@@ -196,7 +200,7 @@ export function apply(context: Context, config: Config): void {
     channelReady, channelStop.signal, failureNoticeReady) : undefined
   const quota = new StudioQuotaControl(ctx, store, quotaPools, providerPool, quotaFeishuAlerts)
   const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), ready, provider => quota.denial(provider),
-    memory, channelStop.signal)
+    memory, channelStop.signal, textWorkerModels)
   ctx.on('llm/stream', (options, next) => drafts.stream(options, next))
   // On hosts with this optional extension, native command receipts and the exact Worker relay stay out of supplemental log uploads.
   ctx.inject(['sessionLogDeepSeek'], scope => {

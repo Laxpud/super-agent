@@ -354,7 +354,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/managed-worker/index.ts` | The opt-in Studio host: keeps its roles read-only, registers Web commands, and guards the one allowed managed document action without running GitHub setup |
-| `src/managed-worker/assistant.ts` | Runs restricted text Workers or Advisors, rechecks protected relays at the native stream boundary, and captures the exact admitted turn's result |
+| `src/managed-worker/assistant.ts` | Runs restricted text Workers or Advisors, checks pinned routes and protected relays at the native stream boundary, and captures the exact admitted turn's result |
+| `src/managed-worker/text-worker-model-policy.ts` | Checks opted-in Assistant and Leader text dispatch against an exact route allow-list; pins a supported explicit or adapter-default effort without selecting another model |
 | `src/managed-worker/advisor.ts` | Uses an opt-in model route to obtain a separate Advisor opinion on a scoped owner question, without dispatching work or granting actions |
 | `src/managed-worker/advisor-store.ts` | Captures the question, exact evidence and Advisor provenance; rechecks management authority at reservation and admission and retains opinions across handoffs |
 | `src/managed-worker/study.ts` | Coordinates bounded investigations and a separate synthesis Worker for one owner message; presents saved results without asking the Assistant to rewrite them |

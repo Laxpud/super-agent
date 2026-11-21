@@ -164,8 +164,11 @@ export class StudioProjectControl {
   /** Reserve once under current management and recheck both before the relay and at the Worker's first step. */
   private async runWork(agent: Agent, workId: string, signal: AbortSignal,
     automatic?: Pick<StudioJobAuto, 'permitId' | 'route'>, allowEvidence = false): Promise<StudioProjectWorkView> {
-    const route = automatic?.route ?? this.workers.checkedRoute(agent)
+    const selected = automatic?.route ?? this.workers.checkedRoute(agent)
+    const pendingPin = automatic ? undefined : this.workers.pinTextWorkerRoute(selected, signal)
+    const route = pendingPin ? await pendingPin : selected
     signal.throwIfAborted()
+    if (pendingPin && !this.leaderReady(agent)) throw new Error('Project dispatch denied: LEADER_UNAVAILABLE')
     const workerId = SessionId(randomUUID())
     const reserved = this.store.projects.reserveWork(agent.id, workId, workerId, automatic, allowEvidence)
     const refusal = (reason: string) => {
