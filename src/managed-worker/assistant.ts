@@ -214,25 +214,27 @@ export class StudioAssistant {
     readonly providerDenial: (provider: string) => string | undefined, private readonly memoryEnabled: boolean,
     private readonly hostStopping: AbortSignal, private readonly textWorkerModels?: TextWorkerModelPolicy) {}
 
-  /** Check quota for the actual Worker route. Only ordinary manual dispatch can use a role's configured default. */
-  checkedRoute(agent: Agent, manualRole?: TextWorkerDispatchRole): WorkerRoute {
-    const defaultModel = manualRole ? this.textWorkerModels?.defaultFor(manualRole) : undefined
-    const route = draftWorkerRoute(agent, defaultModel)
+  /** Check quota on the caller's route for study work, which does not use ordinary dispatch defaults or bounds. */
+  checkedRoute(agent: Agent): WorkerRoute {
+    return this.checkRouteQuota(draftWorkerRoute(agent))
+  }
+
+  private checkRouteQuota(route: WorkerRoute): WorkerRoute {
     const denial = this.providerDenial(route.model.provider)
     if (denial) throw new Error(denial)
     return route
   }
 
-  /** Pin the effective effort before reserving manual text work. Leave other routes and disabled policy unchanged. */
-  pinTextWorkerRoute(route: WorkerRoute, caller: AbortSignal): Promise<WorkerRoute> | undefined {
-    if (!this.textWorkerModels) return
+  /** Use the same dispatch role for default selection and bounds. Only pin after checking the actual route's quota. */
+  prepareTextWorkerRoute(agent: Agent, role: TextWorkerDispatchRole, caller: AbortSignal): WorkerRoute | Promise<WorkerRoute> {
+    const policy = this.textWorkerModels
+    const route = this.checkRouteQuota(draftWorkerRoute(agent, policy?.defaultFor(role)))
+    if (!policy) return route
     const signal = AbortSignal.any([caller, this.stopping.signal, this.hostStopping])
-    return this.textWorkerModels.pin(route.model, signal).then(model => {
+    return policy.pin(role, route.model, signal).then(model => {
       signal.throwIfAborted()
-      const denial = this.providerDenial(model.provider)
-      if (denial) throw new Error(denial)
       // Pass the verified default as an explicit effort so a later adapter default cannot change the Worker's route.
-      return { cwd: route.cwd, model, pinnedModel: model }
+      return this.checkRouteQuota({ cwd: route.cwd, model, pinnedModel: model })
     })
   }
 
@@ -395,9 +397,9 @@ export class StudioAssistant {
 
   /** Reserve the Assistant task and Worker ID before starting the shared text runner. */
   private async delegate(agent: Agent, source: OwnerRequest, caller: AbortSignal): Promise<StudioDraftTask> {
-    const selected = this.checkedRoute(agent, 'assistant')
-    const pendingPin = this.pinTextWorkerRoute(selected, caller)
-    const route = pendingPin ? await pendingPin : selected
+    const selected = this.prepareTextWorkerRoute(agent, 'assistant', caller)
+    const pendingPin = selected instanceof Promise
+    const route = pendingPin ? await selected : selected
     caller.throwIfAborted()
     this.stopping.signal.throwIfAborted()
     if (pendingPin && !this.assistantReady(agent)) throw new Error('Studio draft rejected: ASSISTANT_UNAVAILABLE')

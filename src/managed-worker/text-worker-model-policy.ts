@@ -7,6 +7,13 @@ export type TextWorkerModelSelection = { provider: string; model: string; reason
 export type PinnedTextWorkerModel = Readonly<Required<TextWorkerModelSelection>>
 export type TextWorkerDispatchRole = 'assistant' | 'leader'
 type TextWorkerDefaults = Readonly<Partial<Record<TextWorkerDispatchRole, PinnedTextWorkerModel | null>>>
+type TextWorkerBoundSide = 'min' | 'max'
+type TextWorkerRoleBounds = Readonly<Partial<Record<TextWorkerBoundSide, PinnedTextWorkerModel | null>>>
+type TextWorkerBounds = Readonly<Partial<Record<TextWorkerDispatchRole, TextWorkerRoleBounds | null>>>
+type TextWorkerRouteRange = Readonly<Record<TextWorkerBoundSide, number>>
+
+const DISPATCH_ROLES = ['assistant', 'leader'] as const
+const BOUND_SIDES = ['min', 'max'] as const
 
 const ROUTE_LIMIT = 64
 const IDENTIFIER_LIMIT = 256
@@ -28,6 +35,19 @@ export const TextWorkerRouteConfig: s<Required<TextWorkerModelSelection>> = s.ob
 export const TextWorkerDefaultsConfig = s.object({
   assistant: s.union([s.const(null), TextWorkerRouteConfig]).default(null),
   leader: s.union([s.const(null), TextWorkerRouteConfig]).default(null),
+}).default({ assistant: null, leader: null })
+
+const roleBoundsConfig = (): s<TextWorkerRoleBounds> => s.object({
+  min: s.union([s.const(null), TextWorkerRouteConfig]).default(null)
+    .description('First allowed row in textWorkerRoutes order, inclusive. Omit or use null for no lower bound.'),
+  max: s.union([s.const(null), TextWorkerRouteConfig]).default(null)
+    .description('Last allowed row in textWorkerRoutes order, inclusive. Omit or use null for no upper bound.'),
+})
+
+/** Each role can independently restrict dispatch to an inclusive interval in textWorkerRoutes. */
+export const TextWorkerBoundsConfig = s.object({
+  assistant: s.union([s.const(null), roleBoundsConfig()]).default(null),
+  leader: s.union([s.const(null), roleBoundsConfig()]).default(null),
 }).default({ assistant: null, leader: null })
 
 /** Compare the configured tuple against the actual Step or stream, without substituting defaults. */
@@ -79,13 +99,15 @@ async function awaitMetadata(result: unknown, signal: AbortSignal): Promise<unkn
   finally { listener[Symbol.dispose]() }
 }
 
-/** Keep an immutable snapshot of allowed routes and role defaults; check current metadata only when pinning. */
+/** Snapshot the ordered routes, role bounds and defaults; consult current Host metadata only when pinning. */
 export class TextWorkerModelPolicy {
   readonly #ctx: Context
   readonly #entries: readonly PinnedTextWorkerModel[]
+  readonly #bounds: Readonly<Record<TextWorkerDispatchRole, TextWorkerRouteRange>>
   readonly #defaults: Readonly<Record<TextWorkerDispatchRole, PinnedTextWorkerModel | undefined>>
 
-  constructor(ctx: Context, entries: readonly Required<TextWorkerModelSelection>[], defaults?: TextWorkerDefaults) {
+  constructor(ctx: Context, entries: readonly Required<TextWorkerModelSelection>[], defaults?: TextWorkerDefaults,
+    bounds?: TextWorkerBounds) {
     this.#ctx = ctx
     if (!Array.isArray(entries) || entries.length === 0 || entries.length > ROUTE_LIMIT) {
       throw notAllowed(`Configure between 1 and ${ROUTE_LIMIT} text Worker routes.`)
@@ -104,15 +126,52 @@ export class TextWorkerModelPolicy {
     }
     this.#entries = Object.freeze(snapshot)
 
-    // Resolve each role to a frozen allow-list row; do not retain the caller's defaults or consult the Host.
+    // Store zero-based positions in the frozen list, not references to the caller's endpoint tuples.
+    const resolveRange = (role: TextWorkerDispatchRole): TextWorkerRouteRange => {
+      const path = `textWorkerBounds.${role}`
+      const roleBounds = bounds?.[role]
+      const resolveEndpoint = (side: TextWorkerBoundSide, unrestricted: number): number => {
+        const endpoint = roleBounds?.[side]
+        if (endpoint == null) return unrestricted
+        const position = this.#routePosition(endpoint)
+        if (position < 0) throw notAllowed(`${path}.${side} must exactly match a tuple in textWorkerRoutes.`)
+        return position
+      }
+      const min = resolveEndpoint('min', 0)
+      const max = resolveEndpoint('max', this.#entries.length - 1)
+      if (min > max) throw notAllowed(`${path}.min must not appear after ${path}.max in textWorkerRoutes.`)
+      return Object.freeze({ min, max })
+    }
+    this.#bounds = Object.freeze({ assistant: resolveRange('assistant'), leader: resolveRange('leader') })
+
+    // Reuse the frozen allow-list row only if the role could dispatch that exact tuple.
     const resolveDefault = (role: TextWorkerDispatchRole): PinnedTextWorkerModel | undefined => {
       const selection = defaults?.[role]
       if (selection == null) return undefined
-      const route = this.#entries.find(entry => sameTextWorkerModel(entry, selection))
+      const position = this.#routePosition(selection)
+      const route = this.#entries[position]
       if (!route) throw notAllowed(`textWorkerDefaults.${role} must exactly match a tuple in textWorkerRoutes.`)
+      if (!this.#withinBounds(role, position)) {
+        throw notAllowed(`textWorkerDefaults.${role} is outside the range configured by textWorkerBounds.${role}.`)
+      }
       return route
     }
     this.#defaults = Object.freeze({ assistant: resolveDefault('assistant'), leader: resolveDefault('leader') })
+  }
+
+  #routePosition(selection: Readonly<TextWorkerModelSelection>): number {
+    return this.#entries.findIndex(entry => sameTextWorkerModel(entry, selection))
+  }
+
+  #withinBounds(role: TextWorkerDispatchRole, position: number): boolean {
+    const { min, max } = this.#bounds[role]
+    return min <= position && position <= max
+  }
+
+  #assertWithinBounds(role: TextWorkerDispatchRole, position: number): void {
+    if (!this.#withinBounds(role, position)) {
+      throw new Error(`TEXT_WORKER_MODEL_OUT_OF_BOUNDS: The text Worker route is outside the range configured by textWorkerBounds.${role}.`)
+    }
   }
 
   /** Return the configured route for this role; dispatch must still confirm it through pin. */
@@ -120,15 +179,19 @@ export class TextWorkerModelPolicy {
     return this.#defaults[role]
   }
 
-  /** Reject out-of-policy selections before consulting the Host; pin only an exact effort that is also allowed. */
-  async pin(selection: Readonly<TextWorkerModelSelection>, signal: AbortSignal): Promise<PinnedTextWorkerModel> {
+  /** Check global membership and role bounds for the exact tuple, then return it only if the Host confirms it. */
+  async pin(role: TextWorkerDispatchRole, selection: Readonly<TextWorkerModelSelection>, signal: AbortSignal): Promise<PinnedTextWorkerModel> {
     signal.throwIfAborted()
     const { provider, model, reasoningEffort } = selection
-    const allowed = this.#entries.filter(route => route.provider === provider && route.model === model)
+    const position = reasoningEffort === undefined ? undefined : this.#routePosition({ provider, model, reasoningEffort })
+    const allowed = position === undefined
+      ? this.#entries.some(route => route.provider === provider && route.model === model)
+      : position >= 0
     signal.throwIfAborted()
-    if (!allowed.length || (reasoningEffort !== undefined && !allowed.some(route => route.reasoningEffort === reasoningEffort))) {
+    if (!allowed) {
       throw notAllowed('The requested text Worker route or explicit reasoning effort is not configured.')
     }
+    if (position !== undefined) this.#assertWithinBounds(role, position)
 
     const lookupSignal = AbortSignal.any([signal, AbortSignal.timeout(LOOKUP_TIMEOUT_MS)])
     let confirmed: ReturnType<typeof confirmEffort>
@@ -152,20 +215,30 @@ export class TextWorkerModelPolicy {
     }
 
     if ('problem' in confirmed) throw textWorkerModelError(confirmed.problem)
-    const pinned = allowed.find(route => route.reasoningEffort === confirmed.effort)
+    // For inherited effort, test the adapter's actual default, never another row for the same model.
+    const confirmedPosition = position ?? this.#routePosition({ provider, model, reasoningEffort: confirmed.effort })
+    const pinned = this.#entries[confirmedPosition]
     if (!pinned) throw notAllowed('The confirmed default reasoning effort is not configured for this text Worker route.')
+    if (position === undefined) this.#assertWithinBounds(role, confirmedPosition)
     return pinned
   }
 }
 
-/** Leave unconfigured dispatch unchanged, but reject role defaults without an allow-list at apply time. */
+/** Leave unconfigured dispatch unchanged; role defaults and bounds endpoints require an ordered allow-list. */
 export function createTextWorkerModelPolicy(ctx: Context, entries?: readonly Required<TextWorkerModelSelection>[],
-  defaults?: TextWorkerDefaults): TextWorkerModelPolicy | undefined {
+  defaults?: TextWorkerDefaults, bounds?: TextWorkerBounds): TextWorkerModelPolicy | undefined {
   if (entries === undefined || entries.length === 0) {
+    for (const role of DISPATCH_ROLES) {
+      for (const side of BOUND_SIDES) {
+        if (bounds?.[role]?.[side] != null) {
+          throw notAllowed(`textWorkerBounds.${role}.${side} requires a nonempty textWorkerRoutes list.`)
+        }
+      }
+    }
     if (defaults?.assistant != null || defaults?.leader != null) {
       throw notAllowed('textWorkerDefaults requires a nonempty textWorkerRoutes list.')
     }
     return undefined
   }
-  return new TextWorkerModelPolicy(ctx, entries, defaults)
+  return new TextWorkerModelPolicy(ctx, entries, defaults, bounds)
 }

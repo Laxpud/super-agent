@@ -41,7 +41,7 @@ import { StudioQuotaNotices } from './quota-notices.ts'
 import { QuotaPoolConfig, StudioQuotaControl, quotaProviderMap } from './quota.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
 import { StudioStudy, isStudyTool, studyOutput } from './study.ts'
-import { createTextWorkerModelPolicy, TextWorkerDefaultsConfig, TextWorkerRouteConfig } from './text-worker-model-policy.ts'
+import { createTextWorkerModelPolicy, TextWorkerBoundsConfig, TextWorkerDefaultsConfig, TextWorkerRouteConfig } from './text-worker-model-policy.ts'
 import { watchdogCommand } from './watchdog.ts'
 
 export const name = 'dsh-superagent-managed-worker'
@@ -56,9 +56,11 @@ export const Config = s.object({
   memory: s.boolean().default(false)
     .description('Enable owner preferences, explicit references in text work, project archives and Bot experiences. Saved preferences and project facts are never applied automatically.'),
   textWorkerRoutes: s.array(TextWorkerRouteConfig).max(64).default([])
-    .description('Allow only these exact provider/model/effort combinations for Assistant and manual Leader text dispatch. Leave empty only when neither role has a default.'),
+    .description('Allowed provider/model/effort combinations for ordinary text dispatch. Order from lower to higher when using textWorkerBounds.'),
   textWorkerDefaults: TextWorkerDefaultsConfig
-    .description('Optional Worker-only defaults for Assistant delegation and manual Leader text dispatch. Each must match textWorkerRoutes exactly.'),
+    .description('Optional Worker-only defaults for Assistant delegation and manual Leader text dispatch. Each must match an allowed tuple within that role’s bounds.'),
+  textWorkerBounds: TextWorkerBoundsConfig
+    .description('Optional inclusive bounds per dispatch role. Each endpoint must match one textWorkerRoutes row in all three fields. Omit or use null for an open side. Bounds never pick a model.'),
   feishuDocumentInbox: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
     .description('Optional, separately configured single-owner Feishu inbox for a managed document.'),
   feishuTextInbox: s.union([s.const(null), FeishuTextInboxConfig]).default(null)
@@ -143,7 +145,7 @@ export function apply(context: Context, config: Config): void {
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
   if (documentRecovery && !watchdog) throw new Error('Studio document recovery requires watchdog for evidence lookup')
   const advisoryModel = advisor ? advisorSelection(advisor) : undefined
-  const textWorkerModels = createTextWorkerModelPolicy(ctx, config.textWorkerRoutes, config.textWorkerDefaults)
+  const textWorkerModels = createTextWorkerModelPolicy(ctx, config.textWorkerRoutes, config.textWorkerDefaults, config.textWorkerBounds)
   if (systemdJobPollSeconds !== 0 && (!systemdJobInbox || !Number.isInteger(systemdJobPollSeconds) || systemdJobPollSeconds < 5 || systemdJobPollSeconds > 300)) {
     throw new Error('Studio job watcher requires systemdJobInbox and a polling interval of 5–300 seconds')
   }

@@ -41,7 +41,7 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 ### 限定普通文字 Worker 的模型组合
 
-在隔离 profile 的原有 Studio 条目中，可用 `textWorkerRoutes` 限定可派工的组合，并用 `textWorkerDefaults` 分别给 Assistant 和 Leader 指定 Worker 的默认组合。保留 `stateDir` 和其他已设选项。下例只是配置形状：请填写实际的 Provider、模型和思考深度 ID，不用显示名称代替，也不用填凭据。
+在隔离 profile 的原有 Studio 条目中，可用 `textWorkerRoutes` 列出允许的组合，用 `textWorkerDefaults` 和 `textWorkerBounds` 分别给 Assistant 和 Leader 指定 Worker 的默认组合和派工范围。保留 `stateDir` 和其他已设选项。下例只展示配置写法，请填写实际的 Provider、模型和思考深度 ID，不要填显示名称或凭据。
 
 ```yaml
 - id: dsh-superagent-managed-worker
@@ -55,6 +55,9 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
       - provider: example-provider
         model: example-analysis-model
         reasoningEffort: medium
+      - provider: example-provider
+        model: example-analysis-model
+        reasoningEffort: high
     textWorkerDefaults:
       assistant:
         provider: example-provider
@@ -64,14 +67,28 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
         provider: example-provider
         model: example-analysis-model
         reasoningEffort: medium
+    textWorkerBounds:
+      assistant:
+        max:
+          provider: example-provider
+          model: example-analysis-model
+          reasoningEffort: medium
+      leader:
+        min:
+          provider: example-provider
+          model: example-analysis-model
+          reasoningEffort: medium
 ```
 
-配置了角色默认值后，照常向 Assistant 交代一项纯文字任务，或让现任 Leader 派工已有待办。发起会话仍用自己的模型，不需要切换到 Worker 的组合。省略某个角色或填 `null` 时，该角色的 Worker 继续沿用会话选择，并遵守清单。若会话未选思考深度，只接受适配器明确报告、且在清单中的默认深度。清单和默认值都不设时保持原行为。
+使用 `textWorkerBounds` 时，按自己的偏好把 `textWorkerRoutes` 从低到高排列。`min`、`max` 都按三个字段定位清单中的一行，范围包含端点。只设 `min` 就不设上限，只设 `max` 就不设下限；省略角色或填 `null` 就不另设范围。上例中 Assistant 可用第 1、2 行，Leader 可用第 2、3 行；第 2、3 行虽然是同一模型，思考深度不同，属于两个组合。清单顺序不代表模型的通用能力排名。
 
-这两个选项只影响 Assistant 的单项文字委派和现任 Leader 的手动文字派工。分项调查、Advisor、文档、飞书收件和自动作业接续仍走各自的路线。宿主核验并固定这次派工的组合，不按清单顺序挑选，也不在角色默认值不可用时回退到会话的模型。
+发起会话仍用自己的模型。配置了角色默认值时，照常交代文字任务或派工，Worker 使用该默认值；没有默认值时，Worker 沿用会话选择。若会话未选思考深度，宿主先核验适配器报告的默认深度，再检查组合是否在清单和角色范围内。三个选项都不设时保持原行为。
 
-- **启用 Studio 时遇到 `TEXT_WORKER_MODEL_NOT_ALLOWED`：** 指定默认值时，`textWorkerRoutes` 不能为空。让默认值的三个字段与清单中同一行完全一致，或把该角色的默认值改为 `null`。
-- **派工时组合不在清单或无法核实（`TEXT_WORKER_MODEL_NOT_ALLOWED`／`TEXT_WORKER_MODEL_UNCONFIRMED`）：** 先核对适配器是否仍支持该组合。已设角色默认值时，改会话模型不会改变 Worker；如需换组合，请将默认值改为清单中另一条已核实的组合。未设时，可在发起会话显式选择一个受支持且在清单内的组合。
+这些配置只影响 Assistant 的单项文字委派和现任 Leader 的手动文字派工。分项调查、Advisor、文档、飞书收件和自动作业接续仍走各自的路线。宿主只核验并固定选中的组合，不按顺序自动挑选，也不在默认值不可用或越界时换用其他组合。
+
+- **启用时遇到 `TEXT_WORKER_MODEL_NOT_ALLOWED`：** 设置默认值或端点时，清单不能为空。确认默认值和端点都与清单中的某一行完全匹配、`min` 不在 `max` 之后，且默认值在本角色范围内。
+- **派工时遇到 `TEXT_WORKER_MODEL_OUT_OF_BOUNDS`：** 所选组合虽在清单上但不在该角色范围内，宿主未创建 Worker。若设了角色默认值，请核对默认值和范围；改发起会话的模型不会覆盖它。未设默认值时，在发起会话选择范围内的组合，必要时明确选择思考深度。
+- **派工时组合不在清单或无法核实（`TEXT_WORKER_MODEL_NOT_ALLOWED`／`TEXT_WORKER_MODEL_UNCONFIRMED`）：** 先核对适配器是否仍支持该组合。已设角色默认值就修正配置；未设默认值才在发起会话选择合适的组合。
 
 宿主以适配器的元数据为准，不另行探测远端账户、额度或价格。
 
