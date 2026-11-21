@@ -1,5 +1,6 @@
 /** Durable references from Studio work to separately authorized document tasks. */
 import type { DatabaseSync } from 'node:sqlite'
+import { readProjectDocumentDecisions, type ProjectDocumentDecisionHistory } from './project-document-decision-store.js'
 import type { StudioProjectBinding, StudioProjectWork } from './project-store.ts'
 import type { ManagedResult, ManagedTask } from './store.ts'
 
@@ -9,6 +10,7 @@ export interface StudioProjectDocument {
   hold?: string
   linkLeaderSessionId: string
   linkManagementEpoch: number
+  scopeDecisions?: ProjectDocumentDecisionHistory
   result?: {
     text: string
     workerSessionId: string
@@ -94,9 +96,9 @@ export function attachProjectDocument(db: DatabaseSync, access: ProjectDocumentA
   return accept({ task, ...(hold === undefined ? {} : { hold }), linkLeaderSessionId: leaderSessionId, linkManagementEpoch: managementEpoch })
 }
 
-/** Read task state and the attachment together; the caller scopes work to the Leader's project. */
+/** Read the scoped attachment and task state; only an authorized full detail may request decision metadata. */
 export function readProjectDocument(db: DatabaseSync, access: ProjectDocumentAccess, work: DocumentWork,
-  full: boolean): StudioProjectDocument | undefined {
+  full: boolean, includeOwnerDocumentDecisions = false): StudioProjectDocument | undefined {
   const row = db.prepare(`SELECT task_id, project_id, link_leader_session_id, link_management_epoch,
     anchored_execution_epoch, anchored_authorization_version FROM studio_project_document WHERE work_id = ?`).get(work.workId)
   if (!row) return
@@ -115,6 +117,9 @@ export function readProjectDocument(db: DatabaseSync, access: ProjectDocumentAcc
   } else {
     const hold = access.documentHold(task)
     if (hold !== undefined) document.hold = hold
+  }
+  if (full && includeOwnerDocumentDecisions === true) {
+    document.scopeDecisions = readProjectDocumentDecisions(db, task, anchoredEpoch, anchoredAuthorization)
   }
   return document
 }

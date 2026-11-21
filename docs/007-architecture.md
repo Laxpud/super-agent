@@ -371,7 +371,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/project-fact-use-store.ts` | Pins one fact revision to registered work without copying its excerpt; retains the native owner event and protects the immutable link |
 | `src/managed-worker/bot-experience.ts` | Handles owner-only commands for recording a reusable method and inspecting its applicability and provenance |
 | `src/managed-worker/bot-experience-store.ts` | Keys method revisions by stable Leader Bot and checks their exact project fact parents without returning source project text |
-| `src/managed-worker/project-document-store.ts` | Links project work to one already authorized document task and reads its exact audited commit, never a later shared head |
+| `src/managed-worker/project-document-store.ts` | Links project work to one authorized document task, reads its exact audited commit, and includes correction history only in an authorized owner detail read |
+| `src/managed-worker/project-document-decision-store.ts` | Projects recent applied scope corrections after attachment, with original source and Worker coordinates, without copying message or document text |
 | `src/managed-worker/project-job.ts` | Owner controls to pin an existing external job, observe it, and authorize or pause its post-processing without stopping the job |
 | `src/managed-worker/project-job-monitor.ts` | Checks bounded batches of pinned jobs without Agents, then defers automatic dispatch to the exact active Leader and approved model route |
 | `src/managed-worker/project-job-store.ts` | Stores one pinned invocation per work item, preserving the first confirmed terminal observation and independent authorization versions |

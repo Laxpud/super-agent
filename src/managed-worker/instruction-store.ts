@@ -105,6 +105,9 @@ export const INSTRUCTION_SCHEMA = `
     post_approved_text TEXT NOT NULL,
     FOREIGN KEY (task_id, execution_epoch) REFERENCES managed_session_binding (task_id, execution_epoch)
   ) STRICT;
+  -- Project detail looks back through the existing receipts in descending authorization order.
+  CREATE INDEX IF NOT EXISTS studio_document_narrowing_task_post
+    ON studio_document_narrowing (task_id, post_authorization_version DESC);
   CREATE VIEW IF NOT EXISTS studio_document_effective_pending AS
     SELECT i.* FROM studio_document_instruction i WHERE i.state = 'pending'
       AND NOT EXISTS (SELECT 1 FROM studio_document_narrowing n WHERE n.instruction_id = i.instruction_id);

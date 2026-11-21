@@ -61,12 +61,33 @@ function documentText({ task, hold, linkLeaderSessionId, linkManagementEpoch }: 
     + sharedDocumentCoordinates(task) + (hold ? `\nDocument action held: ${hold}. Check /studio-doc status or /studio-doc inbox in the current document Worker.` : '')
 }
 
+/** Render approved scope changes as history, separate from the current Worker state and any committed result. */
+function documentDecisionText(history: NonNullable<StudioProjectDocument['scopeDecisions']>): string {
+  const { entries, more, unconfirmed } = history
+  if (!entries.length && !unconfirmed) return '\n\nNo applied document scope corrections are recorded after linking. Check pending input with /studio-doc inbox in the current document Worker.'
+  const lines = ['Recorded document scope corrections (after linking):',
+    'Newest first. These are past decisions, not current authorization or a document write result.']
+  for (const entry of entries) {
+    const { source, keptLines, keptCount } = entry
+    const lineNumbers = keptLines.join(', ') + (keptCount > keptLines.length ? ', …' : '')
+    const origin = source.channel === 'gui' ? `Source: Web owner message ${source.messageId} in the original Worker Session ${source.sessionId}`
+      + (source.eventSeq > 0 ? `, inbox event ${source.eventSeq}.` : '.') : `Source: Feishu owner message ${source.messageId} in the original linked private chat.`
+    lines.push(`\nAuthorization v${entry.previousAuthorizationVersion} → v${entry.authorizationVersion}; kept ${keptCount} approved changed ${keptCount === 1 ? 'line' : 'lines'} (${lineNumbers}).`,
+      `Applied at ${entry.reviewedAt} (UTC) in Worker Session ${entry.reviewSessionId}, execution epoch ${entry.executionEpoch}. Instruction ${entry.instructionId}.`, origin)
+  }
+  if (more) lines.push('Older correction receipts are not shown.')
+  if (unconfirmed) lines.push('Some correction evidence could not be confirmed and was not shown as applied.')
+  return `\n\n${lines.join('\n')}`
+}
+
 /** Return saved provenance, not a Leader rewrite. Only owner reads can include document or fact-derived text. */
 function workText(view: StudioProjectWorkView, includeRequest = false, includeDocumentBody = false, includeFactBody = false): string {
   const { work, run, job, document, fact } = view
   const execution = run ? `\nWorker Bot ${run.workerBotId}; Session ${run.workerSessionId}; execution epoch ${run.executionEpoch}; dispatched by Leader Session ${run.leaderSessionId} at management epoch ${run.managementEpoch}.` : ''
   const source = `\nOwner source: message ${work.sourceMessageId} in Leader Session ${work.leaderSessionId}.`
   const detail = job ? `\n\n${projectJobText(job)}` : document ? `\n\n${documentText(document)}` : ''
+  const decisions = !includeDocumentBody || !document ? '' : document.scopeDecisions ? documentDecisionText(document.scopeDecisions)
+    : '\n\nDocument scope history is available only in the current Leader Session. Use /studio-project status to find it.'
   const request = includeRequest ? `\n\nRegistered request:\n${work.requestText}` : ''
   const reference = fact ? `\nPinned fact ${fact.key} v${fact.revision} in project ${fact.projectId}; registered from owner turn ${fact.turn}, inbox event ${fact.sourceEventSeq}.` : ''
   const resultSource = run?.result ?? fact?.resultSource
@@ -77,7 +98,7 @@ function workText(view: StudioProjectWorkView, includeRequest = false, includeDo
   const committed = document?.result
   const commit = committed ? `\n\nCommitted document by Worker Session ${committed.workerSessionId}; execution epoch ${committed.executionEpoch}; authorization version ${committed.authorizationVersion}; tool call ${committed.toolCallId}; saved at ${committed.at}.`
     + (includeDocumentBody ? `\n\n${committed.text}` : `\nRead the exact text with /studio-project work ${work.workId}.`) : ''
-  return `${workSummary(view)}${execution}${source}${reference}${run?.failure ? `\nReason: ${run.failure}.` : ''}${detail}${request}${result}${commit}`
+  return `${workSummary(view)}${execution}${source}${reference}${run?.failure ? `\nReason: ${run.failure}.` : ''}${detail}${decisions}${request}${result}${commit}`
 }
 
 /** Show the Bot separately from the currently authorized Session and management epoch. */
@@ -293,7 +314,8 @@ export class StudioProjectControl {
     if (verb === 'work') {
       if (argument) {
         if (!id.safeParse(argument).success) return denied('INVALID_WORK_ID')
-        const result = this.store.projects.readWork(agent.id, argument)
+        // Only this native owner detail read requests correction history. The Store also requires current management.
+        const result = this.store.projects.readWork(agent.id, argument, agent.session.header.origin !== 'subagent')
         return result.ok ? { kind: 'success', text: workText(result.value, true, true, archiveEnabled) } : denied(result.reason)
       }
       const result = this.store.projects.listWork(agent.id)

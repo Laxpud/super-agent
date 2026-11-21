@@ -16,6 +16,7 @@ import { assistantSourceUsed } from './study-store.js'
 import { validSystemdJob, type SystemdJobRef, type SystemdJobState } from './systemd-job.js'
 
 export { sameJobRoute, type StudioJobAuto, type StudioJobRoute } from './project-job-auto-store.js'
+export type { ProjectDocumentDecision, ProjectDocumentDecisionHistory } from './project-document-decision-store.js'
 export type { StudioProjectDocument } from './project-document-store.js'
 export type { StudioProjectJob } from './project-job-store.js'
 
@@ -870,16 +871,16 @@ export class ProjectStore {
     })
   }
 
-  /** Read one work item for a current or historical Leader of that project, without granting management. */
-  readWork(leaderSessionId: string, workId: string): ManagedResult<StudioProjectWorkView> {
-    if (!isId(leaderSessionId) || !isId(workId)) return deny('INVALID_INPUT')
+  /** Read exact project work for a historical or current Leader. Only an explicit owner read by the current Leader includes document decisions. */
+  readWork(sessionId: string, workId: string, includeOwnerDocumentDecisions = false): ManagedResult<StudioProjectWorkView> {
+    if (!isId(sessionId) || !isId(workId)) return deny('INVALID_INPUT')
     return this.access.snapshot(() => {
-      const binding = this.binding(leaderSessionId)
+      const binding = this.binding(sessionId)
       if (!binding) return deny('SESSION_NOT_BOUND')
       const work = this.work(binding.projectId, workId)
       if (!work) return deny('WORK_NOT_FOUND')
-      const current = this.currentProject(leaderSessionId, true)
-      return accept(this.workView(work, true, current.ok))
+      const current = this.currentProject(sessionId, true)
+      return accept(this.workView(work, true, current.ok, includeOwnerDocumentDecisions === true && current.ok))
     })
   }
 
@@ -899,10 +900,11 @@ export class ProjectStore {
     return row && readWorkRow(row)
   }
 
-  private workView(work: StudioProjectWork, full: boolean, includeFactResult: boolean): StudioProjectWorkView {
+  private workView(work: StudioProjectWork, full: boolean, includeFactResult: boolean,
+    includeOwnerDocumentDecisions = false): StudioProjectWorkView {
     const pinned = readWorkFact(this.db, work.workId)
     const job = readProjectJob(this.db, work.projectId, work.workId)
-    const document = readProjectDocument(this.db, this.access, work, full)
+    const document = readProjectDocument(this.db, this.access, work, full, includeOwnerDocumentDecisions)
     // Historical Leaders still get provenance. Fact validity describes the head, not the viewing Session's authority.
     const fact = pinned && { ...pinned, current: pinned.projectId === work.projectId && this.factQuote(pinned) !== undefined }
     return { work, ...this.workRunView(work, fact, includeFactResult), ...(job ? { job } : {}), ...(document ? { document } : {}) }
