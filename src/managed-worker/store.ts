@@ -33,6 +33,7 @@ import { PROJECT_DOCUMENT_SCHEMA, projectDocumentCommandUsed } from './project-d
 import { PROJECT_FACT_USE_SCHEMA } from './project-fact-use-store.js'
 import { PROJECT_HANDOFF_SCHEMA } from './project-handoff-store.js'
 import { PROJECT_JOB_AUTO_SCHEMA } from './project-job-auto-store.js'
+import { PROJECT_JOB_START_SCHEMA } from './project-job-start-store.js'
 import { PROJECT_JOB_SCHEMA } from './project-job-store.js'
 import { PROJECT_RESULT_USE_SCHEMA, projectResultCommandUsed } from './project-result-use-store.js'
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
@@ -421,6 +422,7 @@ export class ManagedWorkerStore {
         this.db.exec(PROJECT_DOCUMENT_SCHEMA)
         this.db.exec(PROJECT_JOB_SCHEMA)
         this.db.exec(PROJECT_JOB_AUTO_SCHEMA)
+        this.db.exec(PROJECT_JOB_START_SCHEMA)
         this.db.exec(PROJECT_FACT_USE_SCHEMA)
         this.db.exec(PROJECT_RESULT_USE_SCHEMA)
         this.db.exec(PROJECT_WORK_MODEL_SCHEMA)

@@ -61,7 +61,7 @@ function documentHealth(entry: WatchdogDocument, captureUnconfirmed: boolean, ob
 }
 
 function jobHealth(entry: WatchdogJob, observe: ObserveSession): string {
-  const { id, paused, authorizationVersion, attempt, automatic } = entry
+  const { id, paused, authorizationVersion, attempt, automatic, startEvidence } = entry
   const state = entry.state === 'running' ? 'Waiting on the recorded external invocation'
     : entry.state === 'unknown' ? 'External observation unknown, not a confirmed failure'
       : entry.state === 'failed' ? 'Recorded external failure' : 'External invocation recorded complete'
@@ -74,6 +74,15 @@ function jobHealth(entry: WatchdogJob, observe: ObserveSession): string {
   // A released reservation is text work history, not proof this job started post-processing.
   if (attempt?.state === 'released') facts.push(`Latest text reservation (execution epoch ${attempt.executionEpoch}) was released before start.`)
   else if (attempt) facts.push(`Post-processing attempt (execution epoch ${attempt.executionEpoch}): ${executionStatus[attempt.state]}.`)
+  // Compare the saved admission with the owner pause, not the current presence or activity of the Worker.
+  if (startEvidence?.kind === 'before-pause') {
+    facts.push(`The recorded Studio start at authorization v${startEvidence.startAuthorizationVersion} predates the current pause at v${startEvidence.pauseAuthorizationVersion}.`)
+  } else if (startEvidence?.kind === 'during-pause') {
+    facts.push(`Recorded inconsistency: Studio recorded a start while owner pause v${startEvidence.authorizationVersion} was active.`)
+  } else if (startEvidence?.kind === 'unconfirmed') {
+    facts.push('Start and pause order unconfirmed: the saved evidence cannot establish the order. This does not show that the attempt started while paused.')
+  }
+  if (startEvidence && startEvidence.kind !== 'unconfirmed') facts.push('This does not establish model entry or an external action.')
 
   const waiting = entry.state === 'completed' && !paused && (!attempt || attempt.state === 'released')
   if (waiting) facts.push('No post-processing start is recorded.')

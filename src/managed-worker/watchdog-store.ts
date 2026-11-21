@@ -2,6 +2,7 @@
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
 import type { DocumentFailureNotice } from './document-failure-notice-store.js'
 import type { DocumentFailure } from './document-recovery-store.js'
+import { projectJobStartEvidence, type ProjectJobStartEvidence } from './project-job-start-store.js'
 import { isJobState } from './project-job-store.js'
 import { latestWorkBlockState } from './project-work-block-store.js'
 import type { StudioQuotaIncident } from './quota-store.js'
@@ -67,6 +68,8 @@ export interface WatchdogJob {
   /** Only the grant for the current Leader and authorization version, without its permit ID or route. */
   automatic?: { state: 'unused' } | { state: 'spent'; executionEpoch: number }
   attempt?: Pick<WatchdogDispatch, 'state' | 'executionEpoch'>
+  /** The saved Studio start compared with an exact recorded owner pause, not a live Worker observation. */
+  startEvidence?: ProjectJobStartEvidence
 }
 
 export interface WatchdogExecution {
@@ -249,10 +252,14 @@ function job(db: DatabaseSync, id: string): WatchdogJob {
     else if (isVersion(consumed) && attempt && consumed <= attempt.executionEpoch) automatic = { state: 'spent', executionEpoch: consumed }
     else throw new Error('Invalid Watchdog job grant')
   }
-  // A released text reservation can predate the attachment. Retain its coordinates without inferring that it processed the job.
+  // A released text reservation can predate the attachment. Only an entered attempt can have a start to compare with a pause.
+  const startEvidence = attempt && attempt.state !== 'reserved' && attempt.state !== 'released'
+    ? projectJobStartEvidence(db, { workId: id, projectId: leader.projectId, invocationId, executionEpoch: attempt.executionEpoch,
+      authorizationVersion, paused: paused === 1 }) : undefined
   return { kind: 'job', id, ...leader, unit, invocationId, state, observedAt, observationVersion,
     paused: paused === 1, authorizationVersion, ...(automatic ? { automatic } : {}),
-    ...(attempt ? { attempt: { state: attempt.state, executionEpoch: attempt.executionEpoch } } : {}) }
+    ...(attempt ? { attempt: { state: attempt.state, executionEpoch: attempt.executionEpoch } } : {}),
+    ...(startEvidence ? { startEvidence } : {}) }
 }
 
 function projectWork(db: DatabaseSync, id: string): WatchdogExecution {
