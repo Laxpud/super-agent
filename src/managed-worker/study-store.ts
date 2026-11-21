@@ -1,6 +1,7 @@
 /** Durable inputs, single-use Worker reservations, and results for unprojected Studio studies. */
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
+import { guiDocumentContinuationSeen } from './document-continuation-store.js'
 import type { ManagedResult, StudioDraftResult } from './store.js'
 
 export const STUDY_MIN_PARTS = 2
@@ -126,10 +127,11 @@ type StudySource = Pick<Study, 'assistantSessionId' | 'sourceMessageId' | 'sourc
 const OUTSTANDING = "state IN ('pending', 'reserved', 'running')"
 
 /** Check both authenticated coordinates across all Assistant routes inside their shared write transaction. */
-export function assistantSourceUsed(db: DatabaseSync, source: StudySource): boolean {
+export function assistantSourceUsed(db: DatabaseSync, source: StudySource & { sourceEventSeq?: number }): boolean {
   const keys = [source.assistantSessionId, source.sourceMessageId, source.sourceRequestId] as const
   // Each route checks its own idempotent replay first. This check decides only whether a new row may be inserted.
-  return ['studio_draft_task', 'studio_project_proposal', 'studio_study'].some(table => !!db.prepare(`SELECT 1 FROM ${table}
+  return guiDocumentContinuationSeen(db, ...keys, source.sourceEventSeq)
+    || ['studio_draft_task', 'studio_project_proposal', 'studio_study'].some(table => !!db.prepare(`SELECT 1 FROM ${table}
     WHERE assistant_session_id = ? AND (source_message_id = ? OR source_request_id = ?) LIMIT 1`).get(...keys))
     || !!db.prepare(`SELECT 1 FROM studio_advice WHERE role = 'assistant' AND requester_session_id = ?
         AND (source_message_id = ? OR source_request_id = ?) LIMIT 1`).get(...keys)

@@ -10,6 +10,7 @@ import { z } from 'zod'
 import { resolveFeishuBot, type FeishuBot } from '../deployment.ts'
 import { consumeFeishuEvents, consumerRetry } from '../sources/feishu-events.ts'
 import { FeishuEventSchema } from '../sources/feishu-trigger.ts'
+import { documentContinuationIntent, type DocumentContinuationIntent } from './document-continuation-intent.ts'
 import { feishuTextCommand, type FeishuTextRoute, type StudioFeishuText } from './feishu-text.ts'
 import type { ManagedResult, ManagedTask, ManagedWorkerStore, StudioFeishuInstruction } from './store.ts'
 
@@ -24,6 +25,9 @@ const exec = promisify(execFile)
 const noticeReceipt = z.object({ ok: z.literal(true), data: z.object({
   message_id: z.string().regex(messageId), chat_id: z.string().regex(chatId),
 }) })
+
+/** Return a brief status without document content, or undefined to leave a duplicate unanswered. */
+type FeishuDocumentContinuation = (source: StudioFeishuInstruction, intent: DocumentContinuationIntent, signal: AbortSignal) => Promise<string | undefined>
 
 /** A local capability for an already verified bot and its configured owner, not a freely routed transport. */
 export interface StudioFeishuNoticeDestination {
@@ -79,11 +83,13 @@ export class StudioFeishuInbox {
   private state = 'waiting for the bot connection'
   private readonly scope: string
   private readonly replies = new Set<Promise<void>>()
+  private readonly continuations = new Set<Promise<void>>()
   private noticeChannel: { bot: FeishuBot; signal: AbortSignal } | undefined
 
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore, private readonly stateDir: string,
     private readonly config: FeishuInboxConfig, private readonly allowed: () => boolean, private readonly text: StudioFeishuText | undefined,
-    private readonly documentCorrections: boolean, private readonly onNoticeReady?: () => void) {
+    private readonly documentCorrections: boolean, private readonly onNoticeReady?: () => void,
+    private readonly onDocumentContinuation?: FeishuDocumentContinuation) {
     this.scope = feishuSourceScope(config)
   }
 
@@ -157,7 +163,8 @@ export class StudioFeishuInbox {
         this.listening = false
         this.noticeChannel = undefined
         connection.abort()
-        await Promise.all(this.replies)
+        // An aborted connection cannot start more replies, but its continuation callbacks may still be settling.
+        await Promise.all([...this.continuations, ...this.replies])
       }
       retry = consumerRetry(retry, Date.now() - began)
       await delay(retry, undefined, { signal }).catch(() => {})
@@ -183,9 +190,25 @@ export class StudioFeishuInbox {
       ...(data.root_id && messageId.test(data.root_id) ? { rootId: data.root_id } : {}),
       ...(data.thread_id && threadId.test(data.thread_id) ? { threadId: data.thread_id } : {}),
     }
+    if (this.documentCorrections && this.onDocumentContinuation && text !== null) {
+      const intent = documentContinuationIntent(text)
+      if (intent) {
+        this.receiveDocumentContinuation(bot, source, intent, signal, this.onDocumentContinuation)
+        return
+      }
+    }
     // Classify the reserved namespace even if the body is too large to retain. Never turn a malformed command into a correction.
     const command = this.text ? feishuTextCommand(data.content) : undefined
     if (this.text && (command || !this.documentCorrections)) {
+      if (!this.documentCorrections) {
+        // Standalone text skips the combined route claim. A continuation from a previous configuration must stay claimed.
+        const seen = this.store.feishuDocumentContinuationSeen(this.scope, source.requestId)
+        if (!seen.ok) {
+          this.ctx.logger.warn('Studio could not confirm the Feishu message route')
+          return
+        }
+        if (seen.value) return
+      }
       this.text.receive(source, command, (message, phase) => this.reply(bot, data.message_id, message, signal, phase))
       return
     }
@@ -205,6 +228,21 @@ export class StudioFeishuInbox {
       const ordering = late ? ' An older Feishu timestamp was detected; check the order before deciding.' : ''
       this.reply(bot, data.message_id, `Received for task ${taskId}: document writes are held for review. This is not an effective change.${ordering} Open /studio-doc inbox in Studio Web.`, signal)
     }
+  }
+
+  /** Start the callback synchronously so it can claim the source before the next event; drain its completion on shutdown. */
+  private receiveDocumentContinuation(bot: FeishuBot, source: StudioFeishuInstruction, intent: DocumentContinuationIntent,
+    signal: AbortSignal, handle: FeishuDocumentContinuation): void {
+    const target = source.messageId
+    const pending = (async () => {
+      try {
+        const receipt = await handle(source, intent, signal)
+        if (receipt !== undefined) this.reply(bot, target, receipt, signal)
+      } catch {
+        this.reply(bot, target, 'Studio could not confirm document continuation. Check the task status in Studio Web.', signal)
+      }
+    })().finally(() => { this.continuations.delete(pending) })
+    this.continuations.add(pending)
   }
 
   /** Do not make a later instruction wait behind a notification. Drop surplus receipts, not their ledger records. */

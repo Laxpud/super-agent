@@ -60,12 +60,14 @@ export function validateDocumentRelays(store: ManagedWorkerStore, agent: Agent, 
 
 /** Owner requests continue the same task once per decision, without changing authority or writing the document. */
 export async function continueDocument(delivery: AgentDelivery, store: ManagedWorkerStore, agent: Agent, argument: string,
-  signal: AbortSignal, ready: () => boolean): Promise<CommandResult> {
+  signal: AbortSignal, ready: () => boolean, expected?: Pick<ManagedTask, 'taskId' | 'executionEpoch'>): Promise<CommandResult> {
   const revision = versionArg.safeParse(argument)
   if (!revision.success) return instructionFailure('EXPECTED_AUTHORIZATION_VERSION')
   const snapshot = store.documentContinuation(agent.id, revision.data)
   if (!snapshot.ok) return instructionFailure(snapshot.reason)
   const { task } = snapshot.value
+  // A request from another entry point already selected a task and epoch; never substitute a newer target.
+  if (expected && (task.taskId !== expected.taskId || task.executionEpoch !== expected.executionEpoch)) return instructionFailure('STALE_EXECUTION')
   const key = documentContinuationKey(task)
   let denial: CommandResult | undefined
   try {

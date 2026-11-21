@@ -379,6 +379,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/systemd-job.ts` | Reads a bounded snapshot of one supported local user service invocation; unknown or mismatched evidence never reports completion |
 | `src/managed-worker/instructions.ts` | Records Web inputs before model reads, reviews Web and Feishu corrections against their exact versions, and sends current approved text to the bound Worker |
 | `src/managed-worker/document-intent.ts` | Recognizes a small grammar of unambiguous pause or line-subset requests; it has no authority to change them into actions |
+| `src/managed-worker/document-continuation-intent.ts` | Matches one standalone request to continue existing work, without interpreting a correction or a request to lift a pause |
+| `src/managed-worker/document-continuation-store.ts` | Claims verified Web and Feishu request coordinates once and retains the selected document execution and authorization without copying text |
+| `src/managed-worker/document-continuation.ts` | Resolves a single native owner request, shows ambiguous candidates, and uses the existing versioned relay to the current document Worker |
 | `src/managed-worker/owner-confirmation.ts` | Checks the explicit answer to a live native Web owner question; timeout and delayed or mismatched replies cannot confirm a change |
 | `src/managed-worker/memory.ts` | Handles model-free preference and citation commands and verifies the exact persisted native command before mutation |
 | `src/managed-worker/memory-store.ts` | Maintains scoped preference revisions and terminal forget records; resolves citations only at the active source revision in the selected context |
@@ -396,7 +399,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/preference-correction-store.ts` | Journals one correction for an exact active revision and run; binds the terminal decision to the matching new revision in the same transaction |
 | `src/managed-worker/preference-scope-change-intent.ts` | Recognizes a standalone restriction or forget request with exact preference and project identifiers |
 | `src/managed-worker/preference-scope-change-store.ts` | Stores one-use scope decisions without preference text and binds confirmation to its exact journal transition |
-| `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot, routes the configured owner's private chat to enabled text or document-review paths, and sends best-effort plain-text receipts |
+| `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot, routes the configured owner's private chat to enabled text, review or continuation paths, and sends best-effort plain-text receipts |
 | `src/managed-worker/feishu-text.ts` | Routes explicit single-message text commands to a restricted Worker or exact result retrieval without rerunning completed work |
 | `src/managed-worker/feishu-draft-store.ts` | Preserves Feishu input, task and Worker identities, and result provenance; deduplicates deliveries under the shared SQLite run fence |
 | `src/managed-worker/feishu-delivery-store.ts` | Fixes the first route for each combined-inbox delivery and retains those claims across restarts and mode changes |

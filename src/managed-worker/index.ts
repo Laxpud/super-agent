@@ -15,6 +15,8 @@ import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool, type R
 import { BOT_EXPERIENCE_HINT } from './bot-experience.ts'
 import { documentStartArgs, sharedDocumentCommand, sharedDocumentCoordinates, sharedDocumentError } from './document-command.ts'
 import { StudioDocumentFailureNotices } from './document-failure-notices.ts'
+import { documentContinuationIntent } from './document-continuation-intent.ts'
+import { StudioDocumentContinuation } from './document-continuation.ts'
 import { StudioDocumentRecovery } from './document-recovery.ts'
 import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, feishuSourceScope, validateFeishuInbox } from './feishu-inbox.ts'
 import { StudioFeishuText, feishuDraftOutput, validateFeishuTextRoute } from './feishu-text.ts'
@@ -43,6 +45,8 @@ export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'perm
 export const Config = s.object({
   stateDir: s.string().required().description('Absolute directory reserved for the Studio database.'),
   guiDocumentInbox: s.boolean().default(false).description('Hold pending document writes for owner review when a new chat message arrives in the bound document Worker.'),
+  documentContinuations: s.boolean().default(false)
+    .description('Route standalone owner continuation requests in Studio Assistant and the linked Feishu document inbox to the current document Worker without changing authorization.'),
   advisor: s.union([s.const(null), AdvisorConfig]).default(null)
     .description('Opt-in route for independent, tool-free Advisor consultations; null disables new consultations.'),
   memory: s.boolean().default(false)
@@ -127,8 +131,8 @@ function receipt(operation: string, result: ManagedResult<ManagedTask>, showResu
 
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
 export function apply(context: Context, config: Config): void {
-  const { stateDir, guiDocumentInbox, advisor, memory, feishuDocumentInbox, feishuTextInbox, quotaPools, quotaFeishuAlerts,
-    watchdog, documentRecovery, documentFailureFeishuAlerts, systemdJobInbox, systemdJobPollSeconds } = config
+  const { stateDir, guiDocumentInbox, documentContinuations, advisor, memory, feishuDocumentInbox, feishuTextInbox, quotaPools,
+    quotaFeishuAlerts, watchdog, documentRecovery, documentFailureFeishuAlerts, systemdJobInbox, systemdJobPollSeconds } = config
   const ctx = localOwnerHost(context)
   if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
   if (documentRecovery && !watchdog) throw new Error('Studio document recovery requires watchdog for evidence lookup')
@@ -212,9 +216,11 @@ export function apply(context: Context, config: Config): void {
   const preferenceIntake = memory ? new StudioPreferenceIntake(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal) : undefined
   const preferenceChanges = memory ? new StudioPreferenceChange(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal) : undefined
   const delivery = new AgentDelivery(ctx)
+  const continuations = documentContinuations ? new StudioDocumentContinuation(ctx, store, delivery, ready, channelStop.signal) : undefined
   const feishuText = feishuTextInbox ? new StudioFeishuText(store, drafts, feishuTextInbox, channelStop.signal, channelReady, combinedFeishu) : undefined
   const feishu = feishuConfig && new StudioFeishuInbox(ctx, store, stateDir, feishuConfig, channelReady, feishuText,
-    !!feishuDocumentInbox || combinedFeishu, failureNoticeReady)
+    !!feishuDocumentInbox || combinedFeishu, failureNoticeReady,
+    continuations && ((source, intent, signal) => continuations.receiveFeishu(source, intent, signal)))
   if (documentFailureNoticeScope && feishu) {
     failureNotices = new StudioDocumentFailureNotices(ctx, store, () => feishu.noticeDestination(), channelStop.signal,
       () => ctx.logger.warn('Studio Feishu document failure notice was not confirmed; check /studio-health document <task-id>'))
@@ -250,6 +256,7 @@ export function apply(context: Context, config: Config): void {
       await feishuText?.drain()
       await advisors.drain()
       await studies.drain()
+      await continuations?.drain()
       await preferenceChanges?.drain()
       await projectFactIntake.drain()
       await recovery?.drain()
@@ -346,6 +353,11 @@ export function apply(context: Context, config: Config): void {
       const input = currentOwnerInboxInput(step)
       if (input) {
         step.signal.throwIfAborted()
+        const continuation = role === 'assistant' && continuations?.reviewWeb(step, input)
+        if (continuation) {
+          await continuation
+          return { kind: 'enter', messages: [] }
+        }
         const registration = projectFactIntake.review(step, input, role)
         if (registration) {
           await registration
@@ -359,8 +371,10 @@ export function apply(context: Context, config: Config): void {
             return { kind: 'enter', messages: [] }
           }
         }
-      } else if (messages.some(message => message.content.some(block => block.type === 'text' && parseProjectFactRequest(block.text).kind !== 'plain'))) {
-        // An edited, batched, or non-owner reference must not silently enter a different work route.
+      } else if (messages.some(message => message.content.some(block => block.type === 'text'
+        && (parseProjectFactRequest(block.text).kind !== 'plain'
+          || (role === 'assistant' && continuations && documentContinuationIntent(block.text)))))) {
+        // An edited, batched, or non-owner control request must not silently enter a different work route.
         return { kind: 'reject' }
       }
     }
@@ -408,7 +422,10 @@ export function apply(context: Context, config: Config): void {
         if (verb === 'feishu-status') return { kind: 'success', text: feishu.status() }
         const result = feishu.bind(agent.id, commandId)
         if (!result.ok) return documentHoldError(result.reason) ?? rejected(result.reason)
-        return { kind: 'success', text: `The configured Feishu private chat is linked to task ${result.value.taskId}. Incoming messages require review; no write scope or pause changed.` }
+        const linked = `The configured Feishu private chat is linked to task ${result.value.taskId}.`
+        return { kind: 'success', text: continuations
+          ? `${linked} No write scope or pause changed. To continue this task, send a separate message in that chat:\nContinue that task\nOther ordinary messages still go to document review.`
+          : `${linked} Incoming messages require review; no write scope or pause changed.` }
       }
       if (verb === 'start') {
         let json: unknown
@@ -418,7 +435,8 @@ export function apply(context: Context, config: Config): void {
         const input = fields.data
         const result = 'documentId' in input ? store.createSharedTask(agent.id, input.documentId, input.expectedVersion, input.replacement, commandId)
           : store.create(agent.id, input.initial, input.replacement, commandId)
-        return receipt('Managed task created', result)
+        const created = receipt('Managed task created', result)
+        return continuations && result.ok ? { ...created, text: `${created.text}\n\nTo continue from a Studio Assistant Session, send a separate message:\nContinue document task ${result.value.taskId}` } : created
       }
       if (verb === 'status' && argument === '') return receipt('Managed task status', store.status(agent.id))
       if (verb === 'pause' && argument === '') return receipt('Pause effective', store.pause(agent.id, commandId), false)

@@ -6,6 +6,8 @@ import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
 import { ADVISOR_SCHEMA, AdvisorStore, interruptAdvice } from './advisor-store.js'
 import { BOT_EXPERIENCE_SCHEMA, BotExperienceStore } from './bot-experience-store.js'
+import { DOCUMENT_CONTINUATION_SCHEMA, appendDocumentContinuationClaim, feishuDocumentContinuationLate, feishuDocumentContinuationSeen,
+  readDocumentContinuationSource, type DocumentContinuationSelection, type DocumentContinuationSource } from './document-continuation-store.js'
 import { DOCUMENT_FAILURE_NOTICE_SCHEMA, DocumentFailureNoticeStore, type DocumentFailureNotice } from './document-failure-notice-store.js'
 import { DOCUMENT_RECOVERY_SCHEMA, DocumentRecoveryStore, type DocumentFailure, type DocumentFailureInput } from './document-recovery-store.js'
 import { parseDraftPreference } from './draft-preference-request.js'
@@ -37,6 +39,7 @@ import { WATCHDOG_INDEXES, readWatchdogEntries, readWatchdogTarget,
   type WatchdogQuota, type WatchdogSnapshot, type WatchdogTarget } from './watchdog-store.js'
 
 export { EXPERIENCE_TEXT_LIMIT, isExperienceText, type BotExperience } from './bot-experience-store.js'
+export type { DocumentContinuationSelection, DocumentContinuationSource } from './document-continuation-store.js'
 export type { DocumentFailureNotice } from './document-failure-notice-store.js'
 export type { DocumentFailure, DocumentFailureInput } from './document-recovery-store.js'
 export type { StudioDraftPreference } from './draft-preference-store.js'
@@ -412,6 +415,7 @@ export class ManagedWorkerStore {
         this.db.exec(FEISHU_DRAFT_SCHEMA)
         this.db.exec(FEISHU_DELIVERY_SCHEMA)
         this.db.exec(SHARED_DOCUMENT_SCHEMA)
+        this.db.exec(DOCUMENT_CONTINUATION_SCHEMA)
         this.db.exec(DOCUMENT_RECOVERY_SCHEMA)
         this.db.exec(DOCUMENT_FAILURE_NOTICE_SCHEMA)
         this.documentFailureNotices.recoverSending()
@@ -864,6 +868,8 @@ export class ManagedWorkerStore {
       // A redelivery can return its original task without starting anything, even after a routing change.
       const existing = this.feishuDrafts.duplicate(scope, source.requestId)
       if (existing) return accept({ task: existing, created: false })
+      // A continuation claim is not a text task. Reject it in both modes before considering a new reservation.
+      if (feishuDocumentContinuationSeen(this.db, scope, source.requestId)) return deny('FEISHU_DELIVERY_ALREADY_ROUTED')
       const combined = scope === this.feishuCombinedScope
       if (combined) {
         if (!freshClaim || delivery.requestId !== source.requestId || delivery.sourceTimeMs !== source.sourceTimeMs
@@ -1008,9 +1014,16 @@ export class ManagedWorkerStore {
     })
   }
 
-  /** Check both legacy ledgers as well as the route table without rewriting historic records. */
+  /** Let the legacy text-only Host skip deliveries owned by the continuation route, including after reconfiguration. */
+  feishuDocumentContinuationSeen(scope: string, requestId: string): ManagedResult<boolean> {
+    if (!isId(scope) || !isId(requestId)) return deny('INVALID_INPUT')
+    return this.snapshot(() => accept(feishuDocumentContinuationSeen(this.db, scope, requestId)))
+  }
+
+  /** Check both legacy ledgers as well as route claims without rewriting historic records. */
   private feishuDeliverySeen(scope: string, requestId: string): boolean {
-    return this.feishuDeliveries.has(scope, requestId) || this.instructions.feishuDuplicate(scope, requestId)
+    return feishuDocumentContinuationSeen(this.db, scope, requestId)
+      || this.feishuDeliveries.has(scope, requestId) || this.instructions.feishuDuplicate(scope, requestId)
       || this.feishuDrafts.duplicate(scope, requestId) !== undefined
   }
 
@@ -1133,22 +1146,97 @@ export class ManagedWorkerStore {
     })
   }
 
+  /** Claim a Host-verified source and fix its outcome in the same write fence. Only the first selection may reach Host dispatch. */
+  claimDocumentContinuation(source: DocumentContinuationSource, taskId?: string): ManagedResult<DocumentContinuationSelection> {
+    const exact = readDocumentContinuationSource(source)
+    if (!exact || (taskId !== undefined && (typeof taskId !== 'string' || taskId.length !== 36
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(taskId)))) return deny('INVALID_INPUT')
+    return this.write<DocumentContinuationSelection>(() => {
+      const { channel, sourceScope, requestId } = exact
+      if (channel === 'gui') {
+        if (!this.ordinaryAssistantBinding(sourceScope)) return deny('SESSION_NOT_BOUND')
+        if (this.guiContinuationSourceUsed(exact)) return accept({ kind: 'duplicate' })
+      } else if (this.feishuDeliverySeen(sourceScope, requestId)) return accept({ kind: 'duplicate' })
+
+      // Blocked and ambiguous requests still own this delivery. Only a storage or run failure rolls back the claim.
+      const outcome = this.selectDocumentContinuation(exact, taskId)
+      appendDocumentContinuationClaim(this.db, this.#runId, exact, taskId, outcome)
+      return accept(outcome)
+    })
+  }
+
+  /** Check prior Assistant work and memory evidence without reading any original request or preference body. */
+  private guiContinuationSourceUsed({ sourceScope, requestId, messageId, eventSeq }: DocumentContinuationSource): boolean {
+    const source = { assistantSessionId: sourceScope, sourceMessageId: messageId, sourceRequestId: requestId,
+      ...(eventSeq === null ? {} : { sourceEventSeq: eventSeq }) }
+    return assistantSourceUsed(this.db, source)
+      || ['studio_memory_proposal', 'studio_memory_correction', 'studio_memory_scope_change'].some(table =>
+        !!this.db.prepare(`SELECT 1 FROM ${table} WHERE assistant_session_id = ?
+          AND (source_request_id = ? OR source_message_id = ? OR source_event_seq = ?) LIMIT 1`)
+          .get(sourceScope, requestId, messageId, eventSeq))
+      || !!this.db.prepare(`SELECT 1 FROM studio_memory_revision WHERE source_session_id = ? AND source_event_seq = ?
+        UNION ALL SELECT 1 FROM studio_memory_citation WHERE source_session_id = ? AND source_event_seq = ? LIMIT 1`)
+        .get(sourceScope, eventSeq, sourceScope, eventSeq)
+  }
+
+  /** Resolve the target under the claim's write lock. Neither an explicit ID nor a binding bypasses execution checks. */
+  private selectDocumentContinuation(source: DocumentContinuationSource, taskId: string | undefined):
+    Exclude<DocumentContinuationSelection, { kind: 'duplicate' }> {
+    let task: ManagedTask | undefined
+    if (source.channel === 'feishu') {
+      const { sourceScope, sourceTimeMs } = source
+      const boundTaskId = this.instructions.feishuTask(sourceScope)
+      if (boundTaskId === undefined) return { kind: 'blocked', reason: 'FEISHU_DOCUMENT_NOT_BOUND' }
+      if (taskId !== undefined && taskId !== boundTaskId) return { kind: 'blocked', reason: 'TASK_SCOPE_MISMATCH' }
+      task = this.task(boundTaskId)
+      if (sourceTimeMs === null || !task) throw new Error('Invalid Studio Feishu continuation binding or source time')
+      if (this.instructions.feishuLate(sourceScope, sourceTimeMs) || this.feishuDeliveries.actionLate(sourceScope, sourceTimeMs)
+        || this.feishuDrafts.late(sourceScope, sourceTimeMs) || feishuDocumentContinuationLate(this.db, sourceScope, sourceTimeMs)) {
+        return { kind: 'blocked', reason: 'FEISHU_MESSAGE_LATE', task }
+      }
+    } else if (taskId !== undefined) {
+      task = this.task(taskId)
+      if (!task) return { kind: 'blocked', reason: 'TASK_NOT_FOUND' }
+    } else {
+      // Count unfinished documents, not runnable Sessions. Fetch one extra ID to detect truncation without a second query.
+      const limit = 8
+      const rows = this.db.prepare('SELECT task_id FROM managed_document WHERE document_version = 1 ORDER BY task_id LIMIT ?').all(limit + 1)
+      if (!rows.length) return { kind: 'blocked', reason: 'NO_UNFINISHED_DOCUMENT_TASK' }
+      const candidates = rows.slice(0, limit).map(({ task_id: id }) => {
+        const entry = isId(id) ? this.task(id) : undefined
+        if (!entry) throw new Error('Missing Studio continuation candidate')
+        return entry
+      })
+      if (rows.length > 1) return { kind: 'ambiguous', candidates, more: rows.length > limit }
+      task = candidates[0]!
+    }
+
+    const current = this.documentContinuationTask(task.workerSessionId, task.authorizationVersion)
+    return current.ok ? { kind: 'selected', task: current.value } : { kind: 'blocked', reason: current.reason, task }
+  }
+
   /** Read the exact current target for Host dispatch to this Worker; do not issue a permit or change the task. */
   documentContinuation(sessionId: string, expectedAuthorizationVersion: number): ManagedResult<{ task: ManagedTask; text: string }> {
     if (!isId(sessionId) || !isVersion(expectedAuthorizationVersion)) return deny('INVALID_INPUT')
     return this.snapshot(() => {
-      if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-      const current = this.currentTask(sessionId)
-      if (!current.ok) return current
-      const task = current.value
-      if (this.studioSessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
-      if (task.documentVersion === 1 && sharedDocumentConflict(task)) return deny('SHARED_DOCUMENT_CONFLICT')
-      const blocked = this.executionBlocked(task)
-      if (blocked) return blocked
-      if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
-      if (task.authorizationVersion !== expectedAuthorizationVersion) return deny('STALE_AUTHORIZATION')
-      return accept({ task, text: this.documentTargets(task.taskId).approvedText })
+      const current = this.documentContinuationTask(sessionId, expectedAuthorizationVersion)
+      return current.ok ? accept({ task: current.value, text: this.documentTargets(current.value.taskId).approvedText }) : current
     })
+  }
+
+  /** Use the same eligibility checks for route selection and dispatch without opening a nested transaction or reading text. */
+  private documentContinuationTask(sessionId: string, expectedAuthorizationVersion: number): ManagedResult<ManagedTask> {
+    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
+    const current = this.currentTask(sessionId)
+    if (!current.ok) return current
+    const task = current.value
+    if (this.studioSessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
+    if (task.documentVersion === 1 && sharedDocumentConflict(task)) return deny('SHARED_DOCUMENT_CONFLICT')
+    const blocked = this.executionBlocked(task)
+    if (blocked) return blocked
+    if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
+    if (task.authorizationVersion !== expectedAuthorizationVersion) return deny('STALE_AUTHORIZATION')
+    return current
   }
 
   /** Review exactly the oldest pending item without changing the approved text or lifting any prior pause. */
