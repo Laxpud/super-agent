@@ -114,7 +114,9 @@ function executionHealth(entry: WatchdogExecution, observe: ObserveSession): str
   // A project item's text dispatch is separate from the state of its linked job or document.
   const label = entry.kind === 'project' ? 'Project text work' : entry.kind === 'feishu' ? 'Feishu task'
     : entry.kind === 'draft' ? 'Web draft' : entry.kind === 'study' ? 'Study' : 'Advice'
-  const status = entry.kind === 'project' && entry.state === 'pending' ? 'no text dispatch recorded' : executionStatus[entry.state]
+  const termination = entry.kind === 'project' ? entry.termination : undefined
+  const status = termination && entry.state === 'running' ? 'dispatch still recorded as running; Worker turn has ended'
+    : entry.kind === 'project' && entry.state === 'pending' ? 'no text dispatch recorded' : executionStatus[entry.state]
   const block = entry.kind === 'project' ? entry.ownerBlock : undefined
   // Keep a past release separate from the current owner decision. A later running or finished dispatch leads with its execution state.
   const hold = block === 'active' ? 'blocked by owner'
@@ -127,7 +129,10 @@ function executionHealth(entry: WatchdogExecution, observe: ObserveSession): str
   if (entry.projectId && entry.leaderSessionId && entry.managementEpoch) facts.push(`Project ${entry.projectId}; management epoch ${entry.managementEpoch}.`,
     observedSession('Current Leader', entry.leaderSessionId, observe))
   if (block) facts.push(`For the saved condition, use /studio-project work ${entry.id} in the current Leader Session.`)
-  if (entry.sessionId && (entry.state === 'reserved' || entry.state === 'running')) {
+  if (termination) facts.push(`Worker turn ${termination.turn} ended with ${termination.code} (native event ${termination.endEventSeq}).`,
+    `For the saved dispatch, use /studio-project work ${entry.id} in the current Leader Session.`)
+  else if (entry.kind === 'project' && entry.state === 'running') facts.push('No native turn termination is recorded for this dispatch; its outcome is not established.')
+  if (entry.sessionId && !termination && (entry.state === 'reserved' || entry.state === 'running')) {
     if (entry.executionEpoch) facts.push(`Execution epoch ${entry.executionEpoch}.`)
     facts.push(observedSession(entry.kind === 'advice' ? 'Advisor' : 'Worker', entry.sessionId, observe))
   } else if (entry.sessionId && entry.executionEpoch) {

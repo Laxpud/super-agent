@@ -39,6 +39,7 @@ import { PROJECT_RESULT_USE_SCHEMA, projectResultCommandUsed } from './project-r
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
 import { PROJECT_WORK_BLOCK_SCHEMA, projectWorkBlockCommandUsed } from './project-work-block-store.js'
 import { PROJECT_WORK_MODEL_SCHEMA, projectWorkModelCommandUsed } from './project-work-model-store.js'
+import { PROJECT_WORK_TERMINATION_SCHEMA } from './project-work-termination-store.js'
 import { QUOTA_NOTICE_SCHEMA, QuotaNoticeStore, isQuotaNoticeMessageId, type StudioQuotaNotice } from './quota-notice-store.js'
 import { QUOTA_SCHEMA, QuotaStore, type StudioQuotaIncident } from './quota-store.js'
 import { SHARED_DOCUMENT_SCHEMA, appendSharedRevision, readSharedRevision,
@@ -65,6 +66,7 @@ export { MEMORY_TEXT_LIMIT, PREFERENCE_CORRECTION_RECEIPT_PREFIX, PREFERENCE_PRO
 export { PROJECT_FACT_QUOTE_LIMIT, isProjectFactKey, isProjectFactQuote, type ProjectFact } from './project-archive-store.js'
 export { PROJECT_WORK_BLOCK_TEXT_LIMIT, type ProjectWorkBlockView } from './project-work-block-store.js'
 export type { ProjectWorkFactUse } from './project-fact-use-store.js'
+export type { ProjectWorkTermination, ProjectWorkTerminationInput } from './project-work-termination-store.js'
 export type { StudioQuotaNotice } from './quota-notice-store.js'
 export type { StudioQuotaIncident, StudioQuotaReason } from './quota-store.js'
 export type { SharedDocumentRevision } from './shared-document-store.js'
@@ -427,6 +429,7 @@ export class ManagedWorkerStore {
         this.db.exec(PROJECT_RESULT_USE_SCHEMA)
         this.db.exec(PROJECT_WORK_MODEL_SCHEMA)
         this.db.exec(PROJECT_WORK_BLOCK_SCHEMA)
+        this.db.exec(PROJECT_WORK_TERMINATION_SCHEMA)
         this.db.exec(INSTRUCTION_SCHEMA)
         this.db.exec(FEISHU_DRAFT_SCHEMA)
         this.db.exec(FEISHU_DELIVERY_SCHEMA)

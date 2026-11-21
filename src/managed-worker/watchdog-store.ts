@@ -5,6 +5,7 @@ import type { DocumentFailure } from './document-recovery-store.js'
 import { projectJobStartEvidence, type ProjectJobStartEvidence } from './project-job-start-store.js'
 import { isJobState } from './project-job-store.js'
 import { latestWorkBlockState } from './project-work-block-store.js'
+import { readWorkTermination, type ProjectWorkTermination } from './project-work-termination-store.js'
 import type { StudioQuotaIncident } from './quota-store.js'
 import type { ManagedTask } from './store.js'
 import { validSystemdJob } from './systemd-job.js'
@@ -84,6 +85,8 @@ export interface WatchdogExecution {
   reason?: string
   /** Latest project text block status, independent of the last reservation or execution. */
   ownerBlock?: 'active' | 'cleared'
+  /** A native end for this exact standalone project Worker, independent of dispatch settlement. */
+  termination?: ProjectWorkTermination
 }
 
 export type WatchdogEntry = WatchdogDocument | WatchdogJob | WatchdogExecution
@@ -265,12 +268,17 @@ function job(db: DatabaseSync, id: string): WatchdogJob {
 function projectWork(db: DatabaseSync, id: string): WatchdogExecution {
   const leader = management(db, workOrigin(db, id))
   // The last attempt stays historical after a block is set or cleared. Read only the current block status, not owner notes.
-  const attempt = latestDispatch(db, id, leader.projectId) ?? { state: 'pending' as const }
+  const recorded = latestDispatch(db, id, leader.projectId)
+  const attempt = recorded ?? { state: 'pending' as const }
   const ownerBlock = latestWorkBlockState(db, id)
   if (ownerBlock === 'active' && attempt.state !== 'pending' && attempt.state !== 'released') {
     throw new Error('An active owner block conflicts with the saved Studio text dispatch')
   }
-  return { kind: 'project', id, ...leader, ...attempt, ...(ownerBlock === undefined ? {} : { ownerBlock }) }
+  const termination = recorded && (recorded.state === 'running' || recorded.state === 'failed' || recorded.state === 'interrupted')
+    ? readWorkTermination(db, { workId: id, projectId: leader.projectId, executionEpoch: recorded.executionEpoch, workerSessionId: recorded.sessionId })
+    : undefined
+  return { kind: 'project', id, ...leader, ...attempt, ...(ownerBlock === undefined ? {} : { ownerBlock }),
+    ...(termination ? { termination } : {}) }
 }
 
 function execution(db: DatabaseSync, kind: ExecutionKind, source: ExecutionSource, row: Row): WatchdogExecution {

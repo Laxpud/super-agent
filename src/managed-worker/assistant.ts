@@ -4,9 +4,10 @@ import { isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { freezeMessage, MessageId, type GenerateOptions, type StreamChunk, type UserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
+import { SessionId, SessionSeq, type Session } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { DRAFT_PREFERENCE_HEADER, parseDraftPreference } from './draft-preference-request.ts'
+import type { ProjectWorkTerminationInput } from './project-work-termination-store.ts'
 import { DRAFT_TEXT_LIMIT, type ManagedResult, type ManagedWorkerStore, type StudioDraftResult, type StudioDraftTask } from './store.ts'
 import { sameTextWorkerModel as sameModelRoute, textWorkerModelError, type PinnedTextWorkerModel, type TextWorkerDispatchRole,
   type TextWorkerModelPolicy, type TextWorkerModelSelection as ModelRoute } from './text-worker-model-policy.ts'
@@ -98,6 +99,8 @@ interface WorkerAdmission {
   beforeRelay(): string | undefined
   /** Claim the reserved execution at the model step boundary, rather than when the Worker session is created. */
   beforeEnter?(): string | undefined
+  /** Retain native termination metadata for this dispatch after the Worker log is durable. */
+  recordTermination?(evidence: ProjectWorkTerminationInput): void
   /** Recheck the spent one-time model selection for this exact execution at the native stream boundary. */
   checkModel?(): string | undefined
   /** An explicitly cited preference is loaded once and must still be current on each native model attempt. */
@@ -204,6 +207,24 @@ function sameRelay(message: GenerateOptions['messages'][number], expected: UserM
       const expectedBlock = expected.content[index]
       return block.type === 'text' && expectedBlock?.type === 'text' && block.text === expectedBlock.text
     })
+}
+
+/** Confirm one exact appended relay in this live turn; edits, inherited history and mixed input cannot explain a failure. */
+function confirmedTransportTermination(session: Session, message: UserMessage, turn: number, boundary: number,
+  endEventSeq: number): ProjectWorkTerminationInput | undefined {
+  const first = Math.max(boundary, session.inheritedEventCount, session.firstLiveSeq, endEventSeq - 128)
+  let messageEventSeq: number | undefined
+  for (let offset = endEventSeq - 1; offset >= first; offset--) {
+    const event = session.eventAt(SessionSeq(offset))
+    if (!event || event.type === 'turn/end') return
+    if (event.type === 'turn/start') {
+      if (event.data.turn !== turn || messageEventSeq === undefined) return
+      return { workerSessionId: session.id, turn, messageId: message.id, messageEventSeq, endEventSeq, code: 'TRANSPORT' }
+    }
+    if (event.type !== 'user/message' || isNativeContext(event.data)) continue
+    if (messageEventSeq !== undefined || event.surfaceOp !== 'append' || !sameRelay(event.data, message)) return
+    messageEventSeq = event.seq
+  }
 }
 
 /** Own Assistant delegation and the temporary admission for each independently created text Worker. */
@@ -451,6 +472,7 @@ export class StudioAssistant {
     const signal = AbortSignal.any(signals)
     let handle: WorkerHandle | undefined
     let result: StudioDraftResult | undefined
+    let termination: ProjectWorkTerminationInput | undefined
     let failure = 'WORKER_FAILED'
     const authorize = (check?: () => string | undefined) => {
       signal.throwIfAborted()
@@ -497,14 +519,19 @@ export class StudioAssistant {
         if (role === 'advisor' && !sameModelRoute(route.model, selection)) return 'ADVISOR_ROUTE_CHANGED'
         // Keep the preference check here; project evidence checks require the running execution claimed by beforeEnter.
         return admission.beforeEnter?.() ?? sources.preference?.check()
-      }), stream, modelFence)
+      }), stream, modelFence, role === 'draft-worker' && admission.recordTermination ? evidence => { termination = evidence } : undefined)
       if (!result && failure === 'WORKER_FAILED') failure = 'NO_COMPLETE_WORKER_TEXT'
     } catch {
       // Keep the admission reason; other runtime failures need not reveal provider or host details in a project result.
     } finally {
-      // Do not present complete text unless disposal also drains the Worker's source log.
+      // Disposal drains this Worker's log before we expose its result or native event coordinates.
       try { await handle?.dispose() }
-      catch { result = undefined; failure = 'WORKER_SESSION_CLOSE_FAILED' }
+      catch { termination = undefined; result = undefined; failure = 'WORKER_SESSION_CLOSE_FAILED' }
+    }
+    if (termination && !signal.aborted && !this.hostStopping.aborted) {
+      // Audit the durable end separately; a failed observation must not replace the ordinary dispatch outcome.
+      try { admission.recordTermination?.(termination) }
+      catch { /* Without confirmed retention, report only the ordinary outcome. */ }
     }
     if (signal.aborted) { result = undefined; failure = timeout.aborted ? 'WORKER_TIMEOUT' : 'WORKER_ABORTED' }
     // Persist the pool's reason on interrupted text work so its original entry can report it without another inference.
@@ -514,9 +541,11 @@ export class StudioAssistant {
 
   /** Capture by exact Session and admitted turn. A stream delta, failed turn, or unrelated follow-up cannot become a saved result. */
   private async capture(agent: Agent, message: UserMessage, role: RestrictedTextRole, signal: AbortSignal,
-    enter: DraftInput['enter'], stream?: ProtectedRelayStream, modelFence?: TextWorkerModelFence): Promise<StudioDraftResult | undefined> {
+    enter: DraftInput['enter'], stream?: ProtectedRelayStream, modelFence?: TextWorkerModelFence,
+    observeTermination?: (evidence: ProjectWorkTerminationInput) => void): Promise<StudioDraftResult | undefined> {
     const settled = Promise.withResolvers<StudioDraftResult | undefined>()
     const input: DraftInput = { message, role, enter, reject: settled.reject, ...(stream ? { stream } : {}), ...(modelFence ? { modelFence } : {}) }
+    const boundary = agent.session.seq
     let final: StudioDraftResult | undefined
     const remove = this.ctx.on('session/event', (session, event) => {
       if (session !== agent.session) return
@@ -533,6 +562,14 @@ export class StudioAssistant {
         // Native preparation can reject the pinned effort before any stream is constructed. Keep that failure distinct from empty output.
         if (modelFence && reason.kind === 'error' && UNCONFIRMED_TEXT_ROUTE_FAILURES.has(reason.error.code)) {
           try { modelFence.requireExact(false) } catch (error) { settled.reject(error); return }
+        }
+        if (observeTermination && reason.kind === 'error' && reason.error.code === 'TRANSPORT' && !signal.aborted && !this.hostStopping.aborted) {
+          try {
+            // At observation time this must still be the original restricted Worker. Only durable coordinates leave the runner.
+            const termination = this.drafts.get(agent) === input && this.textReady(agent, role)
+              ? confirmedTransportTermination(session, message, input.turn, boundary, event.seq) : undefined
+            if (termination) observeTermination(termination)
+          } catch { /* An optional observation cannot keep the dispatch from settling. */ }
         }
         settled.resolve(reason.kind === 'completed' ? final : undefined)
       }

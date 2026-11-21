@@ -21,6 +21,8 @@ import { appendWorkModel, appendWorkModelClear, appendWorkModelConsume, exactCon
   isWorkModelSelectionId, latestWorkModel, projectWorkModelCommandUsed, readPinnedWorkModel, readWorkModelDispatch, sameWorkModel,
   workModelSourceUsed, workModelState, workModelView, type ProjectWorkModelDispatchIntent, type ProjectWorkModelSelection,
   type ProjectWorkModelSelectionView } from './project-work-model-store.js'
+import { appendWorkTermination, readWorkTermination, readWorkTerminationInput,
+  type ProjectWorkTerminationInput } from './project-work-termination-store.js'
 import { validSystemdJob, type SystemdJobRef, type SystemdJobState } from './systemd-job.js'
 import type { PinnedTextWorkerModel } from './text-worker-model-policy.js'
 
@@ -32,6 +34,7 @@ export { PROJECT_RESULT_QUOTE_LIMIT, type ProjectWorkResultUse } from './project
 export { PROJECT_WORK_BLOCK_TEXT_LIMIT, type ProjectWorkBlockView } from './project-work-block-store.js'
 export type { ProjectWorkModelDispatch, ProjectWorkModelDispatchIntent, ProjectWorkModelSelection,
   ProjectWorkModelSelectionView } from './project-work-model-store.js'
+export type { ProjectWorkTermination, ProjectWorkTerminationInput } from './project-work-termination-store.js'
 
 /** Maximum project name length in UTF-16 code units. */
 export const PROJECT_NAME_LIMIT = 160
@@ -1102,6 +1105,23 @@ export class ProjectStore {
       if (!stored) return deny('STALE_EXECUTION')
       if (stored.state !== 'running') return deny('WORK_NOT_RUNNING')
       return this.confirmWorkModelRun(stored, selectionId)
+    })
+  }
+
+  /** Host-only: retain the exact native termination without changing dispatch state or authorizing another attempt. */
+  recordWorkTermination(run: StudioProjectRun, evidence: ProjectWorkTerminationInput): ManagedResult<void> {
+    const identity = dispatchIdentity(run)
+    const input = readWorkTerminationInput(evidence)
+    if (!identity || !input || input.workerSessionId !== identity.workerSessionId) return deny('INVALID_INPUT')
+    return this.access.write(() => {
+      // Like settlement, the legitimately started Worker retains provenance across a Leader handoff in this Host run.
+      const stored = this.exactRun(identity)
+      if (!stored) return deny('STALE_EXECUTION')
+      if (stored.state !== 'running') return deny('WORK_NOT_RUNNING')
+      if (this.workHasDocumentOrJob(stored.workId)) return deny('WORK_TERMINATION_TEXT_ONLY')
+      if (readWorkTermination(this.db, stored)) return deny('DUPLICATE_WORK_TERMINATION')
+      appendWorkTermination(this.db, stored, this.access.runId, input)
+      return accept(undefined)
     })
   }
 

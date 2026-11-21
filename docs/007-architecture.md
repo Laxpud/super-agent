@@ -374,6 +374,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/project-result-use-store.ts` | Pins one exact slice of a completed independent result to pending work in the same project; stores coordinates and a source fingerprint, not the text |
 | `src/managed-worker/project-work-model-store.ts` | Records native model choices and withdrawals for pending text work, and spends the exact choice alongside the one authorized dispatch epoch |
 | `src/managed-worker/project-work-block-store.ts` | Records native owner holds and exact clears on unstarted text work; atomically releases reservations and exposes status without copying decision notes |
+| `src/managed-worker/project-work-termination-store.ts` | Retains one durable native transport end for the exact standalone project dispatch; projects coordinates without settling or restarting work |
 | `src/managed-worker/bot-experience.ts` | Handles owner-only commands for recording a reusable method and inspecting its applicability and provenance |
 | `src/managed-worker/bot-experience-store.ts` | Keys method revisions by stable Leader Bot and checks their exact project fact parents without returning source project text |
 | `src/managed-worker/project-document-store.ts` | Links project work to one authorized document task, reads its exact audited commit, and includes correction history only in an authorized owner detail read |

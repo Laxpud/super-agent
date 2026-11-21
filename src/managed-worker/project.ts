@@ -285,6 +285,7 @@ export class StudioProjectControl {
     const { result, failure } = await this.workers.runTextWorker(agent, workerId, route, request, signal, {
       beforeRelay: () => check(() => this.store.projects.canStartWork(run)),
       beforeEnter: () => check(() => this.store.projects.beginWork(run)),
+      ...(!job ? { recordTermination: evidence => { this.store.projects.recordWorkTermination(run, evidence) } } : {}),
       ...(selection ? { checkModel: () => check(() => this.store.projects.checkRunningWorkModel(run, selection.selectionId)) } : {}),
       // Only the runner can resolve the excerpt. Recheck the same attempt again just before the adapter streams.
       ...(fact ? { fact: {
