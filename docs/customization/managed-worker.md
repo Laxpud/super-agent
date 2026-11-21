@@ -111,11 +111,31 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 也可以直接在 Leader 会话中操作：
 
 1. 在未绑定项目的 **SuperAgent Studio Leader** 会话中提交 `/studio-project create {"name":"资料整理","objective":"持续整理研究记录"}`。回执给出项目 ID、Leader Bot、当前会话及管理轮次 `1`。可用 `leaderBotId` 复用已有 Leader Bot，用 `originTaskId` 引用一个已经完成的文字任务；引用原成果不重新派工。
-2. 在当前 Leader 会话中用普通消息要求登记一项自包含的文字待办，将所需材料放在同一条消息里。登记保留原文与来源，不会启动 Worker。用 `/studio-project work` 可查看最近 20 项。需要执行时，让当前 Leader 派工指定待办 ID；Worker 使用 Leader 的[派工默认组合](<#限定普通文字-worker-的模型组合>)；未设默认值时沿用该会话的模型选择。普通派工只接收该待办的原文，不能用工具或修改文档。
+2. 在当前 Leader 会话中用普通消息要求登记一项自包含的文字待办，将所需材料放在同一条消息里。登记保留原文与来源，不会启动 Worker。用 `/studio-project work` 可查看最近 20 项。需要执行时，让当前 Leader 派工指定待办 ID。普通派工使用 Leader 的[派工默认组合](<#限定普通文字-worker-的模型组合>)，或在未设默认值时沿用会话选择；只想改这一次时，可[另行选择组合](<#为一项待办选择一次派工模型>)。文字 Worker 不能用工具或修改文档。
 3. 用 `/studio-project work <待办ID>` 查看原请求、状态和 Worker 的原始结果，不调用模型。在同一项目的 Leader 会话中，Worker 结束或宿主重启后仍可取回已保存结果。已经开始的工作中断后会留下状态，不会自动重跑。
 4. 要换管理会话，在从未绑定项目的 Leader 会话中提交 `/studio-project take <项目ID> <当前管理轮次>`。默认保留 Leader Bot；末尾可追加已有 Leader Bot ID 或 `new` 以换负责人。旧会话仍可用 `work` 查询本项目的工作记录，但不能再登记或派工。移交前尚未开始的保留名额会释放，由当前 Leader 决定是否继续原待办；已经开始的 Worker 可保存原出处的结果。
 
 如果移交报轮次过时、命令重复，或回执不明，先在原 Leader 会话用 `/studio-project status` 核对当前会话和轮次，也可在新的 Leader 或 Studio Assistant 会话用 `/studio-project status <项目ID>` 查询。不要原样重发旧的移交命令。
+
+### 为一项待办选择一次派工模型
+
+配置 `textWorkerRoutes` 后，可在**现任 Leader 的普通 Web 会话**为尚未开始的文字待办固定一次派工组合。在 `/studio-project work <待办ID>` 找到命令模板，填入清单和 Leader 范围内的 Provider、模型与思考深度。例如：
+
+```text
+/studio-project use-model {"workId":"<待办ID>","route":{"provider":"example-provider","model":"example-analysis-model","reasoningEffort":"high"}}
+```
+
+登记只保存选择，不查询适配器、启动 Worker 或改变默认值。确认待办与组合后，从回执复制这一整行，作为一条新的纯文字消息发送，不编辑旧消息，也不附加代码围栏或附件：
+
+```text
+Dispatch work <待办ID> with model <选择ID>
+```
+
+也可单独发 `派工 <待办ID> 使用组合 <选择ID>`。宿主核对两个 ID 和组合的当前可用性，只把原任务和已明确允许的引用交给无工具 Worker。此入口不适用于文档或外部作业，也不改变 Leader 会话自己的模型。
+
+- **取消或改选：** 待办仍未启动且没有占用的预约时，可用 `/studio-project clear-model <待办ID> <选择ID>` 撤销。旧选择 ID 随即失效。若要用普通路线，撤销后另发 `派工 <待办ID>`；若要换组合，重新登记后再用新 ID 派工。
+- **拒绝或中断：** 先用 `/studio-project work <待办ID>` 查状态，不盲目重发。组合校验未通过时，选择未消耗；核对该选择或撤销，改会话模型不能替换它。预约成功即用掉选择，后续释放也不恢复；若仍待办，须先清除才能另行派工。已开始并结束的工作只查记录，不重跑。宿主不会自行换模型。
+- **重启或移交：** 重启后未使用的选择可由原 Leader 查到，仍须另发明确派工消息。移交后旧选择失效，接手会话若要派工，须先清除，再另选组合或发普通派工消息。
 
 ### 查看移交时记录和当前待办
 

@@ -36,7 +36,7 @@ import { PROJECT_HANDOFF_HINT } from './project-handoff.ts'
 import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
 import { StudioProjectJobMonitor } from './project-job-monitor.ts'
 import { StudioProjectJobControl } from './project-job.ts'
-import { LEADER_PRESET, PROJECT_RESULT_USE_HINT, StudioProjectControl, isLeaderTool } from './project.ts'
+import { LEADER_PRESET, PROJECT_MODEL_CLEAR_HINT, PROJECT_MODEL_USE_HINT, PROJECT_RESULT_USE_HINT, StudioProjectControl, isLeaderTool } from './project.ts'
 import { StudioQuotaNotices } from './quota-notices.ts'
 import { QuotaPoolConfig, StudioQuotaControl, quotaProviderMap } from './quota.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
@@ -531,8 +531,9 @@ export function apply(context: Context, config: Config): void {
   }))
   ctx.effect(() => ctx.commands.register({
     name: 'studio-project',
-    description: 'Read project work, create or transfer a project, or link a document task. With memory enabled, pin an excerpt using use-result.',
+    description: 'Read or manage project work. With text Worker routes configured, use use-model to choose one model for a pending work item. With memory enabled, use use-result to pin an excerpt.',
     input: { hint: 'create <JSON> | status [project-id] | take <project-id> <epoch> [leader-bot-id|new] | work [work-id] | attach-document <work-id> <task-id> <authorization-version> | proposal [proposal-id]'
+      + (textWorkerModels ? ` | ${PROJECT_MODEL_USE_HINT}` : '') + ` | ${PROJECT_MODEL_CLEAR_HINT}`
       + (memory ? ` | ${PROJECT_RESULT_USE_HINT} | ${PROJECT_HANDOFF_HINT} | ${PROJECT_ARCHIVE_HINT} | ${BOT_EXPERIENCE_HINT}` : '') },
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {

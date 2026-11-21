@@ -179,19 +179,24 @@ export class TextWorkerModelPolicy {
     return this.#defaults[role]
   }
 
+  /** Check an explicitly named tuple against configuration only. Saving an owner choice does not query an adapter. */
+  explicitRoute(role: TextWorkerDispatchRole, selection: Readonly<TextWorkerModelSelection>): PinnedTextWorkerModel {
+    const position = this.#routePosition(selection)
+    const route = this.#entries[position]
+    if (!route) throw notAllowed('The requested text Worker route or explicit reasoning effort is not configured.')
+    this.#assertWithinBounds(role, position)
+    return route
+  }
+
   /** Check global membership and role bounds for the exact tuple, then return it only if the Host confirms it. */
   async pin(role: TextWorkerDispatchRole, selection: Readonly<TextWorkerModelSelection>, signal: AbortSignal): Promise<PinnedTextWorkerModel> {
     signal.throwIfAborted()
     const { provider, model, reasoningEffort } = selection
-    const position = reasoningEffort === undefined ? undefined : this.#routePosition({ provider, model, reasoningEffort })
-    const allowed = position === undefined
-      ? this.#entries.some(route => route.provider === provider && route.model === model)
-      : position >= 0
-    signal.throwIfAborted()
-    if (!allowed) {
+    const explicit = reasoningEffort === undefined ? undefined : this.explicitRoute(role, { provider, model, reasoningEffort })
+    if (!explicit && !this.#entries.some(route => route.provider === provider && route.model === model)) {
       throw notAllowed('The requested text Worker route or explicit reasoning effort is not configured.')
     }
-    if (position !== undefined) this.#assertWithinBounds(role, position)
+    signal.throwIfAborted()
 
     const lookupSignal = AbortSignal.any([signal, AbortSignal.timeout(LOOKUP_TIMEOUT_MS)])
     let confirmed: ReturnType<typeof confirmEffort>
@@ -215,11 +220,12 @@ export class TextWorkerModelPolicy {
     }
 
     if ('problem' in confirmed) throw textWorkerModelError(confirmed.problem)
+    if (explicit) return explicit
     // For inherited effort, test the adapter's actual default, never another row for the same model.
-    const confirmedPosition = position ?? this.#routePosition({ provider, model, reasoningEffort: confirmed.effort })
+    const confirmedPosition = this.#routePosition({ provider, model, reasoningEffort: confirmed.effort })
     const pinned = this.#entries[confirmedPosition]
     if (!pinned) throw notAllowed('The confirmed default reasoning effort is not configured for this text Worker route.')
-    if (position === undefined) this.#assertWithinBounds(role, confirmedPosition)
+    this.#assertWithinBounds(role, confirmedPosition)
     return pinned
   }
 }

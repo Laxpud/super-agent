@@ -15,13 +15,20 @@ import { appendWorkResultUse, PROJECT_RESULT_QUOTE_LIMIT, projectResultCommandUs
   workResultFingerprint, workResultUseView, type ProjectWorkResultUse, type WorkResultSource } from './project-result-use-store.js'
 import type { ManagedResult, StudioDraftResult } from './store.ts'
 import { assistantSourceUsed } from './study-store.js'
+import { appendWorkModel, appendWorkModelClear, appendWorkModelConsume, exactConsumedWorkModel, hasUnclearedWorkModel,
+  isWorkModelSelectionId, latestWorkModel, projectWorkModelCommandUsed, readPinnedWorkModel, readWorkModelDispatch, sameWorkModel,
+  workModelSourceUsed, workModelState, workModelView, type ProjectWorkModelDispatchIntent, type ProjectWorkModelSelection,
+  type ProjectWorkModelSelectionView } from './project-work-model-store.js'
 import { validSystemdJob, type SystemdJobRef, type SystemdJobState } from './systemd-job.js'
+import type { PinnedTextWorkerModel } from './text-worker-model-policy.js'
 
 export { sameJobRoute, type StudioJobAuto, type StudioJobRoute } from './project-job-auto-store.js'
 export type { ProjectDocumentDecision, ProjectDocumentDecisionHistory } from './project-document-decision-store.js'
 export type { StudioProjectDocument } from './project-document-store.js'
 export type { StudioProjectJob } from './project-job-store.js'
 export { PROJECT_RESULT_QUOTE_LIMIT, type ProjectWorkResultUse } from './project-result-use-store.js'
+export type { ProjectWorkModelDispatch, ProjectWorkModelDispatchIntent, ProjectWorkModelSelection,
+  ProjectWorkModelSelectionView } from './project-work-model-store.js'
 
 /** Maximum project name length in UTF-16 code units. */
 export const PROJECT_NAME_LIMIT = 160
@@ -90,6 +97,7 @@ export interface StudioProjectWorkView {
   document?: StudioProjectDocument
   fact?: ProjectWorkFactUse
   resultUse?: ProjectWorkResultUse
+  modelSelection?: ProjectWorkModelSelectionView
 }
 
 // The current epoch points to an immutable binding. Each binding also records the native command that created it.
@@ -701,6 +709,77 @@ export class ProjectStore {
     return { ...binding, workId, sourceMessageId, sourceRequestId, requestText }
   }
 
+  /** Host-only: record a native owner's exact route without authorizing a dispatch. */
+  bindWorkModel(leaderSessionId: string, workId: string, route: PinnedTextWorkerModel, commandId: string): ManagedResult<ProjectWorkModelSelection> {
+    const pinned = readPinnedWorkModel(route)
+    if (!isId(leaderSessionId) || !isId(workId) || !isId(commandId) || !pinned) return deny('INVALID_INPUT')
+    return this.access.write(() => {
+      const actor = this.currentProject(leaderSessionId, true)
+      if (!actor.ok) return actor
+      if (!this.work(actor.value.projectId, workId)) return deny('WORK_NOT_FOUND')
+      if (this.commandUsed(commandId) || this.access.documentCommandUsed(commandId)) return deny('DUPLICATE_COMMAND')
+      if (hasUnclearedWorkModel(this.db, workId)) return deny('WORK_MODEL_SELECTION_ALREADY_BOUND')
+      if (this.hasNonreleasedDispatch(workId)) return deny('WORK_ALREADY_DISPATCHED')
+      if (this.workHasDocumentOrJob(workId)) return deny('WORK_MODEL_TEXT_ONLY')
+      const selection = { selectionId: randomUUID(), route: pinned }
+      appendWorkModel(this.db, actor.value, workId, selection, commandId)
+      return accept(selection)
+    })
+  }
+
+  /** Host-only: withdraw the exact uncleared choice, even if a predecessor bound it or a released attempt spent it. */
+  clearWorkModel(leaderSessionId: string, workId: string, selectionId: string, commandId: string): ManagedResult<void> {
+    if (!isId(leaderSessionId) || !isId(workId) || !isId(commandId)) return deny('INVALID_INPUT')
+    if (!isWorkModelSelectionId(selectionId)) return deny('WORK_MODEL_SELECTION_NOT_CURRENT')
+    return this.access.write(() => {
+      const actor = this.currentProject(leaderSessionId, true)
+      if (!actor.ok) return actor
+      if (!this.work(actor.value.projectId, workId)) return deny('WORK_NOT_FOUND')
+      if (this.commandUsed(commandId) || this.access.documentCommandUsed(commandId)) return deny('DUPLICATE_COMMAND')
+      const model = latestWorkModel(this.db, workId)
+      if (!model || model.cleared || model.selectionId !== selectionId) return deny('WORK_MODEL_SELECTION_NOT_CURRENT')
+      if (this.hasNonreleasedDispatch(workId)) return deny('WORK_ALREADY_DISPATCHED')
+      appendWorkModelClear(this.db, actor.value, selectionId, commandId)
+      return accept(undefined)
+    })
+  }
+
+  /** Preflight a manual dispatch; reserveWork must repeat the check under its write lock. */
+  resolveWorkModel(leaderSessionId: string, workId: string, selectionId?: string, explicitPlain = false):
+    ManagedResult<ProjectWorkModelSelection | undefined> {
+    if (!isId(leaderSessionId) || !isId(workId) || typeof explicitPlain !== 'boolean') return deny('INVALID_INPUT')
+    return this.access.snapshot(() => {
+      const actor = this.currentProject(leaderSessionId, true)
+      if (!actor.ok) return actor
+      if (!this.work(actor.value.projectId, workId)) return deny('WORK_NOT_FOUND')
+      return this.resolveWorkModelInTransaction(actor.value, workId, selectionId, explicitPlain)
+    })
+  }
+
+  /** No token can fall through to the ordinary route. An owner must explicitly dispatch after a withdrawal. */
+  private resolveWorkModelInTransaction(actor: StudioProjectBinding, workId: string, selectionId: string | undefined,
+    explicitPlain: boolean, automatic = false): ManagedResult<ProjectWorkModelSelection | undefined> {
+    const model = latestWorkModel(this.db, workId)
+    if (automatic && (selectionId !== undefined || (model && !model.cleared))) return deny('PROJECT_MODEL_SELECTION_REQUIRES_OWNER')
+    if (selectionId === undefined) {
+      return model && (!model.cleared || (!explicitPlain && !automatic)) ? deny('PROJECT_MODEL_SELECTION_REQUIRES_OWNER') : accept(undefined)
+    }
+    if (!model || model.cleared || model.selectionId !== selectionId) return deny('WORK_MODEL_SELECTION_NOT_CURRENT')
+    const state = workModelState(model, actor)
+    if (state === 'used') return deny('WORK_MODEL_SELECTION_USED')
+    if (state !== 'pending') return deny('WORK_MODEL_SELECTION_NOT_CURRENT')
+    if (this.workHasDocumentOrJob(workId)) return deny('WORK_MODEL_TEXT_ONLY')
+    return accept({ selectionId, route: model.route })
+  }
+
+  private hasNonreleasedDispatch(workId: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM studio_project_dispatch WHERE work_id = ? AND state <> 'released'").get(workId)
+  }
+
+  private workHasDocumentOrJob(workId: string): boolean {
+    return projectDocumentAttached(this.db, workId) || !!this.db.prepare('SELECT 1 FROM studio_project_job WHERE work_id = ?').get(workId)
+  }
+
   /** Host-only: link an existing version 1 task with an exact owner authorization version; neither grant nor start execution. */
   attachDocument(leaderSessionId: string, workId: string, taskId: string, expectedAuthorizationVersion: number,
     commandId: string): ManagedResult<StudioProjectDocument> {
@@ -711,6 +790,7 @@ export class ProjectStore {
       const current = this.currentProject(leaderSessionId)
       if (!current.ok) return current
       if (!this.work(current.value.projectId, workId)) return deny('WORK_NOT_FOUND')
+      if (hasUnclearedWorkModel(this.db, workId)) return deny('WORK_MODEL_TEXT_ONLY')
       if (readWorkFact(this.db, workId)) return deny('FACT_TEXT_WORK_ONLY')
       if (readWorkResultUse(this.db, workId)) return deny('RESULT_TEXT_WORK_ONLY')
       return attachProjectDocument(this.db, this.access, current.value, workId, taskId, expectedAuthorizationVersion, commandId,
@@ -726,6 +806,7 @@ export class ProjectStore {
     const { unit, invocationId } = ref
     if (!isId(unit) || !isId(invocationId) || !validSystemdJob({ unit, invocationId })) return deny('INVALID_INPUT')
     return this.withCurrentJobWork(leaderSessionId, workId, actor => {
+      if (hasUnclearedWorkModel(this.db, workId)) return deny('WORK_MODEL_TEXT_ONLY')
       if (readWorkFact(this.db, workId)) return deny('FACT_TEXT_WORK_ONLY')
       if (readWorkResultUse(this.db, workId)) return deny('RESULT_TEXT_WORK_ONLY')
       if (projectDocumentAttached(this.db, workId)) return deny('WORK_HAS_DOCUMENT_TASK')
@@ -810,18 +891,28 @@ export class ProjectStore {
     })
   }
 
-  /** Reserve an eligible Worker, spending the exact grant in the same transaction for automatic dispatches only. */
+  /** Reserve an eligible Worker, atomically spending the exact native model selection or automatic job grant if required. */
   reserveWork(leaderSessionId: string, workId: string, workerSessionId: string, automatic?: { permitId: string; route: StudioJobRoute },
-    allowFact = false):
+    allowFact = false, modelDispatch?: ProjectWorkModelDispatchIntent):
     ManagedResult<StudioProjectWorkView & { run: StudioProjectRun; created: boolean }> {
     const auto = automatic === undefined ? undefined : readAutoReservation(automatic)
     if (!isId(leaderSessionId) || !isId(workId) || !isId(workerSessionId) || (automatic !== undefined && !auto)) return deny('INVALID_INPUT')
+    const intent = modelDispatch === undefined ? undefined : readWorkModelDispatch(modelDispatch)
+    if (modelDispatch !== undefined && !intent) return deny('WORK_MODEL_SELECTION_NOT_CURRENT')
+    const proof = intent && 'selectionId' in intent ? intent : undefined
+    const explicitPlain = intent !== undefined && 'explicitPlain' in intent
     return this.access.write<StudioProjectWorkView & { run: StudioProjectRun; created: boolean }>(() => {
       const current = this.currentProject(leaderSessionId)
       if (!current.ok) return current
       const { projectId, managementEpoch } = current.value
       const work = this.work(projectId, workId)
       if (!work) return deny('WORK_NOT_FOUND')
+      const selected = this.resolveWorkModelInTransaction(current.value, workId, proof?.selectionId, explicitPlain, auto !== undefined)
+      if (!selected.ok) return selected
+      if (proof) {
+        if (!selected.value || !sameWorkModel(selected.value.route, proof.route)) return deny('WORK_MODEL_SELECTION_NOT_CURRENT')
+        if (workModelSourceUsed(this.db, leaderSessionId, proof)) return deny('SOURCE_ALREADY_USED')
+      }
       const fact = readWorkFact(this.db, workId)
       if (fact && fact.projectId !== projectId) return deny('FACT_PROJECT_MISMATCH')
       // A fact is only for a fresh, explicit owner dispatch to a standalone text Worker.
@@ -856,9 +947,12 @@ export class ProjectStore {
       if (!isEpoch(executionEpoch)) return deny('INVALID_INPUT')
       const run: StudioProjectRun = { workId, projectId, leaderSessionId, managementEpoch, workerSessionId,
         workerBotId: randomUUID(), executionEpoch, state: 'reserved' }
+      if (proof) appendWorkModelConsume(this.db, run, this.access.runId, proof)
       requireWrite(this.db.prepare(`INSERT INTO studio_project_dispatch (work_id, execution_epoch, project_id, leader_session_id,
         management_epoch, worker_session_id, worker_bot_id, run_id, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reserved')`)
         .run(...this.dispatchKeys(run)).changes)
+      if (selected.value) return accept({ ...view, run, created: true,
+        modelSelection: { ...selected.value, state: 'used', executionEpoch } })
       if (job && grant) {
         consumeJobAuto(this.db, grant, projectId, executionEpoch)
         return accept({ work, job: { ...job, automatic: { ...grant, executionEpoch } }, run, created: true })
@@ -946,6 +1040,21 @@ export class ProjectStore {
     })
   }
 
+  /** Check the exact consumed selection on its current, running attempt before the Host opens a model stream. */
+  checkRunningWorkModel(run: StudioProjectRun, selectionId: string): ManagedResult<void> {
+    const identity = dispatchIdentity(run)
+    if (!identity) return deny('INVALID_INPUT')
+    if (!isWorkModelSelectionId(selectionId)) return deny('WORK_MODEL_SELECTION_NOT_CURRENT')
+    return this.access.snapshot(() => {
+      const current = this.dispatchAuthority(identity)
+      if (!current.ok) return current
+      const stored = this.exactRun(identity)
+      if (!stored) return deny('STALE_EXECUTION')
+      if (stored.state !== 'running') return deny('WORK_NOT_RUNNING')
+      return this.confirmWorkModelRun(stored, selectionId)
+    })
+  }
+
   /** Settle only this Worker's attempt. A pre-start failure releases it; a started attempt is always terminal. */
   settleWork(run: StudioProjectRun, result: StudioDraftResult | undefined, failure: string): ManagedResult<StudioProjectRun> {
     const identity = dispatchIdentity(run)
@@ -981,7 +1090,7 @@ export class ProjectStore {
       const work = this.work(binding.projectId, workId)
       if (!work) return deny('WORK_NOT_FOUND')
       const current = this.currentProject(sessionId, true)
-      return accept(this.workView(work, true, current.ok, ownerDetail === true && current.ok))
+      return accept(this.workView(work, true, current.ok, ownerDetail === true && current.ok ? current.value : undefined))
     })
   }
 
@@ -1001,16 +1110,17 @@ export class ProjectStore {
     return row && readWorkRow(row)
   }
 
-  private workView(work: StudioProjectWork, full: boolean, includeFactResult: boolean, ownerDetail = false): StudioProjectWorkView {
+  private workView(work: StudioProjectWork, full: boolean, includeFactResult: boolean, owner?: StudioProjectBinding): StudioProjectWorkView {
     const pinned = readWorkFact(this.db, work.workId)
     const pinnedResult = readWorkResultUse(this.db, work.workId)
     const job = readProjectJob(this.db, work.projectId, work.workId)
-    const document = readProjectDocument(this.db, this.access, work, full, ownerDetail)
-    // Historical Leaders retain provenance. The current flag describes source validity, not the viewer's authority.
+    const document = readProjectDocument(this.db, this.access, work, full, owner !== undefined)
+    const model = owner && latestWorkModel(this.db, work.workId)
+    // Historical Leaders retain evidence provenance. Native model choices are only shown to the current Leader's owner.
     const fact = pinned && { ...pinned, current: pinned.projectId === work.projectId && this.factQuote(pinned) !== undefined }
     const resultUse = pinnedResult && workResultUseView(pinnedResult, this.currentWorkResult(pinnedResult, work.projectId) !== undefined)
-    return { work, ...this.workRunView(work, fact, includeFactResult, resultUse, ownerDetail),
-      ...(job ? { job } : {}), ...(document ? { document } : {}) }
+    return { work, ...this.workRunView(work, fact, includeFactResult, resultUse, owner !== undefined),
+      ...(job ? { job } : {}), ...(document ? { document } : {}), ...(model && owner ? { modelSelection: workModelView(model, owner) } : {}) }
   }
 
   private factQuote({ projectId, key, revision }: WorkFactSource): string | undefined {
@@ -1103,6 +1213,15 @@ export class ProjectStore {
     return current
   }
 
+  /** A selected attempt must match the exact spend row before entry; ordinary attempts have no active selection. */
+  private confirmWorkModelRun(run: StudioProjectRun, selectionId?: string): ManagedResult<void> {
+    const spent = exactConsumedWorkModel(this.db, run, this.access.runId)
+    if ((selectionId !== undefined && spent !== selectionId) || (!spent && hasUnclearedWorkModel(this.db, run.workId))) {
+      return deny('WORK_MODEL_SELECTION_NOT_CURRENT')
+    }
+    return spent && this.workHasDocumentOrJob(run.workId) ? deny('WORK_MODEL_TEXT_ONLY') : accept(undefined)
+  }
+
   /** Recheck the exact stored reservation and its sources, regardless of the caller's copy of its state. */
   private startableReservation(identity: DispatchIdentity): ManagedResult<{ run: StudioProjectRun; fact?: { text: string }; resultUse?: { text: string } }> {
     const current = this.dispatchAuthority(identity)
@@ -1111,6 +1230,8 @@ export class ProjectStore {
     if (!stored) return deny('STALE_EXECUTION')
     if (stored.state !== 'reserved') return deny('WORK_NOT_RESERVED')
     if (!this.work(stored.projectId, stored.workId)) return deny('WORK_NOT_FOUND')
+    const model = this.confirmWorkModelRun(stored)
+    if (!model.ok) return model
     const fact = this.confirmWorkFact(stored)
     if (!fact.ok) return fact
     const resultUse = this.confirmWorkResult(stored)
@@ -1189,6 +1310,7 @@ export class ProjectStore {
       || projectJobAutoCommandUsed(this.db, commandId)
       || projectDocumentCommandUsed(this.db, commandId)
       || projectResultCommandUsed(this.db, commandId)
+      || projectWorkModelCommandUsed(this.db, commandId)
   }
 
   /** Scope exact IDs and latest lookups to the originating Session, not the shared Assistant Bot. */

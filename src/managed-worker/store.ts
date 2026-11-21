@@ -36,6 +36,7 @@ import { PROJECT_JOB_AUTO_SCHEMA } from './project-job-auto-store.js'
 import { PROJECT_JOB_SCHEMA } from './project-job-store.js'
 import { PROJECT_RESULT_USE_SCHEMA, projectResultCommandUsed } from './project-result-use-store.js'
 import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
+import { PROJECT_WORK_MODEL_SCHEMA, projectWorkModelCommandUsed } from './project-work-model-store.js'
 import { QUOTA_NOTICE_SCHEMA, QuotaNoticeStore, isQuotaNoticeMessageId, type StudioQuotaNotice } from './quota-notice-store.js'
 import { QUOTA_SCHEMA, QuotaStore, type StudioQuotaIncident } from './quota-store.js'
 import { SHARED_DOCUMENT_SCHEMA, appendSharedRevision, readSharedRevision,
@@ -420,6 +421,7 @@ export class ManagedWorkerStore {
         this.db.exec(PROJECT_JOB_AUTO_SCHEMA)
         this.db.exec(PROJECT_FACT_USE_SCHEMA)
         this.db.exec(PROJECT_RESULT_USE_SCHEMA)
+        this.db.exec(PROJECT_WORK_MODEL_SCHEMA)
         this.db.exec(INSTRUCTION_SCHEMA)
         this.db.exec(FEISHU_DRAFT_SCHEMA)
         this.db.exec(FEISHU_DELIVERY_SCHEMA)
@@ -448,7 +450,7 @@ export class ManagedWorkerStore {
         interruptStudies(this.db)
         interruptAdvice(this.db)
         // A restart frees only reservations that never entered the model. Running attempts remain terminal.
-        // Releasing a reservation never unspends its automatic grant; grants not yet tried survive the restart.
+        // Releasing a reservation never unspends a grant or model selection; unspent choices survive the restart.
         this.db.exec(`UPDATE studio_project_dispatch SET
           state = CASE state WHEN 'reserved' THEN 'released' ELSE 'interrupted' END,
           failure = 'HOST_RESTARTED' WHERE state IN ('reserved', 'running')`)
@@ -1762,6 +1764,7 @@ export class ManagedWorkerStore {
       || !!this.db.prepare('SELECT 1 FROM studio_shared_document_revision WHERE command_id = ?').get(commandId)
       || projectDocumentCommandUsed(this.db, commandId)
       || projectResultCommandUsed(this.db, commandId)
+      || projectWorkModelCommandUsed(this.db, commandId)
   }
 
   private actionUsed(sessionId: string, toolCallId: string): boolean {

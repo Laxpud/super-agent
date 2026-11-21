@@ -78,6 +78,7 @@ interface ProtectedRelayStream {
 interface TextWorkerModelFence {
   route: PinnedTextWorkerModel
   requireExact(confirmed: boolean): void
+  recheck?(): void
 }
 interface DraftInput {
   message: UserMessage
@@ -97,6 +98,8 @@ interface WorkerAdmission {
   beforeRelay(): string | undefined
   /** Claim the reserved execution at the model step boundary, rather than when the Worker session is created. */
   beforeEnter?(): string | undefined
+  /** Recheck the spent one-time model selection for this exact execution at the native stream boundary. */
+  checkModel?(): string | undefined
   /** An explicitly cited preference is loaded once and must still be current on each native model attempt. */
   preference?: RelayContext
   /** Load the exact reserved fact and recheck it against the running execution at the stream boundary. */
@@ -225,10 +228,20 @@ export class StudioAssistant {
     return route
   }
 
-  /** Use the same dispatch role for default selection and bounds. Only pin after checking the actual route's quota. */
-  prepareTextWorkerRoute(agent: Agent, role: TextWorkerDispatchRole, caller: AbortSignal): WorkerRoute | Promise<WorkerRoute> {
+  get textWorkerSelectionEnabled(): boolean { return this.textWorkerModels !== undefined }
+
+  /** Check a native owner's exact choice against the configured list and role range without resolving a provider. */
+  checkTextWorkerSelection(role: TextWorkerDispatchRole, selection: PinnedTextWorkerModel): PinnedTextWorkerModel {
+    if (!this.textWorkerModels) throw new Error('TEXT_WORKER_MODEL_SELECTION_DISABLED: Configure textWorkerRoutes first.')
+    return this.textWorkerModels.explicitRoute(role, selection)
+  }
+
+  /** Use one role for selection and bounds. An unavailable explicit selection must not fall back to a default. */
+  prepareTextWorkerRoute(agent: Agent, role: TextWorkerDispatchRole, caller: AbortSignal,
+    selection?: PinnedTextWorkerModel): WorkerRoute | Promise<WorkerRoute> {
     const policy = this.textWorkerModels
-    const route = this.checkRouteQuota(draftWorkerRoute(agent, policy?.defaultFor(role)))
+    const model = selection ? this.checkTextWorkerSelection(role, selection) : policy?.defaultFor(role)
+    const route = this.checkRouteQuota(draftWorkerRoute(agent, model))
     if (!policy) return route
     const signal = AbortSignal.any([caller, this.stopping.signal, this.hostStopping])
     return policy.pin(role, route.model, signal).then(model => {
@@ -327,6 +340,8 @@ export class StudioAssistant {
       }
       stream.recheck()
     }
+    // The adapter has prepared its call; verify the one-time selection still belongs to this running execution.
+    modelFence?.recheck?.()
     yield* next()
   }
 
@@ -451,10 +466,12 @@ export class StudioAssistant {
           throw textWorkerModelError('The native Worker request did not match the pinned model route and assignment.')
         }
       },
+      ...(admission.checkModel ? { recheck: () => authorize(admission.checkModel) } : {}),
     }
     try {
-      // A frozen source belongs to one draft Worker only; never combine sources or relay them to an Advisor.
-      authorize(() => kinds.length > 1 || ((context || modelFence) && role !== 'draft-worker') ? 'INVALID_MODEL_INPUT' : undefined)
+      // Never relay multiple sources, offer one to an Advisor, or use an owner-selected model without its pinned tuple.
+      authorize(() => kinds.length > 1 || ((context || modelFence) && role !== 'draft-worker') || (admission.checkModel && !modelFence)
+        ? 'INVALID_MODEL_INPUT' : undefined)
       modelFence?.requireExact(sameModelRoute(modelFence.route, route.model))
       // The factory finishes mounting and classifying the persisted role before the runner supplies any work.
       handle = await createStudioSession(this.ctx, workerId, this.workerPreset, route, signal)

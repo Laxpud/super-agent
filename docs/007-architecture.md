@@ -371,6 +371,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/project-fact-intake.ts` | Binds a fresh native owner message to one pending work item before model admission |
 | `src/managed-worker/project-fact-use-store.ts` | Pins one fact revision to registered work without copying its excerpt; retains the native owner event and protects the immutable link |
 | `src/managed-worker/project-result-use-store.ts` | Pins one exact slice of a completed independent result to pending work in the same project; stores coordinates and a source fingerprint, not the text |
+| `src/managed-worker/project-work-model-store.ts` | Records native model choices and withdrawals for pending text work, and spends the exact choice alongside the one authorized dispatch epoch |
 | `src/managed-worker/bot-experience.ts` | Handles owner-only commands for recording a reusable method and inspecting its applicability and provenance |
 | `src/managed-worker/bot-experience-store.ts` | Keys method revisions by stable Leader Bot and checks their exact project fact parents without returning source project text |
 | `src/managed-worker/project-document-store.ts` | Links project work to one authorized document task, reads its exact audited commit, and includes correction history only in an authorized owner detail read |
