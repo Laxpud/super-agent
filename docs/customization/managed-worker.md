@@ -467,11 +467,13 @@ feishuTextInbox:
   model: example-model-id
 ```
 
+第一次监听前（包括限时监听查私聊 ID），用配置中的同一 CLI 路径运行 [`event status --current`](<https://github.com/larksuite/cli/blob/v1.0.90/cmd/event/status.go#L23-L41>)，核对专用应用 ID 和 `Bus: not running`；已有事件进程时不接管。首次监听就绪后再查，记下本次启动的应用 ID 和 PID，供退出时核对。
+
 1. 先用 `--dump-config` 看配置是否落在唯一启用的 `studio-local-host`，原型监听仍关闭。正式启动后，在 **SuperAgent managed document Worker** 会话用 `/studio-doc feishu-status` 确认监听就绪；无需登记或绑定文档。监听就绪还不是飞书送达证据。
 2. 在测试私聊只发送一次普通文字：`draft: 用三列表格比较虚构的甲、乙方案，只列数据。甲耗时 4 小时、需 2 人；乙耗时 6 小时、需 1 人。表头为方案、耗时、人数。` 在飞书原消息的回复串核对实际回复、任务 ID 和保存的结果。若没有回复，先用 `/studio-result feishu` 查找，不重发本次输入。
 3. 等文字 Worker 结束后，在独立 Web 页打开一个**新**的 Studio Assistant 会话，用 `/studio-result <同一任务ID>`。通过条件是飞书实际收到结果或可用的取回指引，Web 返回同一任务的已保存正文和 Worker 出处，不再派工。只有 Web 取回成功而飞书没收到回复时，记录为取回通过、真实发件未确认，别算作整条链路通过。记录任务 ID、两端状态与正文是否一致，不附密钥或私人聊天。
 
-退出试用宿主后，专用 CLI 的本地事件进程可能仍在。用**配置中的同一 CLI 路径**看 [`event status --current`](<https://github.com/larksuite/cli/blob/v1.0.90/cmd/event/status.go#L23-L41>)。只有确认是本次试用启动的专用应用、且已无消费者，才用该 CLI 的 [`event stop`](<https://github.com/larksuite/cli/blob/v1.0.90/cmd/event/stop.go#L46-L71>) 停止当前应用的事件进程，再查状态；不加 `--all` 或 `--force`，不要停止原有应用或改动密钥。
+退出试用宿主后，用同一 CLI 再查事件状态。只有应用 ID 和 PID 都与本次记录相符，而且显示 `Active consumers: 0`，才用该 CLI 的 [`event stop`](<https://github.com/larksuite/cli/blob/v1.0.90/cmd/event/stop.go#L46-L71>) 停止当前应用的事件进程，再查状态。进程已退出或归属不明时不操作；不加 `--all` 或 `--force`，不要改动密钥。
 
 #### 同一个私聊兼顾文档更正
 
