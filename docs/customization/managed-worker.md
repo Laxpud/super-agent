@@ -6,7 +6,7 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 使用 DSH `0.2.2-rc.3` 的单所有者 Web 环境，以回环地址监听。不要给该环境配置 LiveShare、远程入口、共享所有者登录或非所有者的命令和会话写权限。操作员通过 DSH Web 自己的所有者认证；原生命令回调不另外识别自然人身份。不要把它部署到当前工作的 profile 里试用。
 
-若已在隔离 profile 安装本 bundle，[bundle 补丁](../../cordis.patch.yml) 已提供以下条目，可以直接用这份覆盖层启用 Studio。未安装时，按下方的[源码试用方式](<#从源码树试用>)调整宿主条目。`stateDir` 必须是 Studio 专用的绝对目录，不应与旧执行器、其他实例或 Worker 工作目录共享。
+若已在隔离 profile 安装本 bundle，[bundle 补丁](../../cordis.patch.yml) 已提供以下条目，可以直接用这份覆盖层启用 Studio。未安装时，按下方的[源码试用方式](<#从源码树试用>)加载同一份补丁。`stateDir` 必须是 Studio 专用的绝对目录，不应与旧执行器、其他实例或 Worker 工作目录共享。
 
 ```yaml
 - id: dsh-superagent
@@ -33,19 +33,9 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 ### 从源码树试用
 
-先在源码树中构建 `lib/managed-worker.js`（`pnpm build`）。将上方覆盖层另存为 `studio-local.yml`，保留原型禁用项和三个预设启用项。只把不带 `-preset` 后缀的宿主条目替换成下面两段：旧的包名入口保持关闭，另用绝对路径加载本地构建。
+先在源码树运行 `pnpm build`。Studio 宿主与浏览器卡片由仓库补丁中的同一条目加载。将上方覆盖层另存为 `studio-local.yml`，填写实际的 `stateDir`；不要再单独插入旧的 `studio-local-host`，也不要把宿主条目的 `name` 指向构建后的 JS 文件，否则不会加载 Studio 卡片。
 
-```yaml
-- id: dsh-superagent-managed-worker
-  disabled: true
-- insert:
-    - id: studio-local-host
-      name: /absolute/path/to/super-agent/lib/managed-worker.js
-      config:
-        stateDir: /absolute/path/to/studio-state
-```
-
-换成实际路径，用新的 `DSH_HOME`，并在分开的试用工作目录运行。先加载仓库补丁，再应用本地覆盖层：
+用新的 `DSH_HOME`，并在分开的试用工作目录运行。先加载仓库补丁，再应用本地覆盖层：
 
 ```sh
 DSH_HOME=/absolute/path/to/studio-test-home dsh --profile web \
@@ -54,12 +44,12 @@ DSH_HOME=/absolute/path/to/studio-test-home dsh --profile web \
   --host 127.0.0.1 --port 0 --no-open
 ```
 
-把最后一行的 Web 参数整行换成 `--dump-config`，可以先查看合并后的配置，不启动 Web。正式启动时，`--port 0` 选用空闲端口，从本次启动输出打开回环地址。此方式不安装 bundle，不更新现有 profile。配置后续可选功能时，把新增字段放入 `studio-local-host` 的 `config`，保留 `stateDir`，不要重新启用包名入口。
+把最后一行的 Web 参数整行换成 `--dump-config`，可以先查看合并后的配置，不启动 Web。正式启动时，`--port 0` 选用空闲端口，从本次启动输出打开回环地址。此方式不安装 bundle，不更新现有 profile。配置后续可选功能时，把新增字段放入 `dsh-superagent-managed-worker` 的 `config`，保留 `stateDir`，原型条目继续禁用。
 
 ## 交代文字任务和取回成果
 
 1. 在新会话中选择 **SuperAgent Studio Assistant**，选择支持工具调用的模型，用普通消息提出一个独立的纯文字任务，例如「把这三条材料整理成一个简短比较表」。当前只转交该条请求，不自动带上过去的聊天、附件或文件；请把所需文字放在同一条消息。Worker 不具备业务工具，其模型按[文字派工配置](<#限定普通文字-worker-的模型组合>)选择。
-2. 在原会话展开 **Worker result** 工具卡片，看 Worker 的原文和任务 ID。宿主同时保存产出 Bot、会话、执行轮次与消息位置。Assistant 可以报告任务状态，但卡片中的原文不靠它复述。
+2. 在原会话先展开该轮的「已完成」过程，再展开 **Worker result** 工具卡片。卡片显示 Worker 原文、任务 ID、产出 Bot、会话、执行轮次及消息位置；正文保留原始文本，不由 Assistant 复述。如果页面只显示 `studio_delegate_draft` 的普通回执，先按下述命令取回原文，再检查这次启动是否加载了 Studio 浏览器组件。
 3. 在这个会话用 `/studio-result` 取回最新任务，或在任意 Studio Assistant 会话用 `/studio-result <任务ID>` 取回指定任务。此命令不调用模型，不需要 Worker 在线。宿主重启后，已经保存的成果仍可读；未完成的任务显示为中断，不自动再派一遍。
 
 文字请求和结果各限 32,000 个 UTF-16 代码单元。三分钟内未完成时，宿主会请求取消 Worker，再关闭其会话。超时、失败或没有完整文字时，不把中间内容当作完成。文字任务不授予任何文档写入权，也不用于运行外部长作业。
@@ -453,7 +443,7 @@ Studio 只把飞书事件明确标为 `text` 的消息正文当作纯文字输�
 
 #### 现场验收飞书与 Web 的成果交接
 
-准备好[专用机器人与测试私聊](<#飞书私聊登记>)后，按[源码试用步骤](<#从源码树试用>)准备独立 Web profile。启动前，在 `studio-local-host` 的 `config` 中保留 `stateDir`，加入以下设置并替换示例值。`cwd` 使用另一个空的试用工作目录；`provider` 和 `model` 填在独立 profile 中已配置且获准试用的路线 ID。不需要启用 `feishuDocumentInbox`、文档更正或额度通知。
+准备好[专用机器人与测试私聊](<#飞书私聊登记>)后，按[源码试用步骤](<#从源码树试用>)准备独立 Web profile。启动前，在 `dsh-superagent-managed-worker` 的 `config` 中保留 `stateDir`，加入以下设置并替换示例值。`cwd` 使用另一个空的试用工作目录；`provider` 和 `model` 填在独立 profile 中已配置且获准试用的路线 ID。不需要启用 `feishuDocumentInbox`、文档更正或额度通知。
 
 ```yaml
 feishuTextInbox:
@@ -468,7 +458,7 @@ feishuTextInbox:
 
 启动前关闭本次用于确认私聊 ID 的探针。同一应用的长连接之间不会广播事件；不要启动第二个监听者，也不要接管其他进程。只给这次独立启动传入 `STUDIO_FEISHU_APP_SECRET`，预检配置时不需要密钥。
 
-1. 先用 `--dump-config` 看配置是否落在唯一启用的 `studio-local-host`，原型监听仍关闭。正式启动后，在 **SuperAgent managed document Worker** 会话用 `/studio-doc feishu-status` 确认监听就绪；无需登记或绑定文档。监听就绪还不是飞书送达证据。
+1. 先用 `--dump-config` 核对 Studio 只启用了一份宿主，原型监听仍关闭。正式启动后，在 **SuperAgent managed document Worker** 会话用 `/studio-doc feishu-status` 确认监听就绪；无需登记或绑定文档。监听就绪还不是飞书送达证据。
 2. 在测试私聊只发送一次普通文字：`draft: 用三列表格比较虚构的甲、乙方案，只列数据。甲耗时 4 小时、需 2 人；乙耗时 6 小时、需 1 人。表头为方案、耗时、人数。` 在飞书原消息的回复串核对实际回复、任务 ID 和保存的结果。若没有回复，先用 `/studio-result feishu` 查找，不重发本次输入。
 3. 等文字 Worker 结束后，在同一个独立 Web 页新建空白会话，从工作区旁的 Agent 预设菜单选 **SuperAgent Studio Assistant**。不用先发普通消息，直接执行 `/studio-result <同一任务ID>`，点击对话记录中的 `studio-result` 命令行展开正文。通过条件是飞书实际收到结果或可用的取回指引，Web 展示同一任务的已保存正文和 Worker 出处，不再派工。只有 Web 取回成功而飞书没收到回复时，记录为取回通过、真实发件未确认，别算作整条链路通过。记录任务 ID、两端状态与正文是否一致，不附密钥或私人聊天。
 

@@ -8,13 +8,13 @@ import { SessionId, SessionSeq, type Session } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { DRAFT_PREFERENCE_HEADER, parseDraftPreference } from './draft-preference-request.ts'
 import type { ProjectWorkTerminationInput } from './project-work-termination-store.ts'
+import { DRAFT_DELEGATE, DRAFT_READ } from './result-tool-names.ts'
 import { DRAFT_TEXT_LIMIT, type ManagedResult, type ManagedWorkerStore, type StudioDraftResult, type StudioDraftTask } from './store.ts'
 import { sameTextWorkerModel as sameModelRoute, textWorkerModelError, type PinnedTextWorkerModel, type TextWorkerDispatchRole,
   type TextWorkerModelPolicy, type TextWorkerModelSelection as ModelRoute } from './text-worker-model-policy.ts'
 
+export { DRAFT_DELEGATE } from './result-tool-names.ts'
 export const ASSISTANT_PRESET = 'dsh-superagent-studio-assistant'
-export const DRAFT_DELEGATE = 'studio_delegate_draft'
-const DRAFT_READ = 'studio_read_draft'
 export const DRAFT_TIMEOUT_MS = 180_000
 const UNCONFIRMED_TEXT_ROUTE_FAILURES = new Set(['NO_ADAPTER', 'UNSUPPORTED_REASONING_EFFORT', 'INVALID_MODEL_INFO',
   'INVALID_MODEL_REASONING', 'INVALID_PREPARED_CALL'])

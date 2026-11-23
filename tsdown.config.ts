@@ -6,10 +6,15 @@ const raw = { name: 'raw',
   resolveId: (source: string, importer?: string) => source.endsWith('?raw') && importer ? resolve(dirname(importer), source) : undefined,
   load: (id: string) => id.endsWith('?raw') ? { code: `export default ${JSON.stringify(readFileSync(id.slice(0, -4), 'utf8'))}`, moduleType: 'js' as const }
     : undefined }
+const clientModules = ['react', 'react/jsx-runtime', 'react-dom']
+const clientOutput = (name: string) => ({ entryFileNames: 'client.js',
+  banner: `window.__ModuleLoader__.load({ id: ${JSON.stringify(name)}, factory: (require) => {`,
+  footer: 'return module.exports; } });', intro: 'var module = { exports: {} }; var exports = module.exports;' })
 export default defineConfig([
   { entry: { index: 'src/index.ts', 'github-watch': 'src/sources/github.ts', 'feishu-watch': 'src/sources/feishu.ts',
     'managed-worker': 'src/managed-worker/index.ts' }, outDir: 'lib', format: 'esm', fixedExtension: false, platform: 'node', target: 'es2024', dts: true, clean: true, deps: { neverBundle: [/^@deepseek-ai\//, 'zod', 'proper-lockfile', '@larksuiteoapi/node-sdk'] } },
   { entry: { client: 'src/client/index.tsx' }, outDir: 'lib', format: 'cjs', platform: 'browser', dts: false, clean: false, plugins: [raw],
-    deps: { neverBundle: ['react', 'react/jsx-runtime', 'react-dom'] },
-    outputOptions: { entryFileNames: 'client.js', banner: 'window.__ModuleLoader__.load({ id: "dsh-superagent", factory: (require) => {', footer: 'return module.exports; } });', intro: 'var module = { exports: {} }; var exports = module.exports;' } },
+    deps: { neverBundle: clientModules }, outputOptions: clientOutput('dsh-superagent') },
+  { entry: { client: 'src/studio-web/index.tsx' }, outDir: 'studio-web/lib', format: 'cjs', platform: 'browser', dts: false,
+    deps: { neverBundle: clientModules }, outputOptions: clientOutput('dsh-superagent-studio-web') },
 ])

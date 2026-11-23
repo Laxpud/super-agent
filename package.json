@@ -25,6 +25,7 @@
   },
   "files": [
     "lib",
+    "studio-web",
     "cordis.patch.yml",
     "locale/*.json",
     "README.md",

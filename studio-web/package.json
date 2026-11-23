@@ -1,0 +1,16 @@
+{
+  "name": "dsh-superagent-studio-web",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": ["@deepseek-ai/dsh-client-locale", "@deepseek-ai/dsh-client-ui-renderer"]
+    },
+    "manifestVersion": 1
+  }
+}

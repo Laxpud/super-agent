@@ -4,11 +4,10 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { z } from 'zod'
 import { DRAFT_TIMEOUT_MS, ownerRequest, type StudioAssistant } from './assistant.ts'
+import { STUDY_DELEGATE as DELEGATE_STUDY, STUDY_READ as READ_STUDY } from './result-tool-names.ts'
 import { DRAFT_TEXT_LIMIT, type ManagedResult, type ManagedWorkerStore } from './store.ts'
 import { STUDY_MAX_PARTS, STUDY_MIN_PARTS, type Study, type StudyStep } from './study-store.ts'
 
-const DELEGATE_STUDY = 'studio_delegate_study'
-const READ_STUDY = 'studio_read_study'
 const TOOL_TIMEOUT_MS = (STUDY_MAX_PARTS + 1) * DRAFT_TIMEOUT_MS + 10_000
 const quote = z.string().min(1).max(DRAFT_TEXT_LIMIT)
 const studyArgs = z.strictObject({

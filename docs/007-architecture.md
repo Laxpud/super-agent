@@ -355,6 +355,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/managed-worker/index.ts` | The opt-in Studio host: keeps its roles read-only, registers Web commands, and guards the one allowed managed document action without running GitHub setup |
 | `src/managed-worker/assistant.ts` | Runs restricted text Workers or Advisors, checks pinned routes and protected relays at the native stream boundary, and captures the exact admitted turn's result |
+| `src/managed-worker/result-tool-names.ts` | Shares Studio result tool wire names between Host registration and Web presentation |
 | `src/managed-worker/text-worker-model-policy.ts` | Validates separate text Worker defaults and inclusive role bounds against a shared, owner-ordered allow-list, then confirms and pins the actual dispatch tuple without a fallback |
 | `src/managed-worker/advisor.ts` | Uses an opt-in model route to obtain a separate Advisor opinion on a scoped owner question, without dispatching work or granting actions |
 | `src/managed-worker/advisor-store.ts` | Captures the question, exact evidence and Advisor provenance; rechecks management authority at reservation and admission and retains opinions across handoffs |
@@ -453,6 +454,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
+| `src/studio-web/index.tsx` | Registers Studio's opt-in, read-only tool rows; displays recorded results and provenance without including them in inference |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
 | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |

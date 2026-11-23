@@ -8,6 +8,7 @@ import s from '@deepseek-ai/schemastery'
 import { z } from 'zod'
 import type { Advice, AdvisorRoute } from './advisor-store.ts'
 import { DRAFT_TIMEOUT_MS, ownerRequest, type StudioAssistant } from './assistant.ts'
+import { ADVISOR_CONSULT as CONSULT, ADVISOR_READ as READ } from './result-tool-names.ts'
 import { DRAFT_TEXT_LIMIT, type ManagedResult, type ManagedWorkerStore } from './store.ts'
 
 export const AdvisorConfig: s<Required<AdvisorRoute>> = s.object({
@@ -17,8 +18,6 @@ export const AdvisorConfig: s<Required<AdvisorRoute>> = s.object({
 })
 type AdvisorConfig = Required<AdvisorRoute>
 type Requester = Advice['role']
-const CONSULT = 'studio_consult_advisor'
-const READ = 'studio_read_advice'
 const id = z.uuid()
 const quote = z.string().min(1).max(DRAFT_TEXT_LIMIT)
 const consultArgs = z.strictObject({

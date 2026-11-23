@@ -12,7 +12,7 @@
       disabled: true
     # The managed document Worker starts without GitHub setup. Its preset is also off by default and separate from the legacy Executor.
     - id: dsh-superagent-managed-worker
-      name: dsh-superagent/managed-worker
+      name: ./studio-web/index.js
       disabled: true
     - id: dsh-superagent-managed-worker-preset
       name: '@deepseek-ai/dsh-agent-preset'
