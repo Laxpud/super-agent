@@ -470,7 +470,7 @@ feishuTextInbox:
 
 1. 先用 `--dump-config` 看配置是否落在唯一启用的 `studio-local-host`，原型监听仍关闭。正式启动后，在 **SuperAgent managed document Worker** 会话用 `/studio-doc feishu-status` 确认监听就绪；无需登记或绑定文档。监听就绪还不是飞书送达证据。
 2. 在测试私聊只发送一次普通文字：`draft: 用三列表格比较虚构的甲、乙方案，只列数据。甲耗时 4 小时、需 2 人；乙耗时 6 小时、需 1 人。表头为方案、耗时、人数。` 在飞书原消息的回复串核对实际回复、任务 ID 和保存的结果。若没有回复，先用 `/studio-result feishu` 查找，不重发本次输入。
-3. 等文字 Worker 结束后，在独立 Web 页打开一个**新**的 Studio Assistant 会话，用 `/studio-result <同一任务ID>`。通过条件是飞书实际收到结果或可用的取回指引，Web 返回同一任务的已保存正文和 Worker 出处，不再派工。只有 Web 取回成功而飞书没收到回复时，记录为取回通过、真实发件未确认，别算作整条链路通过。记录任务 ID、两端状态与正文是否一致，不附密钥或私人聊天。
+3. 等文字 Worker 结束后，在同一个独立 Web 页新建空白会话，从工作区旁的 Agent 预设菜单选 **SuperAgent Studio Assistant**。不用先发普通消息，直接执行 `/studio-result <同一任务ID>`，点击对话记录中的 `studio-result` 命令行展开正文。通过条件是飞书实际收到结果或可用的取回指引，Web 展示同一任务的已保存正文和 Worker 出处，不再派工。只有 Web 取回成功而飞书没收到回复时，记录为取回通过、真实发件未确认，别算作整条链路通过。记录任务 ID、两端状态与正文是否一致，不附密钥或私人聊天。
 
 验收后在启动终端按 Ctrl+C，仅退出本次试用宿主；Studio 会关闭它持有的 SDK 长连接，不需要用 `lark-cli` 停止任何进程。历史 SQLite 记录不需要迁移；如果以前用 CLI 启动过 Studio，在独立配置里移除旧的 `cli` 字段，保持四个身份 ID 不变。
 
