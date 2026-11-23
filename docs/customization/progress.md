@@ -20,7 +20,7 @@
 ### 第 1 步的验证范围
 
 - [从源码树隔离启动](<managed-worker.md#从源码树试用>)：独立 Web profile 实测真实 bundle 补丁加本地覆盖层，原型条目保持禁用，三个 Studio 预设沿用仓库配置。Leader 可通过原生命令立项，Assistant 向一个无工具 Worker 委派原请求并取回已保存成果。
-- [普通文字任务](<managed-worker.md#交代文字任务和取回成果>)：DSH `0.2.2-rc.3` 单所有者宿主通过原生 Web RPC 接收消息，用本地固定响应模型验证一次委派、同消息去重、原入口成果与 Worker 来源一致。Worker 会话结束和宿主重启后仍能取回原文，取回不调用模型。未测试线上模型行为或浏览器视觉呈现。
+- [普通文字任务](<managed-worker.md#交代文字任务和取回成果>)：DSH `0.2.2-rc.3` 单所有者宿主通过原生 Web RPC 接收消息，用本地固定响应模型验证一次委派、同消息去重、原入口成果与 Worker 来源一致。Web 实时订阅与历史读取收到相同的 `Worker result` 卡片正文和出处，给 Assistant 的工具回执只含摘要与出处。Worker 会话结束和宿主重启后仍能取回原文，取回不调用模型。未测试线上模型行为或工具卡片的浏览器呈现。
 - [普通文字 Worker 的组合限制](<managed-worker.md#限定普通文字-worker-的模型组合>)：独立 Web profile 验证 Assistant 委派和 Leader 手动派工只用清单中的深度；清单外不启动 Worker，已核实的深度在实际调用前失效时不进入适配器推理，也不改用其他组合。
 - [两角色各自的文字派工默认组合](<managed-worker.md#限定普通文字-worker-的模型组合>)：独立 Web profile 验证双方各用配置的 Worker 组合，不改变发起会话；缺省时沿用本会话，已配置组合失效时不派工或回退。
 - [按清单顺序限定角色范围](<managed-worker.md#限定普通文字-worker-的模型组合>)：独立 Web profile 验证两角色的端点组合可派工，显式选择或适配器默认深度越界时不启动 Worker、不自动换组合。
