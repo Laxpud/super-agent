@@ -409,7 +409,14 @@ export class StudioAssistant {
               throw new Error('Studio draft rejected: EXPECTED_CURRENT_OWNER_TEXT_REQUEST')
             }
           }
-          return draftOutput(await this.delegate(agent, source, exec.signal))
+          const task = await this.delegate(agent, source, exec.signal)
+          const result = draftOutput(task)
+          if (task.state === 'completed' && task.result && !task.preference) {
+            // The native executor commits the result card before ending the turn. Older hosts keep their normal follow-up.
+            const terminal = exec as typeof exec & { concludeTurn?(): void }
+            terminal.concludeTurn?.()
+          }
+          return result
         },
       }))
       disposers.push(agent.ctx.tools.register({ name: DRAFT_READ,
