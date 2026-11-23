@@ -485,7 +485,17 @@ export function apply(context: Context, config: Config): void {
     recordInput: false,
     handler({ agent, rawInput, signal }) {
       signal.throwIfAborted()
-      if (!ready(agent, 'assistant')) return { kind: 'error', text: 'Open a Studio Assistant Session to read Studio results.' }
+      if (!ready(agent, 'assistant')) {
+        // Start with the diagnosis shown in the collapsed row; put the recovery steps in the expandable body.
+        const text = presetOf(agent) !== ASSISTANT_PRESET
+          ? 'Use SuperAgent Studio Assistant to read results.\n'
+            + 'In a new blank session in the same Studio Web profile, choose that Agent preset beside the workspace picker. '
+            + 'Run /studio-result <task-id> there, or /studio-result feishu to find recent Feishu tasks. No chat message is needed.'
+          : 'This Studio Assistant is not ready to read results.\n'
+            + 'Check that you are in the local Studio Web profile and the session uses Read-only permissions. '
+            + 'Retry here when ready. If you open a new Studio Assistant session, include the task ID to read a specific result.'
+        return { kind: 'error', text }
+      }
       const id = rawInput.trim()
       if (id === 'feishu') return feishuDraftsCommand(store)
       if (id && !z.uuid().safeParse(id).success) {
