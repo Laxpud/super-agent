@@ -21,7 +21,8 @@ import { DOCUMENT_WRITE_TOOL as TOOL, GUARD_REVIEW_HINT, documentGuardReviewComm
 import type { DocumentGuardCapture } from './document-guard-store.ts'
 import { DOCUMENT_GUARD_HINT, documentGuardCommand, documentGuardFeedback } from './document-guard.ts'
 import { StudioDocumentRecovery } from './document-recovery.ts'
-import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, feishuSourceScope, validateFeishuInbox } from './feishu-inbox.ts'
+import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, feishuSourceScope, takeFeishuAppSecret, validateFeishuInbox } from './feishu-inbox.ts'
+import { StudioFeishuSdk } from './feishu-sdk.ts'
 import { StudioFeishuText, feishuDraftOutput, feishuDraftsCommand, validateFeishuTextRoute } from './feishu-text.ts'
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
 import { MEMORY_COMMAND, MEMORY_HINT, memoryCommand } from './memory.ts'
@@ -164,6 +165,7 @@ export function apply(context: Context, config: Config): void {
   const feishuScope = feishuConfig ? feishuSourceScope(feishuConfig) : undefined
   const quotaNoticeScope = quotaFeishuAlerts ? feishuScope : undefined
   const documentFailureNoticeScope = documentFailureFeishuAlerts ? feishuScope : undefined
+  const feishuSdk = feishuConfig ? new StudioFeishuSdk(feishuConfig.appId, takeFeishuAppSecret()) : undefined
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   let available = true
   const channelStop = new AbortController()
@@ -228,7 +230,7 @@ export function apply(context: Context, config: Config): void {
   const delivery = new AgentDelivery(ctx)
   const continuations = documentContinuations ? new StudioDocumentContinuation(ctx, store, delivery, ready, channelStop.signal) : undefined
   const feishuText = feishuTextInbox ? new StudioFeishuText(store, drafts, feishuTextInbox, channelStop.signal, channelReady) : undefined
-  const feishu = feishuConfig && new StudioFeishuInbox(ctx, store, stateDir, feishuConfig, channelReady, feishuText,
+  const feishu = feishuConfig && feishuSdk && new StudioFeishuInbox(ctx, store, feishuSdk, feishuConfig, channelReady, feishuText,
     !!feishuDocumentInbox || combinedFeishu, failureNoticeReady,
     continuations && ((source, intent, signal) => continuations.receiveFeishu(source, intent, signal)))
   if (documentFailureNoticeScope && feishu) {

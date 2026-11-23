@@ -408,7 +408,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/preference-correction-store.ts` | Journals one correction for an exact active revision and run; binds the terminal decision to the matching new revision in the same transaction |
 | `src/managed-worker/preference-scope-change-intent.ts` | Recognizes a standalone restriction or forget request with exact preference and project identifiers |
 | `src/managed-worker/preference-scope-change-store.ts` | Stores one-use scope decisions without preference text and binds confirmation to its exact journal transition |
-| `src/managed-worker/feishu-inbox.ts` | Verifies the dedicated bot, routes the configured owner's private chat to enabled text, review or continuation paths, and sends best-effort plain-text receipts |
+| `src/managed-worker/feishu-sdk.ts` | Connects one Feishu application through the official Node SDK, verifies the bot, and validates outbound receipts without logging credentials or payloads |
+| `src/managed-worker/feishu-inbox.ts` | Routes the configured owner's private-chat events from the SDK to existing text, review or continuation paths, and sends best-effort plain-text receipts |
 | `src/managed-worker/feishu-text.ts` | Routes explicit single-message text commands to a restricted Worker or exact result retrieval without rerunning completed work |
 | `src/managed-worker/feishu-draft-store.ts` | Preserves Feishu input, task and Worker identities, and result provenance; deduplicates deliveries under the shared SQLite run fence |
 | `src/managed-worker/feishu-delivery-store.ts` | Claims text commands in both inbox modes and document deliveries in the combined inbox; retains the first route across restarts and mode changes |

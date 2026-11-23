@@ -407,27 +407,27 @@ Assistant 和工具卡只显示回执。用 `/studio-result <任务ID>` 取回�
 
 ### 飞书私聊登记
 
-飞书入口默认关闭。试用时使用单独的 Studio profile、专用的飞书自建应用和测试私聊。Studio 当前只接受飞书（`feishu`）的机器人，不接受国际版 Lark 机器人。
+飞书入口默认关闭。使用单独的 Studio profile、专用飞书自建应用和测试私聊。Studio 通过[官方 Node.js SDK `@larksuiteoapi/node-sdk`](<https://www.npmjs.com/package/@larksuiteoapi/node-sdk/v/1.76.0>)直连飞书（`Domain.Feishu`），不调用 `lark-cli`，不接受国际版 Lark 机器人。旧原型的飞书 Source 仍独立，不能与 Studio 同时监听此应用。
 
-- 在开放平台启用机器人，以应用身份通过[长连接](<https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-/request-url-configuration-case.md>)订阅[接收消息](<https://open.feishu.cn/document/server-docs/im-v1/message/events/receive>)（`im.message.receive_v1`），发布应用使配置生效。准备私聊收件权限 `im:message.p2p_msg:readonly` 和机器人发件权限 `im:message:send_as_bot`，让测试所有者能与该机器人私聊；不需要给 Studio 开群消息权限。权限和事件参数按 [`lark-cli v1.0.90` 的事件注册](<https://github.com/larksuite/cli/blob/v1.0.90/events/im/register.go#L16-L29>)及[发件定义](<https://github.com/larksuite/cli/blob/v1.0.90/shortcuts/im/im_messages_send.go#L17-L36>)核对，尚未验证真实收发。
-- 在宿主 `config` 中用绝对路径指向已配置好的专用 CLI。用同一入口检查 `config strict-mode` 显示 `strict-mode: bot`，不要把密钥或令牌写入 Studio 配置。若不确定 `ownerOpenId`、`chatId`，在没有其他监听者时，按[官方限时监听示例](<https://github.com/larksuite/cli/blob/v1.0.90/skills/lark-event/SKILL.md#L48-L49>)用该 CLI 读取一条自己的测试私聊事件，核对 `sender_id` 和 `chat_id`。不要取其他应用的 ID，也不要让原型的飞书 Source 与 Studio 同时消费这个机器人的事件。Studio 先核对应用和机器人，只收指定所有者发到该私聊的消息。
+- 在开放平台启用机器人，以应用身份通过[长连接](<https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-/request-url-configuration-case.md>)订阅[接收消息 v2.0](<https://open.feishu.cn/document/server-docs/im-v1/message/events/receive.md>)（`im.message.receive_v1`），发布应用使配置生效。准备私聊收件权限 `im:message.p2p_msg:readonly` 和[机器人回复权限](<https://open.feishu.cn/document/server-docs/im-v1/message/reply>) `im:message:send_as_bot`，让所有者能从自己的账号与机器人私聊；不需要群消息权限。
+- 配置只保存应用、机器人、所有者和私聊 ID。`ownerOpenId` 要来自这个应用收到的所有者消息，不能使用其他应用的 `open_id`。首次试用未掌握私聊 ID 时，可用同一个 SDK 的限时探针识别自己发送的一条一次性匹配消息；探针不回复、不派工，退出后再启动 Studio。Studio 先核对应用身份的机器人，再只处理所配置所有者发到所配置私聊的消息。
+- 在本机终端无回显读入专用 App Secret，只给本次 DSH 启动进程的 `STUDIO_FEISHU_APP_SECRET`。Studio 读取后删除该环境变量，不把密钥写入 `config`、会话或 SQLite。不要把密钥粘贴到对话、命令参数或配置文件。只有当前启动启用飞书入口时才需要录入；不要从已有 profile 复制凭据。
 
 ```yaml
 feishuDocumentInbox:
-  cli: /absolute/path/to/studio-lark-cli
-  appId: cli_example
+  appId: cli_0123456789abcdef
   botOpenId: ou_studiobot
   ownerOpenId: ou_studioowner
   chatId: oc_studiochat
 ```
 
-1. 在文档 Worker 会话用 `/studio-doc feishu-status` 核对监听状态。`listening` 只表示 CLI 已进入监听，不能证明这个私聊已能收发。要接收文档指令，再在当前待写任务的 Worker 会话用 `/studio-doc bind-feishu` 绑定。绑定随任务保留，换 Worker 不改变归属；已经绑定的私聊和任务均不能改指到另一个对象。
+1. 在文档 Worker 会话用 `/studio-doc feishu-status` 核对监听状态。`listening` 表示 SDK 长连接已完成握手，不证明这个私聊已能收发。要接收文档指令，再在当前待写任务的 Worker 会话用 `/studio-doc bind-feishu` 绑定。绑定随任务保留，换 Worker 不改变归属；已经绑定的私聊和任务均不能改指到另一个对象。
 2. 从指定私聊发送更正。未绑定时不猜任务；回执只确认消息已登记、文档写入暂被阻止，不代表新指令已经生效。若未收到回执，可在当前 Worker 会话用 `/studio-doc inbox` 核实，不必重发。更正消息不会直接唤起 Worker 或启动工作。
 3. GUI 和飞书共用同一待核对列表。相同飞书消息只登记一次。若发送时间早于同一私聊已登记的消息，或顺序无法核实，Web 的 `/studio-doc inbox` 会提示人工核对；无参数的 `/studio-doc review` 不适用于这条消息。飞书私聊内的时间不能确定它与 Web 指令的先后，迟到也不会改变已确认的范围。核对原消息后，只有确认仍按现行范围继续时才选 `unchanged`；不确定时选 `pause`。核对本身不写入文档。
 
-Studio 只把 CLI 明确标为 `text` 的消息正文当作纯文字输入。富文本、附件或类型不明的消息不会派工、取回成果或启动续做。若私聊已绑定文档且启用了文档收件，只登记消息来源（包括可用的父消息 ID）并阻止写入，等待所有者回到原私聊核对。只启用文字入口时忽略这类消息。
+Studio 只把飞书事件明确标为 `text` 的消息正文当作纯文字输入。富文本、附件或类型不明的消息不会派工、取回成果或启动续做。若私聊已绑定文档且启用了文档收件，只登记消息来源（包括可用的父消息 ID）并阻止写入，等待所有者回到原私聊核对。只启用文字入口时忽略这类消息。
 
-此入口只监听实时送到 CLI 的事件，不补收断线期间的历史；已登记消息的阻断不依赖飞书连接仍在线。
+此入口只接收长连接实时推送的事件，不补收断线期间的历史；已登记消息的阻断不依赖飞书连接仍在线。
 
 ### 从 Web 或飞书继续同一个文档任务
 
@@ -441,10 +441,10 @@ Studio 只把 CLI 明确标为 `text` 的消息正文当作纯文字输入。富
 
 ### 从飞书发起文字任务并取回
 
-用 `feishuTextInbox` 接收纯文字任务。配置沿用上文五个机器人及私聊字段，另指定绝对 `cwd`、现有 `provider` 和 `model`，可选 `reasoningEffort`。Studio 不从消息中选模型或切换账号。
+用 `feishuTextInbox` 接收纯文字任务。配置沿用上文四个机器人及私聊字段，另指定绝对 `cwd`、现有 `provider` 和 `model`，可选 `reasoningEffort`。Studio 不从消息中选模型或切换账号。
 
 1. 发送以 `draft:` 或 `起草：` 开头的消息，把所需材料放在同一条消息中，例如 `draft: 把下列数据整理成比较表……`。不带这些前缀不会发起文字任务。每个私聊同时只执行一个文字任务，已知迟到的请求不会派工。收到忙碌回执后，若仍要执行，请等当前任务结束再另发新消息；原消息不会补派。收到任务 ID 后不必重发。
-2. Worker 只收到前缀后的文字，不具备工具、文档写入权或外部操作权限。Studio 保存原文和结果出处，再尝试以[纯文字回复](<https://github.com/larksuite/cli/blob/main/skills/lark-im/references/lark-im-messages-reply.md>)发送，不解析结果里的图片地址或下载内容。超出回复限制时给出取回方式。
+2. Worker 只收到前缀后的文字，不具备工具、文档写入权或外部操作权限。Studio 保存原文和结果出处，再尝试以[纯文字回复](<https://open.feishu.cn/document/server-docs/im-v1/message/reply>)发送，不解析结果里的图片地址或下载内容。超出回复限制时给出取回方式。
 3. 在同一私聊发 `result <任务ID>`，或在任何 **SuperAgent Studio Assistant** 会话用 `/studio-result <任务ID>`，无需再次调用模型。会话结束或宿主重启后仍可取回已保存结果；中断的任务不会自动重做。
 
 **没收到回复、也不知道任务 ID？** 在 **SuperAgent Studio Assistant** Web 会话用 `/studio-result feishu`。它按消息发送时间（UTC）倒序列出当前配置私聊中最多 8 个已保存的文字任务。按时间和原消息 ID 核对，复制对应的 `/studio-result <任务ID>` 取回。列表不含正文，也不能确认机器人回复是否送达。查不到不等于原消息未被处理，不要仅凭此重发。
@@ -453,12 +453,11 @@ Studio 只把 CLI 明确标为 `text` 的消息正文当作纯文字输入。富
 
 #### 现场验收飞书与 Web 的成果交接
 
-准备好[专用机器人 CLI 与测试私聊](<#飞书私聊登记>)后，按[源码试用步骤](<#从源码树试用>)准备独立 Web profile。启动前，在 `studio-local-host` 的 `config` 中保留 `stateDir`，加入以下设置并替换示例值。`cwd` 使用另一个空的试用工作目录；`provider` 和 `model` 填在独立 profile 中已配置且获准试用的路线 ID。不需要启用 `feishuDocumentInbox`、文档更正或额度通知。
+准备好[专用机器人与测试私聊](<#飞书私聊登记>)后，按[源码试用步骤](<#从源码树试用>)准备独立 Web profile。启动前，在 `studio-local-host` 的 `config` 中保留 `stateDir`，加入以下设置并替换示例值。`cwd` 使用另一个空的试用工作目录；`provider` 和 `model` 填在独立 profile 中已配置且获准试用的路线 ID。不需要启用 `feishuDocumentInbox`、文档更正或额度通知。
 
 ```yaml
 feishuTextInbox:
-  cli: /absolute/path/to/studio-lark-cli
-  appId: cli_example
+  appId: cli_0123456789abcdef
   botOpenId: ou_studiobot
   ownerOpenId: ou_studioowner
   chatId: oc_studiochat
@@ -467,13 +466,13 @@ feishuTextInbox:
   model: example-model-id
 ```
 
-第一次监听前（包括限时监听查私聊 ID），用配置中的同一 CLI 路径运行 [`event status --current`](<https://github.com/larksuite/cli/blob/v1.0.90/cmd/event/status.go#L23-L41>)，核对专用应用 ID 和 `Bus: not running`；已有事件进程时不接管。首次监听就绪后再查，记下本次启动的应用 ID 和 PID，供退出时核对。
+启动前关闭本次用于确认私聊 ID 的探针。同一应用的长连接之间不会广播事件；不要启动第二个监听者，也不要接管其他进程。只给这次独立启动传入 `STUDIO_FEISHU_APP_SECRET`，预检配置时不需要密钥。
 
 1. 先用 `--dump-config` 看配置是否落在唯一启用的 `studio-local-host`，原型监听仍关闭。正式启动后，在 **SuperAgent managed document Worker** 会话用 `/studio-doc feishu-status` 确认监听就绪；无需登记或绑定文档。监听就绪还不是飞书送达证据。
 2. 在测试私聊只发送一次普通文字：`draft: 用三列表格比较虚构的甲、乙方案，只列数据。甲耗时 4 小时、需 2 人；乙耗时 6 小时、需 1 人。表头为方案、耗时、人数。` 在飞书原消息的回复串核对实际回复、任务 ID 和保存的结果。若没有回复，先用 `/studio-result feishu` 查找，不重发本次输入。
 3. 等文字 Worker 结束后，在独立 Web 页打开一个**新**的 Studio Assistant 会话，用 `/studio-result <同一任务ID>`。通过条件是飞书实际收到结果或可用的取回指引，Web 返回同一任务的已保存正文和 Worker 出处，不再派工。只有 Web 取回成功而飞书没收到回复时，记录为取回通过、真实发件未确认，别算作整条链路通过。记录任务 ID、两端状态与正文是否一致，不附密钥或私人聊天。
 
-退出试用宿主后，用同一 CLI 再查事件状态。只有应用 ID 和 PID 都与本次记录相符，而且显示 `Active consumers: 0`，才用该 CLI 的 [`event stop`](<https://github.com/larksuite/cli/blob/v1.0.90/cmd/event/stop.go#L46-L71>) 停止当前应用的事件进程，再查状态。进程已退出或归属不明时不操作；不加 `--all` 或 `--force`，不要改动密钥。
+验收后在启动终端按 Ctrl+C，仅退出本次试用宿主；Studio 会关闭它持有的 SDK 长连接，不需要用 `lark-cli` 停止任何进程。历史 SQLite 记录不需要迁移；如果以前用 CLI 启动过 Studio，在独立配置里移除旧的 `cli` 字段，保持四个身份 ID 不变。
 
 #### 同一个私聊兼顾文档更正
 
@@ -522,7 +521,7 @@ quotaPools:
 
 ### 通过飞书接收额度故障通知（可选）
 
-配置了额度池和[专用飞书入口](<#飞书私聊登记>)后，可在同一宿主 `config` 中启用 `quotaFeishuAlerts: true`。默认不发通知。机器人和连接验证通过后，Studio 使用 [lark-cli 的私聊发送接口](<https://github.com/larksuite/cli/blob/main/skills/lark-im/references/lark-im-messages-send.md>)，仅向配置的 `ownerOpenId` 发送系统通知，不从聊天内容选取收件人，不向群聊发送。
+配置了额度池和[专用飞书入口](<#飞书私聊登记>)后，可在同一宿主 `config` 中启用 `quotaFeishuAlerts: true`。默认不发通知。机器人和连接验证通过后，Studio 用 SDK 调用[发送消息接口](<https://open.feishu.cn/document/server-docs/im-v1/message/create>)，只向配置的 `ownerOpenId` 发送系统通知，并核对回执中的私聊 ID。不从聊天内容选取收件人，不向群聊发送。
 
 通知只包含已确认的额度故障、受影响的池和路由，以及 Web 状态查询方式；不附带任务正文、日志或恢复依据。Studio 对每次故障至多尝试发送一次，发出前先保存发送记录。若已登记发送尝试，但宿主在保存回执前退出，重启后 `/studio-quota status` 显示「送达未确认」，不会自动重发。消息可能已经到达，可在原私聊核对；通知状态不改变额度停止。没有配置或尚未验证飞书时，仍可在 Web 查询停池状态。
 
