@@ -93,6 +93,13 @@ interface CommandInput { agent: Agent; commandId: string; rawInput: string; sign
 type StudioRole = 'assistant' | 'leader' | 'document-worker' | RestrictedTextRole
 interface StudioScope { role: StudioRole; dispose(): void }
 
+/** Resolve the role declared by a preset before the Host installs that Session's scope. */
+function roleForPreset(preset: string | null): StudioRole | undefined {
+  if (preset === ASSISTANT_PRESET) return 'assistant'
+  if (preset === LEADER_PRESET) return 'leader'
+  if (preset === PRESET) return 'document-worker'
+}
+
 /** Only the rc.3 additions used here are declared. The running host provides the services; no second Cordis or DSH runtime is loaded. */
 type ManagedHost = Context & {
   agentPresets: { presetForSession(session: Agent['session']): string | null }
@@ -249,10 +256,7 @@ export function apply(context: Context, config: Config): void {
     if (store.binding(agent.id)) return 'document-worker'
     if (store.assistantBinding(agent.id)) return 'assistant'
     if (store.projects.binding(agent.id)) return 'leader'
-    const preset = presetOf(agent)
-    if (preset === ASSISTANT_PRESET) return 'assistant'
-    if (preset === LEADER_PRESET) return 'leader'
-    if (preset === PRESET) return 'document-worker'
+    return roleForPreset(presetOf(agent))
   }
 
   ctx.effect(() => async () => {
@@ -359,14 +363,30 @@ export function apply(context: Context, config: Config): void {
   ctx.on('agent/created', ({ agent }) => { configure(agent); return undefined })
   ctx.on('agent/disposed', ({ agent }) => { scopes.get(agent)?.dispose(); scopes.delete(agent) })
   ctx.on('agent-preset/selected', (id, preset) => {
-    if (preset !== PRESET && preset !== ASSISTANT_PRESET && preset !== LEADER_PRESET) return
+    if (!roleForPreset(preset)) return
     const agent = ctx.agents.get(id as SessionId)
-    if (agent) configure(agent)
+    if (!agent) return
+    // DSH is still publishing the selection event. Wait until that append returns before recording read-only permissions.
+    queueMicrotask(() => {
+      if (!available) return
+      try {
+        if (!currentSession(agent) || presetOf(agent) !== preset) return
+        // The loop assembles prompts and tools before pre-step. An overlapping turn may already have taken the old snapshot.
+        if (agent.status === 'running') agent.cancel({ kind: 'hook', reason: 'Studio preset changed while the turn was starting.' }, { keepInbox: true })
+        configure(agent)
+      } catch (error) {
+        ctx.logger.warn('Studio could not configure the role for session %s: %s', agent.id, String(error))
+      }
+    })
   })
   ctx.on('agent/pre-step', async (step, next) => {
     const { agent, turn, messages } = step
     const role = scopes.get(agent)?.role
-    if ((role === 'assistant' || role === 'leader') && !ready(agent, role)) return { kind: 'reject' }
+    // A selected preset without an installed scope is not an ordinary Agent. Stop before sending its inherited prompt or tools.
+    if (role ? !ready(agent, role) : roleForPreset(presetOf(agent)) !== undefined) {
+      agent.cancel({ kind: 'hook', reason: 'Studio role is not ready. Check the Studio host, the selected preset, and read-only permissions.' }, { keepInbox: true })
+      return { kind: 'reject' }
+    }
     if (!validateDocumentRelays(store, agent, messages, () => ready(agent, 'document-worker'))) return { kind: 'reject' }
     if (role === 'assistant' || role === 'leader') {
       const input = currentOwnerInboxInput(step)
