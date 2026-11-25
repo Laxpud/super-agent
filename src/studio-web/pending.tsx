@@ -49,8 +49,8 @@ function PendingItem({ item, resolved, refresh }: { item: StudioPending; resolve
     {item.detail && <p className="as-message-text">{item.detail}</p>}
     <div className="as-actions">
       <Button onClick={source}>{t(item.messageId || item.recordSessionId ? 'source' : item.topicId ? 'topic' : 'openConversation')}</Button>
-      {item.state === 'pending' && <span className="as-pill" data-tone={item.mobile === 'unsupported' ? 'warn' : undefined}>
-        {t(`mobile.${item.mobile}`)}</span>}
+      {item.state === 'pending' && <span className="as-pill" data-tone={item.kind !== 'confirmation' && item.mobile === 'unsupported' ? 'warn' : undefined}>
+        {t(item.kind === 'confirmation' ? 'decisionText' : `mobile.${item.mobile}`)}</span>}
     </div>
     {failure !== undefined && <FailureNotice failure={failure} />}
     {item.state === 'pending' ? <>

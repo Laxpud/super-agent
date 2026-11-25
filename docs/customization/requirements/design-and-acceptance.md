@@ -1,10 +1,10 @@
 # 设计前提、验收与范围排除
 
-> **创建日期：** 2026-11-24　｜　**最后需求修改：** 基线截至 2026-11-16
+> **创建日期：** 2026-11-24　｜　**最后需求修改：** 2026-11-25
 >
 > **实现情况：** 不适用。本篇记录设计前提及验收口径，不表示验收已通过。
 >
-> **最近需求变更：** 旧基线未按篇记录。
+> **最近需求变更：** 增补 Router 跨端并发、中断和纯文字确认的验收场景。
 
 [需求索引](README.md#按主题查阅)
 
@@ -36,6 +36,9 @@
 | 简单写作或分析任务无须使用业务工具 | 仍委派 Worker；交付关联其结果，可以在原入口直接展示，不要求 Assistant 再改写一遍。 |
 | 未立项任务需要多个 Worker 调查并综合结论 | 明确指定 Worker 负责技术整合和必要检查；不自动立项，Assistant 不自行补写技术结论，整合 Worker 不向其他 Worker 派工。 |
 | 从飞书请求生成比较表，随后结束 Worker 会话并从 GUI 追问成果 | 原入口提供可访问的成果或可用的取得方式；需要保留的成果不因临时目录清理丢失，换入口仍能定位并取得已有成果，不要求重做。 |
+| 从 GUI 交办 A，A 的受限动作等待确认；此时从飞书查询项目并交办 B，再用文字停止 A | 项目查询返回，B 可以被派发而无须先处理 A 的确认。停止只影响 A，不阻塞 B，也不把未确认动作变为已授权。 |
+| 前台仍在处理一轮时，用户明确改变这一轮的方向，或另外交办独立工作 | 明确改向可介入旧轮；不发送旧方向的答复冒充当前结果。独立工作可以接收和处理，不默认取消旧任务；各结果可定位回原请求。 |
+| 只在飞书私聊打字，查询待确认、批准一项、拒绝另一项，再查看这两项的状态 | 重要确认在私聊主聊天可见，用户不用点卡片或到网页操作。明确指向有效事项的文字与按钮按同样的规则校验；状态在网页也可核对，未指明对象的肯定和过期确认不生效。 |
 | 已批准动作仍在工作室内部排队，尚未启动或发出调用，用户从另一入口要求缩小范围 | 更正登记生效后，受影响的旧批准失效，动作按新范围重新核对；不等待 Leader 阅读或批准更正。 |
 | 用户在 GUI 直接更正 Worker 任务，Worker 尚未读到该消息 | 系统及时登记更正并阻止受影响的旧动作；只有任务依据和执行约束已更新，才能确认更正已生效，不以模型读到消息为生效前提。 |
 | GUI 或飞书重复投递同一条消息，或已知较早的扩大范围指令迟到 | 不重复创建工作或视为新增授权，旧消息不覆盖已确认的新限制；跨渠道先后关系无法判断且影响动作时，澄清受影响的决定。 |
@@ -89,7 +92,8 @@
 
 下列来源曾用于讨论。列入参考不等于采用其框架、存储系统、默认设置或全部行为，也不构成依赖选择。
 
-- [《Super-agent 设计探索：迈向更自主的 Agent 系统》](<https://mp.weixin.qq.com/s/zoS7GlReWPhfCjENGxXCdg>)：背景文章。已讨论公开原型与文章设计并不完全一致，不能假设原型实现了所有提议。
+- [《Super-agent 设计探索：迈向更自主的 Agent 系统》](<https://mp.weixin.qq.com/s/zoS7GlReWPhfCjENGxXCdg>)：统一 Router、隔离任务与异步交互。公开原型与文章设计并不完全一致，不能假设原型实现了所有提议。
+- [OpenAI Dots](<https://learn.chatgpt.com/docs/dots#how-your-dot-works>) 与 [Grok Bot](<https://docs.x.ai/grok-bot/chat-and-collaboration#redirect-work-in-progress>)：讨论过的后台工作与前台对话并行、用户新指令优先和改向参考。
 - [Codex CLI 自动审批入口](<https://github.com/openai/codex/blob/ddd1812a51f4aded35c3ec5446672474d5cb546b/codex-rs/utils/cli/src/shared_options.rs#L43-L90>)与 [Guardian 授权策略](<https://github.com/openai/codex/blob/ddd1812a51f4aded35c3ec5446672474d5cb546b/codex-rs/prompts/templates/guardian/policy_template.md>)：受限基础环境上的动作级代授权。讨论中读取过该源码版本，但不整体照搬其策略。
 - [Codex 根会话授权依据](<https://github.com/openai/codex/blob/ddd1812a51f4aded35c3ec5446672474d5cb546b/codex-rs/guardian-context/src/authorization.rs>)：真实用户指令、来源标记，以及跨委派时仍有范围的授权。
 - [OpenClaw Agent 边界](<https://docs.openclaw.ai/concepts/multi-agent.md>)与[记忆机制](<https://docs.openclaw.ai/concepts/memory.md>)：稳定 Agent 身份、分开的会话，以及有意组织的记忆。

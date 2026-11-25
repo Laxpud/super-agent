@@ -5,7 +5,7 @@
 | 主题 | 内容 |
 | --- | --- |
 | [目标、身份与角色](scope-and-roles.md) | 定制范围、Bot 与 Session 的区别、Assistant 等角色的职责。 |
-| [统一入口与跨渠道对话](agent-studio-entry-and-conversation.md) | 独立入口、隐式 Session、GUI 与飞书共用对话和话题、待处理事项及首版模型设置。 |
+| [统一入口与跨渠道对话](agent-studio-entry-and-conversation.md) | 独立入口、隐式 Session、GUI 与飞书共用对话、并发与中断、文字确认及首版模型设置。 |
 | [项目管理与执行接续](project-lifecycle.md) | 立项、负责人变更、当前管理权与执行归属、共享资源并发修改。 |
 | [交互、渠道与交付](interaction-and-delivery.md) | 指令来源、跨渠道接续、更正与撤销、自主性、汇报和交付。 |
 | [模型配置、调度与额度](model-selection.md) | 模型组合、角色边界、选择规则、已表达的偏好、额度停止与恢复。 |

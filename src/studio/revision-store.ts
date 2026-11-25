@@ -26,6 +26,7 @@ export interface StudioRevisionReservation extends StudioRevisionRecord {
   state: 'running'
   instruction: string
   previousText: string
+  basedOnRequest?: boolean
 }
 
 export interface StudioRevisionArtifact extends StudioRevisionResult { id: string; workerSessionId: string }
@@ -86,7 +87,7 @@ interface RevisionRow {
   result_event_seq?: number | null
 }
 
-interface Origin { requestId: string; messageId: string; text: string }
+interface Origin { requestId: string; messageId: string; text: string; fromRequest?: boolean }
 
 type Row = Record<string, SQLOutputValue>
 const id = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.isWellFormed() && !value.includes('\0')
@@ -116,7 +117,7 @@ export class StudioRevisionStore {
         || !id(workerSessionId) || !id(work?.id) || (work.type !== 'draft' && work.type !== 'study' && work.type !== 'work')) {
         throw new StudioRevisionError('REVISION_INVALID_INPUT', 'Invalid Studio revision coordinates')
       }
-      if (!this.ownerCurrent(conversationId, ownerSessionId)) {
+      if (!this.ownerCurrent(conversationId, ownerSessionId, requestId)) {
         throw new StudioRevisionError('REVISION_STALE_OWNER', 'This Session no longer owns the Studio conversation')
       }
       if (this.db.prepare('SELECT 1 FROM agent_studio_revision WHERE conversation_id = ? AND request_id = ?').get(conversationId, requestId)) {
@@ -126,7 +127,7 @@ export class StudioRevisionStore {
       if (!source) throw new StudioRevisionError('REVISION_SOURCE_NOT_CURRENT', 'This is not a live Studio topic reply from this Session')
       const origin = this.eligibleOrigin(conversationId, work)
       if (!origin) throw new StudioRevisionError('REVISION_WORK_NOT_ELIGIBLE', 'The original task is not eligible for a text revision in this conversation')
-      if (!this.isAncestor(conversationId, requestId, origin.requestId)) {
+      if (!this.isAncestor(conversationId, requestId, origin.requestId) && !this.redirectedOrigin(requestId, origin.requestId, work)) {
         throw new StudioRevisionError('REVISION_WRONG_TOPIC', 'This topic does not reply to the original owner request')
       }
       if (this.workerBound(workerSessionId)) throw new StudioRevisionError('REVISION_WORKER_BOUND', 'This Worker Session is already bound')
@@ -151,7 +152,7 @@ export class StudioRevisionStore {
         .get(randomUUID(), conversationId, ownerSessionId, requestId, messageId, workerSessionId, work.type, work.id,
           origin.requestId, origin.messageId, base?.id ?? null, Date.now()) as unknown as RevisionRow | undefined
       if (!row) throw new Error('Studio revision reservation did not write a row')
-      return { ...record(row), state: 'running', instruction: source, previousText }
+      return { ...record(row), state: 'running', instruction: source, previousText, ...(!base && origin.fromRequest && { basedOnRequest: true }) }
     })
   }
 
@@ -234,19 +235,31 @@ export class StudioRevisionStore {
       .get(workerSessionId) as unknown as RevisionRow | undefined
   }
 
-  private ownerCurrent(conversationId: string, ownerSessionId: string): boolean {
-    // Assistant replacement changes only the logical pointer. Project authority follows the current epoch, not the origin Leader.
+  private ownerCurrent(conversationId: string, ownerSessionId: string, requestId: string): boolean {
+    // 并行路由只在宿主给这条在途输入分配了确切的 Session 时有效。项目仍跟随现任 Leader 的管理版本。
     return conversationId === ASSISTANT_CONVERSATION
       ? !!this.db.prepare(`SELECT 1 FROM agent_studio_assistant a JOIN studio_assistant_binding b USING (session_id)
-        WHERE a.singleton = 1 AND a.session_id = ?`).get(ownerSessionId)
+        WHERE a.singleton = 1 AND a.session_id = ?1
+        UNION ALL SELECT 1 FROM agent_studio_parallel_turn a JOIN studio_assistant_binding b USING (session_id)
+        WHERE a.session_id = ?1 AND a.request_id = ?2 LIMIT 1`).get({ '1': ownerSessionId, '2': requestId })
       : !!this.db.prepare(`SELECT 1 FROM studio_project p JOIN studio_project_binding b USING (project_id, management_epoch)
         WHERE p.project_id = ? AND b.leader_session_id = ?`).get(conversationId, ownerSessionId)
   }
 
-  private liveSource(conversationId: string, ownerSessionId: string, requestId: string): string | undefined {
-    const source = this.db.prepare(`SELECT text FROM agent_studio_message WHERE conversation_id = ? AND run_session_id = ? AND id = ?
-      AND role = 'user' AND status = 'running' AND topic_id IS NOT NULL AND reply_to IS NOT NULL`).get(conversationId, ownerSessionId, requestId)
+  private liveSource(conversationId: string, ownerSessionId: string, requestId: string, handedOff = false): string | undefined {
+    const source = this.db.prepare(`SELECT text FROM agent_studio_message m WHERE conversation_id = ? AND run_session_id = ? AND id = ?
+      AND role = 'user' AND (status = 'running' OR (? AND status = 'completed'))
+      AND ((topic_id IS NOT NULL AND reply_to IS NOT NULL) OR EXISTS
+        (SELECT 1 FROM agent_studio_route_control c WHERE c.request_id = m.id AND c.kind = 'redirect'))
+      AND NOT EXISTS (SELECT 1 FROM agent_studio_route_control c WHERE c.target_id = m.id)`).get(conversationId, ownerSessionId, requestId, +handedOff)
     return text(source?.text) ? source.text : undefined
+  }
+
+  /** 无话题的明确改向也必须由宿主登记，目标只能是原请求或该工作的既有修订。 */
+  private redirectedOrigin(requestId: string, originId: string, work: StudioRevisionWork): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM agent_studio_route_control c WHERE c.request_id = ? AND c.kind = 'redirect' AND
+      (c.target_id = ? OR EXISTS (SELECT 1 FROM agent_studio_revision r WHERE r.request_id = c.target_id
+        AND r.origin_request_id = ? AND r.work_id = ? AND r.work_type = ?))`).get(requestId, originId, originId, work.id, work.type)
   }
 
   private workerBound(sessionId: string): boolean {
@@ -280,16 +293,17 @@ export class StudioRevisionStore {
 
   private reservationCurrent(row: RevisionRow): boolean {
     return row.state === 'running' && row.message_id === studioOwnerMessageId(row.request_id)
-      && this.ownerCurrent(row.conversation_id, row.owner_session_id)
-      && this.liveSource(row.conversation_id, row.owner_session_id, row.request_id) !== undefined && this.originCurrent(row)
+      && this.ownerCurrent(row.conversation_id, row.owner_session_id, row.request_id)
+      && this.liveSource(row.conversation_id, row.owner_session_id, row.request_id, true) !== undefined && this.originCurrent(row)
   }
 
   /** Read only completed standalone text results; the protection checks apply before returning any native result body. */
   private eligibleOrigin(conversationId: string, work: StudioRevisionWork): Origin | undefined {
     let row: Row | undefined
     if (conversationId === ASSISTANT_CONVERSATION && work.type === 'draft') {
-      row = this.db.prepare(`SELECT d.source_request_id, d.source_message_id, d.result_text, d.result_event_seq
-        FROM studio_draft_task d WHERE d.task_id = ? AND d.state = 'completed'
+      row = this.db.prepare(`SELECT d.source_request_id, d.source_message_id, d.state, d.request_text, d.result_text, d.result_event_seq
+        FROM studio_draft_task d WHERE d.task_id = ? AND (d.state = 'completed' OR EXISTS
+          (SELECT 1 FROM agent_studio_route_control c WHERE c.target_id = d.source_request_id AND c.kind = 'redirect'))
         AND NOT EXISTS (SELECT 1 FROM studio_draft_preference p WHERE p.task_id = d.task_id)`).get(work.id)
     } else if (conversationId === ASSISTANT_CONVERSATION && work.type === 'study') {
       row = this.db.prepare(`SELECT s.source_request_id, s.source_message_id, step.result_json
@@ -308,6 +322,9 @@ export class StudioRevisionStore {
         .get(work.id, conversationId)
     }
     if (!row || !id(row.source_request_id) || row.source_message_id !== studioOwnerMessageId(row.source_request_id)) return
+    if (work.type === 'draft' && row.state !== 'completed') {
+      return text(row.request_text) ? { requestId: row.source_request_id, messageId: row.source_message_id, text: row.request_text, fromRequest: true } : undefined
+    }
     const result = work.type === 'draft' ? { text: row.result_text, eventSeq: row.result_event_seq } : this.nativeResult(row.result_json)
     if (!text(result?.text) || !eventSeq(result?.eventSeq)) return
     return { requestId: row.source_request_id, messageId: row.source_message_id, text: result.text }

@@ -6,6 +6,7 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import s from '@deepseek-ai/schemastery'
 import { z } from 'zod'
+import { startStudioRouterWork } from '../studio/router-work.ts'
 import type { Advice, AdvisorRoute } from './advisor-store.ts'
 import { DRAFT_TIMEOUT_MS, ownerRequest, type StudioAssistant } from './assistant.ts'
 import { ADVISOR_CONSULT as CONSULT, ADVISOR_READ as READ } from './result-tool-names.ts'
@@ -140,6 +141,16 @@ export class StudioAdvisor {
           const { advice, created } = unwrap(this.store.advice.reserve({ ...source, ...parsed.data, requesterSessionId: agent.id,
             role, route, toolCallId: exec.callId }))
           if (!created) return adviceOutput(advice)
+          // Assistant 的咨询只登记一次，结果按原请求回传。普通原生会话和 Leader 保持原流程。
+          try {
+            if (startStudioRouterWork(agent, { id: advice.adviceId, kind: 'advice' }, async workerSignal => adviceOutput(await this.run(agent, advice, cwd, workerSignal)).receipt)) {
+              ;(exec as typeof exec & { concludeTurn?(): void }).concludeTurn?.()
+              return adviceOutput(advice)
+            }
+          } catch (error) {
+            this.store.advice.settle(advice, undefined, 'ROUTER_HANDOFF_FAILED')
+            throw error
+          }
           const running = this.run(agent, advice, cwd, signal)
           this.active.add(running)
           try { return adviceOutput(await running) } finally { this.active.delete(running) }

@@ -459,9 +459,11 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/studio/source.ts` | Reserved native Session identities and exact attribution for a Studio owner input or supplemental context |
 | `src/studio/store.ts` | Holds the shared SQLite timeline, topics, model defaults, Session record index, pending states and Feishu delivery claims; no distinct per-channel conversation |
 | `src/studio/domain.ts` | Reads the existing project, execution and hold ledgers to resolve the current Leader, provenance and owner work without changing its authority |
-| `src/studio/sessions.ts` | Delivers one native turn per Studio input, selects the current role, captures visible replies and opens source logs read-only |
-| `src/studio/revision-store.ts` | Reserves and settles a new text revision on the original task after verifying the owner reply and its native management scope |
-| `src/studio/pending.ts` | Persists a question and accepts one exact answer while its owner request remains live |
+| `src/studio/sessions.ts` | Runs independent Assistant turns without sharing a live native Session, applies scoped interruption, and anchors background results and source records to their original input |
+| `src/studio/router-work.ts` | Hands an already registered task from its exact Assistant turn to the Host's independently managed background execution |
+| `src/studio/revision-store.ts` | Reserves and settles a new text revision on the original task after verifying the owner reply or redirection and its native management scope |
+| `src/studio/owner-text.ts` | Recognizes owner text queries, scoped decisions, and route controls without granting new authority from a model |
+| `src/studio/pending.ts` | Persists an exact Host confirmation and accepts a single current decision through text or buttons |
 | `src/studio/models.ts` | Builds the Studio role catalog and verifies concrete model and reasoning-effort combinations |
 | `src/studio/service.ts` | Joins Web and Feishu intake to one conversation, task and pending-item API |
 | `src/studio/http.ts` | Browser-owner-authenticated Studio operations with validated input and bounded responses |

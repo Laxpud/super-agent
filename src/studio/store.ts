@@ -82,6 +82,13 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS agent_studio_timeline ON agent_studio_message(conversation_id, topic_id, sequence);
   CREATE UNIQUE INDEX IF NOT EXISTS agent_studio_inbound ON agent_studio_message(feishu_generation, feishu_id) WHERE channel = 'feishu';
   CREATE INDEX IF NOT EXISTS agent_studio_thread ON agent_studio_message(feishu_generation, feishu_thread_id, sequence);
+  CREATE TABLE IF NOT EXISTS agent_studio_parallel_turn (
+    request_id TEXT PRIMARY KEY REFERENCES agent_studio_message(id), session_id TEXT NOT NULL UNIQUE
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS agent_studio_route_control (
+    target_id TEXT PRIMARY KEY REFERENCES agent_studio_message(id), request_id TEXT NOT NULL UNIQUE REFERENCES agent_studio_message(id),
+    kind TEXT NOT NULL CHECK (kind IN ('stop', 'redirect'))
+  ) STRICT;
   CREATE TABLE IF NOT EXISTS agent_studio_session (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT NOT NULL UNIQUE, conversation_id TEXT NOT NULL, role TEXT NOT NULL, created_at INTEGER NOT NULL
@@ -251,6 +258,15 @@ function quoteSnippet(text: string): string {
   return prefix.isWellFormed() ? prefix : prefix.slice(0, -1)
 }
 
+/** 网页保留一条可直接回复的确认消息；它与飞书卡片及待处理列表是一项决定，而不是新请求。 */
+function confirmationNotice(item: StudioPending): string {
+  const status = item.state === 'pending' ? '待你确认'
+    : item.state === 'expired' ? '确认事项已失效' : item.answer === item.options[0] ? '已记录批准' : '已记录拒绝'
+  const hint = item.state === 'pending' ? '\n\n可直接回复本条消息说「批准」或「拒绝」。' : ''
+  return `${status} · ${item.requester}\n${item.title}${item.detail ? `\n\n${item.detail}` : ''}${hint}`
+    .slice(0, STUDIO_TEXT_LIMIT).toWellFormed()
+}
+
 /** Conversations and their outbox share the caller's connection, but own their synchronous write transactions. */
 export class StudioStore {
   constructor(private readonly db: DatabaseSync, private readonly assertActive: () => void) {
@@ -383,13 +399,29 @@ export class StudioStore {
     return page(rows, decodeMessage, row => row.sequence, true)
   }
 
-  startMessage(id: string, sessionId: string): void {
+  startMessage(id: string, sessionId: string, parallel = false): void {
     this.write(() => {
       requireId(sessionId, 'run session ID')
       const { changes } = this.db.prepare(`UPDATE agent_studio_message SET status = 'running', run_session_id = ?
         WHERE id = ? AND status = 'queued'`).run(sessionId, id)
       if (!changes) throw new StudioStoreError('MESSAGE_STATUS_CONFLICT', 'Studio message is not queued')
+      // 并行 Session 只拥有这条在途输入，不替换 Assistant 的主 Session 指针或取得历史输入的权限。
+      if (parallel) this.db.prepare('INSERT INTO agent_studio_parallel_turn VALUES (?, ?)').run(id, sessionId)
     })
+  }
+
+  /** 将确切的较新用户指令登记到被控制的原轮次，拒绝跨对话、重放和已知迟到的控制。 */
+  recordRouteControl(targetId: string, requestId: string, kind: 'stop' | 'redirect'): boolean {
+    return this.write(() => this.db.prepare(`INSERT INTO agent_studio_route_control (target_id, request_id, kind)
+      SELECT t.id, s.id, ? FROM agent_studio_message t JOIN agent_studio_message s ON s.id = ?
+      WHERE t.id = ? AND s.conversation_id = t.conversation_id AND s.role = 'user' AND t.role = 'user'
+        AND s.sequence > t.sequence AND s.created_at >= t.created_at ON CONFLICT DO NOTHING`)
+      .run(kind, requestId, targetId).changes === 1)
+  }
+
+  routeControlled(id: string): boolean {
+    this.assertActive()
+    return !!this.db.prepare('SELECT 1 FROM agent_studio_route_control WHERE target_id = ?').get(id)
   }
 
   /** Bind native provenance once; recording it after completion is allowed, but changing it is not. */
@@ -412,6 +444,11 @@ export class StudioStore {
         .run(status, error ?? null, id)
       if (!changes) throw new StudioStoreError('MESSAGE_STATUS_CONFLICT', 'Studio message is not live')
     })
+  }
+
+  /** 原生前台结束后，只有仍归属这条请求的受管工作可保留并行 Session，直到实际清理。 */
+  endParallelTurn(id: string): void {
+    this.write(() => this.db.prepare('DELETE FROM agent_studio_parallel_turn WHERE request_id = ?').run(id))
   }
 
   /** Use the Studio input for addressing, not the Session that supplied the new native output. */
@@ -444,10 +481,14 @@ export class StudioStore {
   recover(): void {
     this.write(() => {
       this.db.exec(`UPDATE agent_studio_message SET status = 'interrupted' WHERE status IN ('queued', 'running');
+        DELETE FROM agent_studio_parallel_turn;
         UPDATE agent_studio_feishu_outbox SET state = 'unconfirmed' WHERE state = 'claimed'`)
       const expired = this.db.prepare(`UPDATE agent_studio_pending SET state = 'expired', answer = NULL, answered_by = NULL
-        WHERE state = 'pending' AND kind IN ('confirmation', 'question') RETURNING id`).all()
-      for (const { id } of expired) this.enqueuePendingUpdate(id as string)
+        WHERE state = 'pending' AND kind IN ('confirmation', 'question') RETURNING *`).all() as unknown as PendingRow[]
+      for (const row of expired) {
+        this.updateConfirmationNotice(decodePending(row))
+        this.enqueuePendingUpdate(row.id)
+      }
     })
   }
 
@@ -501,10 +542,17 @@ export class StudioStore {
         .run(item.id, item.kind, item.conversationId, item.topicId ?? null, item.messageId ?? null, item.taskId ?? null, item.requester,
           item.title, item.detail, JSON.stringify(item.options), Number(item.acceptsText), item.mobile, item.state, item.createdAt,
           item.answer ?? null, item.answeredBy ?? null)
+      if (item.kind === 'confirmation' && item.messageId) {
+        const request = this.messageRow(item.messageId, item.conversationId)
+        if (request?.role === 'user') this.db.prepare(`INSERT INTO agent_studio_message
+          (id, conversation_id, role, channel, text, created_at, topic_id, reply_to) VALUES (?, ?, ?, 'studio', ?, ?, ?, ?)`)
+          .run(item.id, item.conversationId, item.conversationId === ASSISTANT_CONVERSATION ? 'assistant' : 'leader',
+            confirmationNotice(item), item.createdAt, request.topic_id, request.id)
+      }
       const binding = this.binding()
       if (binding && item.createdAt >= binding.cutover) {
-        // Only an Assistant thread can have a Feishu anchor. Project cards are standalone notices, not mirrored project turns.
-        const parent = item.conversationId === ASSISTANT_CONVERSATION ? item.messageId ?? item.topicId : undefined
+        // 重要确认和实际阻塞必须在私聊主聊天可见，不依赖原话题或其投递回执。
+        const parent = item.kind === 'question' && item.conversationId === ASSISTANT_CONVERSATION ? item.messageId ?? item.topicId : undefined
         this.enqueue(binding.generation, 'pending', null, item.id, parent)
       }
       return decodePending(this.pendingRow(item.id)!)
@@ -515,6 +563,19 @@ export class StudioStore {
     this.assertActive()
     const row = this.pendingRow(id)
     return row && decodePending(row)
+  }
+
+  /** 文字确认必须找全当前候选，不能因为分页截断就把多个匹配误判成唯一。 */
+  openConfirmations(): StudioPending[] {
+    this.assertActive()
+    return (this.db.prepare(`SELECT * FROM agent_studio_pending WHERE state = 'pending' AND kind = 'confirmation'
+      ORDER BY sequence DESC`).all() as unknown as PendingRow[]).map(decodePending)
+  }
+
+  recentDecisions(): StudioPending[] {
+    this.assertActive()
+    return (this.db.prepare(`SELECT * FROM agent_studio_pending WHERE state <> 'pending' AND kind = 'confirmation'
+      ORDER BY sequence DESC LIMIT ?`).all(STUDIO_PAGE_SIZE) as unknown as PendingRow[]).map(decodePending)
   }
 
   pendingCount(): number {
@@ -546,9 +607,16 @@ export class StudioStore {
       const row = this.db.prepare(`UPDATE agent_studio_pending SET state = ?, answer = ?, answered_by = ?
         WHERE id = ? AND state = 'pending' RETURNING *`).get(status, answer ?? null, answeredBy ?? null, id) as unknown as PendingRow | undefined
       if (!row) return undefined
+      const item = decodePending(row)
+      this.updateConfirmationNotice(item)
       this.enqueuePendingUpdate(id)
-      return decodePending(row)
+      return item
     })
+  }
+
+  private updateConfirmationNotice(item: StudioPending): void {
+    if (item.kind === 'confirmation') this.db.prepare("UPDATE agent_studio_message SET text = ? WHERE id = ? AND channel = 'studio'")
+      .run(confirmationNotice(item), item.id)
   }
 
   /** Reconnecting the same scope preserves its cutover. A changed or rebound scope starts a fresh delivery generation. */
@@ -604,15 +672,17 @@ export class StudioStore {
       const binding = this.binding(scope)
       if (!binding) return undefined
       const candidate = this.db.prepare(`SELECT d.*,
-          COALESCE(CASE WHEN parent.feishu_generation = d.generation THEN parent.feishu_id END, parent_send.remote_id) AS parent_remote,
+          COALESCE(CASE WHEN parent.feishu_generation = d.generation THEN parent.feishu_id END, parent_send.remote_id, parent_card.remote_id) AS parent_remote,
           card.remote_id AS card_remote
         FROM agent_studio_feishu_outbox d
         LEFT JOIN agent_studio_message parent ON parent.id = d.parent_message_id
         LEFT JOIN agent_studio_feishu_outbox parent_send ON parent_send.message_id = parent.id AND parent_send.generation = d.generation
+        LEFT JOIN agent_studio_feishu_outbox parent_card ON parent_card.pending_id = parent.id AND parent_card.generation = d.generation AND parent_card.kind = 'pending'
         LEFT JOIN agent_studio_feishu_outbox card ON d.kind = 'pending-update' AND card.pending_id = d.pending_id
           AND card.kind = 'pending' AND card.generation = d.generation
         WHERE d.generation = ? AND d.state = 'queued'
-          AND COALESCE(parent_send.state, '') NOT IN ('queued', 'claimed') AND COALESCE(card.state, '') NOT IN ('queued', 'claimed')
+          AND COALESCE(parent_send.state, '') NOT IN ('queued', 'claimed') AND COALESCE(parent_card.state, '') NOT IN ('queued', 'claimed')
+          AND COALESCE(card.state, '') NOT IN ('queued', 'claimed')
         ORDER BY d.sequence LIMIT 1`)
       while (true) {
         const row = candidate.get(binding.generation) as unknown as CandidateRow | undefined

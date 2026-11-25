@@ -2,15 +2,16 @@
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { documentIntent } from '../managed-worker/document-intent.ts'
 import type { ManagedWorkerStore } from '../managed-worker/store.ts'
 import { confirmStudioModel, studioModelOptions } from './models.ts'
 import { StudioError } from './pending.ts'
-import { ASSISTANT_CONVERSATION, type FeishuState, type StudioPending, type StudioSend, type StudioSessionRecord, type StudioSettings } from './protocol.ts'
+import { asksForActiveWork, asksForPending, asksForProjects, confirmationStatusQuery, namesConfirmation, readTextDecision, readRouteControl,
+  refersToThisConfirmation } from './owner-text.ts'
+import { ASSISTANT_CONVERSATION, STUDIO_TEXT_LIMIT, type FeishuState, type StudioMessage, type StudioPending, type StudioSend, type StudioSessionRecord, type StudioSettings } from './protocol.ts'
 import { StudioSessions } from './sessions.ts'
 import type { StudioFeishuInput, StudioFeishuPort } from './feishu.ts'
 import type { StudioHttpOperations } from './http.ts'
-
-const pendingQuestion = /^(?:还有什么(?:需要我|要我|待我)处理(?:的吗|的|吗)?|还有什么待办(?:吗)?|待我处理|what(?:'s| is) (?:waiting for|pending for) me|\/studio-pending)[?？。.!！\s]*$/iu
 
 /** Offer the same Assistant and pending state to the authorized Web and Feishu entry points. */
 export class StudioService {
@@ -32,11 +33,130 @@ export class StudioService {
     this.conversation(input.conversationId)
     const { message, created } = this.store.addUser({ ...input, channel: 'gui' })
     if (created) {
-      if (pendingQuestion.test(message.text.trim())) this.publishPendingSummary(message.id)
-      else this.sessions.enqueue(message)
+      this.ownerInput(message, message.replyTo ? this.store.pendingItem(message.replyTo) : undefined)
       this.wake()
     }
     return this.store.message(message.conversationId, message.id) ?? message
+  }
+
+  /** 两个可信入口共用这一分流。先处理读查询、确认与定向控制，不等任何模型轮次。 */
+  private ownerInput(message: StudioMessage, direct?: StudioPending): void {
+    const text = message.text.trim()
+    if (asksForPending.test(text)) { this.publishPendingSummary(message.id); return }
+    if (message.conversationId === ASSISTANT_CONVERSATION && asksForProjects.test(text)) {
+      const projects = this.domain.studioProjects()
+      this.reply(message.id, projects.length === 0 ? '目前没有登记的项目。'
+        : [`目前有 ${projects.length} 个项目：`, ...projects.slice(0, 50).map(item => `- ${item.name}（${item.id}）`),
+          ...(projects.length > 50 ? ['这里只列出前 50 项。'] : [])].join('\n'))
+      return
+    }
+    if (message.conversationId === ASSISTANT_CONVERSATION && asksForActiveWork.test(text)) {
+      const active = this.sessions.activeWork()
+      this.reply(message.id, active.length ? `Assistant 当前正在处理：\n${active.map(item => `- ${item}`).join('\n')}`
+        : 'Assistant 当前没有在处理的请求。')
+      return
+    }
+    const query = confirmationStatusQuery(text)
+    if (query) { this.publishDecisions(message.id, query.target, direct); return }
+    const decision = this.textDecision(message, direct)
+    if (decision !== undefined) { this.reply(message.id, decision); return }
+    const control = readRouteControl(text)
+    const related = this.sessions.relatedWork(message)
+    const exact = control?.target && /^(?:文档(?:任务)?\s*|document(?: task)?\s+)?([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/iu.exec(control.target)?.[1]
+    const intent = documentIntent(text)
+    const document = exact || (related?.type === 'document' && (intent || !control?.target || /^(?:文档|文档任务|该文档|这(?:份|个)文档)$/u.test(control.target)) ? related.id : undefined)
+    const nextScope = document && (intent ?? (control?.kind === 'redirect' ? documentIntent(text.replace(/^.*?(?:改为|改成|调整为)\s*/u, '')) : undefined))
+    if (document && nextScope && nextScope.kind === 'narrow') {
+      const result = this.domain.narrowStudioDocument(document, message.id, nextScope.keepLines)
+      if (result.ok) this.reply(message.id, `已收紧这项文档任务的写入权限（授权版本 ${result.value.authorizationVersion}），原许可不再有效。没有写入文档。`)
+      else if (result.reason === 'STALE_AUTHORIZATION' || result.reason === 'TASK_NOT_FOUND') {
+        this.reply(message.id, `未改变这项写入权限（${result.reason}）。请核对当前任务。`)
+      } else {
+        // 能定位到收紧意图，但不能核实精确子集时，先拦住原范围的后续写入。
+        const held = this.domain.pauseStudioDocument(document, `agent-studio:${message.id}`)
+        this.reply(message.id, held.ok ? `尚未应用你指定的范围（${result.reason}）。已暂停这项任务的后续写入，原许可不能继续使用。`
+          : `未能确认收紧范围或暂停写入（${result.reason} / ${held.reason}）；请核对该任务。`)
+      }
+      return
+    }
+    if (document && nextScope && nextScope.kind === 'pause') {
+      const paused = this.domain.pauseStudioDocument(document, `agent-studio:${message.id}`)
+      this.reply(message.id, paused.ok ? `已暂停这项文档任务的后续写入（授权版本 ${paused.value.authorizationVersion}）。不会撤回已发生的动作。`
+        : `没有确认该任务已暂停（${paused.reason}），请核对状态。`)
+      return
+    }
+    if (control) {
+      const result = this.sessions.control(message, control)
+      if (result?.reply) { this.reply(message.id, result.reply); return }
+      if (result?.redirectFrom) { this.sessions.enqueue(message, result.redirectFrom); return }
+      if (control.kind === 'stop') {
+        if (document) {
+          const paused = this.domain.pauseStudioDocument(document, `agent-studio:${message.id}`)
+          if (paused.ok || paused.reason !== 'TASK_NOT_FOUND') {
+            this.reply(message.id, paused.ok ? `已暂停这项文档任务的后续写入（授权版本 ${paused.value.authorizationVersion}）。不会撤回已发生的动作。`
+              : `没有确认该任务已暂停（${paused.reason}），请核对状态。`)
+            return
+          }
+        }
+        this.reply(message.id, '没有唯一对应的在途事项；没有停止任何工作。请直接回复相关消息，或说出任务名称与动作。')
+        return
+      }
+    }
+    this.sessions.enqueue(message)
+  }
+
+  private reply(id: string, text: string): void {
+    this.store.addReply(id, text)
+    this.store.finishMessage(id, 'completed')
+  }
+
+  private decisionsNamed(target: string): StudioPending[] {
+    const exact = this.store.pendingItem(target.replace(/^[#＃]/u, ''))
+    if (exact?.kind === 'confirmation') return [exact]
+    return [...this.store.openConfirmations(), ...this.store.recentDecisions()].filter(item => namesConfirmation(target, item,
+      item.conversationId === ASSISTANT_CONVERSATION ? undefined : this.domain.studioProject(item.conversationId)?.name))
+  }
+
+  private describeDecision(item: StudioPending): string {
+    return item.state === 'pending' ? '待你确认' : item.state === 'expired' ? '已失效'
+      : item.answer === item.options[0] ? '已记录批准（不等于动作已执行）' : '已记录拒绝'
+  }
+
+  private publishDecisions(id: string, target: string, direct?: StudioPending): void {
+    const items = target ? this.decisionsNamed(target) : direct?.kind === 'confirmation' ? [direct]
+      : this.store.recentDecisions().slice(0, 10)
+    if (!items.length) { this.reply(id, target ? '没有找到对应的确认事项。' : '目前没有已处理的确认事项。'); return }
+    this.reply(id, items.slice(0, 10).map(item => `${item.title}（${item.id}）：${this.describeDecision(item)}${items.length === 1 && item.detail ? `\n${item.detail}` : ''}`)
+      .join('\n').slice(0, STUDIO_TEXT_LIMIT).toWellFormed())
+  }
+
+  /** 只能用认证用户的原文确定决定与对象。不能把其他文字、模型解释或旧答复当成当前授权。 */
+  private textDecision(message: StudioMessage, direct?: StudioPending): string | undefined {
+    const parsed = readTextDecision(message.text)
+    if (!parsed) {
+      return direct?.kind === 'confirmation' && /^(?:好|好的|可以|ok)[。！!\s]*$/iu.test(message.text.trim())
+        ? '仍待确认：这条文字没有批准事项。请明确说「批准」或「拒绝」。' : undefined
+    }
+    const anchor = direct?.kind === 'confirmation' ? direct : undefined
+    const mentionsAnchor = anchor && (refersToThisConfirmation(parsed.target) || namesConfirmation(parsed.target, anchor,
+      anchor.conversationId === ASSISTANT_CONVERSATION ? undefined : this.domain.studioProject(anchor.conversationId)?.name))
+    const matches = anchor ? mentionsAnchor ? [anchor] : [] : this.decisionsNamed(parsed.target)
+    if (!anchor && !matches.length && parsed.ambiguous && parsed.target) return undefined
+    if (matches.length !== 1) return matches.length > 1
+      ? `没有作出决定：有多个匹配事项。请直接回复其中一条，或说清是哪项。\n${matches.slice(0, 6).map(item => `${item.title}（${item.id}）`).join('\n')}`
+      : '没有作出决定：请明确是哪一项确认，可直接回复对应的确认消息。'
+    const item = matches[0]!
+    if (item.state !== 'pending') return `没有再次作出决定：${item.title}，${this.describeDecision(item)}。`
+    if (message.createdAt < item.createdAt) return '这条消息早于当前确认，未作出决定。'
+    const selected = item.options[parsed.approve ? 0 : 1]
+    if (item.options.length !== 2 || selected === undefined) return '该事项没有可对应的批准或拒绝选项。'
+    try {
+      const settled = this.sessions.answer(item.id, selected, message.channel === 'feishu' ? 'feishu' : 'gui', 'text')
+      return `${this.describeDecision(settled)}：${settled.title}。`
+    } catch (error) {
+      if (error instanceof StudioError) return '未作出决定：该事项已经处理、失效或当前不可确认。'
+      throw error
+    }
   }
 
   /** Refresh the status of managed blockers without invoking a model, changing a job, or clearing a hold. */
@@ -52,10 +172,11 @@ export class StudioService {
     const count = this.store.pendingCount()
     const items = this.store.pending().items.filter(item => item.state === 'pending').slice(0, 10)
     const summary = !count ? '目前没有待你处理的事项。' : [`还有 ${count} 项待你处理：`, ...items.map((item, index) =>
-      `${index + 1}. ${item.requester} — ${item.title.slice(0, 160)}${item.taskId ? `（任务 ${item.taskId}）` : ''}${item.mobile === 'unsupported' ? ' · 仍待确认，请到 Studio 处理' : ''}`),
-    ...(count > items.length ? ['更多事项可在 Studio 的「待我处理」查看。'] : [])].join('\n')
-    this.store.addReply(requestId, summary)
-    this.store.finishMessage(requestId, 'completed')
+      `${index + 1}. ${item.requester} — ${item.title.slice(0, 160)}${item.taskId ? `（任务 ${item.taskId}）` : ''}`
+      + (item.kind === 'confirmation' ? ` · 待你确认（${item.id}）` : '')),
+    ...(items.some(item => item.kind === 'confirmation') ? ['可直接回复对应的确认消息说「批准」或「拒绝」，也可以在私聊说清决定和事项。'] : []),
+    ...(count > items.length ? ['这里只显示前 10 项；可说出要查询的确切事项。'] : [])].join('\n')
+    this.reply(requestId, summary)
   }
 
   /** Clearing a block records the owner's checked condition on that exact active block. It never dispatches. */
@@ -133,8 +254,8 @@ export class StudioService {
     const conversationId = ASSISTANT_CONVERSATION
     const parent = anchors.map(id => this.store.feishuMessage(input.scope, id)).find(value => value !== undefined)
       ?? (input.threadId ? this.store.feishuThread(input.scope, input.threadId) : undefined)
-    if (item?.conversationId !== undefined && item.conversationId !== conversationId) {
-      // The question can resume its live Leader, but project messages are never added to Assistant's timeline.
+    if (item?.kind === 'question' && item.conversationId !== conversationId) {
+      // 兼容既有的问题卡片；项目消息不加入 Assistant 的时间线。
       if (item.mobile === 'topic' && item.state === 'pending') {
         try { this.sessions.answer(item.id, input.text, 'feishu', 'topic') }
         catch (error) { if (!(error instanceof StudioError)) throw error }
@@ -142,22 +263,23 @@ export class StudioService {
       return Promise.resolve()
     }
     if ((anchors.length || input.threadId) && !item && !parent) return Promise.resolve()
-    const replyTo = item?.messageId ?? parent?.id
+    const replyTo = item?.conversationId === conversationId
+      ? (item.kind === 'confirmation' && this.store.message(conversationId, item.id) ? item.id : item.messageId) ?? parent?.id
+      : parent?.id
     const { message, created } = this.store.addUser({ requestId: input.id, conversationId, channel: 'feishu', text: input.text,
       createdAt: input.sourceTimeMs, ...(replyTo ? { replyTo } : {}), feishu: { scope: input.scope, id: input.id,
         ...(input.threadId ? { threadId: input.threadId } : {}) } })
     if (!created) return Promise.resolve()
-    if (item) {
+    if (item?.kind === 'question') {
+      // 旧记录里的澄清仍可在绑定的原卡片补充；新对话不会再创建这类阻塞问答。
       let accepted = false
-      // Plain text (even an affirmative answer) cannot approve a decision. It can only answer a scoped, live text question.
       if (item.mobile === 'topic' && item.state === 'pending') {
         try { this.sessions.answer(item.id, input.text, 'feishu', 'topic'); accepted = true }
         catch (error) { if (!(error instanceof StudioError)) throw error }
       }
-      if (!accepted) this.store.addReply(message.id, item.state === 'pending' ? '仍待确认：这条文字没有批准事项。请用有效卡片或在 Studio 处理。' : '这项事项已处理或失效。')
+      if (!accepted) this.store.addReply(message.id, '这项问题已处理或失效。')
       this.store.finishMessage(message.id, 'completed')
-    } else if (pendingQuestion.test(input.text.trim())) this.publishPendingSummary(message.id)
-    else this.sessions.enqueue(message)
+    } else this.ownerInput(message, item)
     this.wake()
     return Promise.resolve()
   }

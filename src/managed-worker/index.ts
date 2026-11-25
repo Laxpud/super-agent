@@ -379,7 +379,8 @@ export function apply(context: Context, config: Config): void {
       || isStudyTool(exec.name) || isLeaderTool(exec.name) || isAdvisorTool(exec.name)
       || exec.name === ASK_STUDIO_OWNER || exec.name === REVISE_STUDIO_TASK ? 'Studio tool denied: INVALID_EXECUTION' : undefined
     if (!ready(agent, role) || exec.parent !== undefined) return 'Studio tool denied: INVALID_EXECUTION'
-    if (exec.name === ASK_STUDIO_OWNER) return studio.sessions.canAsk(agent) ? undefined : 'Studio tool denied: INVALID_EXECUTION'
+    // 普通澄清用对话回答，不允许遗留同名工具重新开一个阻塞问答。
+    if (exec.name === ASK_STUDIO_OWNER) return 'Studio tool denied: INVALID_EXECUTION'
     if (exec.name === REVISE_STUDIO_TASK) return studio.sessions.canRevise(agent) ? undefined : 'Studio tool denied: INVALID_EXECUTION'
     if (studio.sessions.isExistingTaskReply(agent) && (exec.name === DRAFT_DELEGATE || exec.name === STUDY_DELEGATE
       || exec.name === RECORD_WORK || exec.name === PROPOSE_PROJECT)) {

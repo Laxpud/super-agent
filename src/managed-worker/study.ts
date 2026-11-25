@@ -3,6 +3,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { z } from 'zod'
+import { startStudioRouterWork } from '../studio/router-work.ts'
 import { DRAFT_TIMEOUT_MS, ownerRequest, type StudioAssistant } from './assistant.ts'
 import { STUDY_DELEGATE as DELEGATE_STUDY, STUDY_READ as READ_STUDY } from './result-tool-names.ts'
 import { DRAFT_TEXT_LIMIT, type ManagedResult, type ManagedWorkerStore } from './store.ts'
@@ -94,6 +95,16 @@ export class StudioStudy {
         const route = { cwd, model: { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) } }
         const { study, created } = unwrap(this.store.studies.create({ ...source, ...parsed.data, assistantSessionId: agent.id, toolCallId: exec.callId }))
         if (!created) return studyOutput(study)
+        // Studio 保留编排和原任务的关联，不在前台工具调用中等待所有调查与综合。
+        try {
+          if (startStudioRouterWork(agent, { id: study.taskId, kind: 'study' }, async workerSignal => studyOutput(await this.run(agent, study, route, workerSignal)).receipt)) {
+            ;(exec as typeof exec & { concludeTurn?(): void }).concludeTurn?.()
+            return studyOutput(study)
+          }
+        } catch (error) {
+          this.store.studies.stop(agent.id, study.taskId, 'ROUTER_HANDOFF_FAILED')
+          throw error
+        }
         const running = this.run(agent, study, route, signal)
         this.active.add(running)
         try { return studyOutput(await running) } finally { this.active.delete(running) }

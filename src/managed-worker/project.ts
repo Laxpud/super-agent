@@ -62,7 +62,7 @@ For work with a pinned project fact or prior result, dispatch only on an explici
 A work item linked to a managed document is handled by its document Worker. Do not dispatch it as text or interpret the link as authorization to edit. Use the saved document status and commit receipt; the owner can view the exact committed text in the native project work command.
 For an explicit technical consultation on this project, use studio_consult_advisor when available. An existing opinion can inform your judgment, but it is neither an owner request to record new work nor permission to dispatch it.
 Only the owner can create a project or change its Leader. If you no longer manage the project, report that rather than attempting to start work.
-In Agent Studio, use studio_ask_owner for specific missing information. The answer supplies information, not permission to act.`
+In Agent Studio, ask for missing information in your ordinary reply and end the turn. Do not treat a clarification as authorization or a pending confirmation.`
 
 interface CommandReceipt { kind: 'success' | 'error'; text: string }
 const denied = (reason: string): CommandReceipt => ({ kind: 'error', text: `Studio project control rejected: ${reason}.` })

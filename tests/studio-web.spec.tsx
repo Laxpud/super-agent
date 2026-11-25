@@ -273,7 +273,7 @@ it('opens a pending item’s context, serializes explicit answers, and keeps tex
   })
   await render(slots().main)
   await click(en.pending)
-  expect(document.body.textContent).toContain(en['mobile.unsupported'])
+  expect(document.body.textContent).toContain(en.decisionText)
   await click(en.source, node('.as-pending-item'))
   expect(app.requests.at(-1)).toMatchObject({ op: 'message', input: { conversationId: 'project-a', id: 'source-in-project' } })
   await back()

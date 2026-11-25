@@ -77,14 +77,15 @@ describe('Studio owner conversation and Feishu port', () => {
     const waiting = broker.ask(owner, 'Assistant', { kind: 'confirmation', title: 'Create project?', detail: 'Exact objective',
       options: ['Create project', 'Not now'], acceptsText: false, mobile: 'card' }, f.signal, () => true)
     const notify = f.service.feishu.next(scope)!
-    expect(notify).toMatchObject({ kind: 'pending', parentId: 'om_owner' })
+    expect(notify.kind).toBe('pending')
+    expect(notify.parentId).toBeUndefined()
     f.service.feishu.finish(notify.id, 'om_card')
     const id = notify.pending!.id
     await f.receive('om_plain_ok', '好', 'om_card')
     expect(f.store.pendingItem(id)?.state).toBe('pending')
     expect(f.service.feishu.answer({ scope, messageId: 'om_card', pendingId: 'other', value: 'Create project' })).toBe(false)
     expect(f.service.feishu.answer({ scope: 'unbound', messageId: 'om_card', pendingId: id, value: 'Create project' })).toBe(false)
-    expect(f.service.feishu.answer({ scope, messageId: 'om_card', pendingId: id, value: 'Create project' })).toBe(true)
+    await f.receive('om_approve', '批准', 'om_card')
     await expect(waiting).resolves.toBe('Create project')
     expect(() => f.api.answer({ id, value: 'Create project' }, f.signal)).toThrow('already been handled')
     expect(f.service.feishu.answer({ scope, messageId: 'om_card', pendingId: id, value: 'Create project' })).toBe(false)

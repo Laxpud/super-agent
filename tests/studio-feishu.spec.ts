@@ -248,7 +248,7 @@ describe('Studio Feishu official SDK channel', () => {
     ;(await socket()).open()
     await vi.waitFor(() => expect(port.finish).toHaveBeenCalledTimes(3))
     const cards = writes().map(request => body(request).content)
-    expect(cards[0]).toContain('仍待确认')
+    expect(cards[0]).toContain('可直接回复这条消息说「批准」或「拒绝」')
     expect(cards[1]).toContain('已失效')
     expect(cards[2]).toContain('直接回复这张卡片')
     expect(cards.every(card => !card.includes('"tag":"button"'))).toBe(true)

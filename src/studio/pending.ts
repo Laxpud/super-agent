@@ -20,6 +20,8 @@ export interface StudioQuestion {
   taskId?: string
 }
 
+export type StudioAnswerVia = 'gui' | 'card' | 'topic' | 'text'
+
 interface LiveQuestion {
   signal: AbortSignal
   current(): boolean
@@ -34,7 +36,8 @@ export class StudioPendingBroker {
   constructor(private readonly store: StudioStore, private readonly wake: () => void) {}
 
   /** Start a bounded question. An abort expires the saved item, but cannot turn into an affirmative answer. */
-  ask(message: StudioMessage, requester: string, fields: StudioQuestion, signal: AbortSignal, current: () => boolean): Promise<string> {
+  ask(message: StudioMessage, requester: string, fields: StudioQuestion, signal: AbortSignal, current: () => boolean,
+    registered?: (item: StudioPending) => void): Promise<string> {
     signal.throwIfAborted()
     const id = randomUUID()
     const { kind, title, detail, options, acceptsText, mobile, taskId } = fields
@@ -51,12 +54,13 @@ export class StudioPendingBroker {
     this.store.addPending(item)
     this.live.set(id, { signal, current, accept: result.resolve, expire })
     signal.addEventListener('abort', expire, { once: true })
+    registered?.(item)
     this.wake()
     return result.promise.finally(() => { signal.removeEventListener('abort', expire); this.live.delete(id) })
   }
 
-  /** A scoped card answer is distinct from a text supplement. Approval only accepts an offered button value. */
-  answer(id: string, value: string, channel: 'gui' | 'feishu', via: 'card' | 'topic' | 'gui'): StudioPending {
+  /** 文字确认和按钮在宿主都必须选中同一项已给出的决定；普通补充仍不能授权。 */
+  answer(id: string, value: string, channel: 'gui' | 'feishu', via: StudioAnswerVia): StudioPending {
     const item = this.store.pendingItem(id)
     if (!item) throw new StudioError('PENDING_NOT_FOUND', 'Pending item not found.', 404)
     const live = this.live.get(id)
@@ -64,8 +68,12 @@ export class StudioPendingBroker {
       live?.expire()
       throw new StudioError('QUESTION_EXPIRED', 'This item has already been handled or is no longer waiting.', 409)
     }
-    if (channel === 'feishu' && (via === 'gui' || via !== item.mobile)) {
-      throw new StudioError('MOBILE_UNSUPPORTED', 'This item still needs confirmation in Studio.', 409)
+    if (via === 'text') {
+      if (item.kind !== 'confirmation' || item.options.length !== 2 || !item.options.includes(value)) {
+        throw new StudioError('INVALID_ANSWER', 'The text did not select a decision for this exact confirmation.')
+      }
+    } else if (channel === 'feishu' && (via === 'gui' || via !== item.mobile)) {
+      throw new StudioError('MOBILE_UNSUPPORTED', 'This item cannot be handled by this control.', 409)
     }
     const text = value.trim()
     if (!item.options.includes(value) && (!item.acceptsText || !text || text.length > 4_000

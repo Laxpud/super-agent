@@ -199,6 +199,11 @@ const SCHEMA = `
     CHECK ((kind = 'commit' AND command_id IS NULL AND tool_call_id IS NOT NULL AND document_version = 2)
       OR (kind <> 'commit' AND command_id IS NOT NULL AND tool_call_id IS NULL))
   ) STRICT;
+  CREATE TABLE IF NOT EXISTS studio_document_scope_control (
+    request_id TEXT PRIMARY KEY REFERENCES agent_studio_message(id), task_id TEXT NOT NULL,
+    execution_epoch INTEGER NOT NULL, previous_authorization INTEGER NOT NULL, next_authorization INTEGER NOT NULL, kept_lines TEXT NOT NULL,
+    FOREIGN KEY (task_id, execution_epoch) REFERENCES managed_session_binding (task_id, execution_epoch)
+  ) STRICT;
   CREATE TABLE IF NOT EXISTS managed_host_run (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     run_id TEXT NOT NULL,
@@ -1396,6 +1401,49 @@ export class ManagedWorkerStore {
     const task: ManagedTask = { taskId, workerSessionId: sessionId, executionEpoch: 1, authorizationVersion: 1, paused: false, documentVersion: 1 }
     this.audit('create', task, commandId, null)
     return task
+  }
+
+  /** 已认证的较新对话指令只能收紧当前文档的原有行改动，不能新增写入权限或恢复暂停。 */
+  narrowStudioDocument(taskId: string, requestId: string, keepLines: readonly number[]): ManagedResult<ManagedTask> {
+    if (!isId(taskId) || !isId(requestId)) return deny('INVALID_INPUT')
+    const requested = readKeptLines(keepLines)
+    if (!requested) return deny('INVALID_INPUT')
+    return this.write(() => {
+      if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
+      const source = this.db.prepare(`SELECT created_at FROM agent_studio_message WHERE id = ? AND role = 'user'
+        AND channel IN ('gui', 'feishu') AND status = 'queued'`).get(requestId)
+      if (!source || typeof source.created_at !== 'number') return deny('INVALID_INPUT')
+      if (this.db.prepare(`SELECT 1 FROM studio_document_scope_control c JOIN agent_studio_message m ON m.id = c.request_id
+        WHERE c.request_id = ? OR (c.task_id = ? AND m.created_at > ?) LIMIT 1`).get(requestId, taskId, source.created_at)) return deny('STALE_AUTHORIZATION')
+      const task = this.task(taskId)
+      if (!task) return deny('TASK_NOT_FOUND')
+      if (task.documentVersion !== 1 || sharedDocumentConflict(task)) return deny('VERSION_CONFLICT')
+      const blocked = this.authorizationBlocked(task)
+      if (blocked) return blocked
+      const { baselineText, approvedText } = this.documentTargets(taskId)
+      const changes = documentLineChanges(baselineText, approvedText)
+      if (!changes) return deny('INSTRUCTION_NOT_NARROWABLE')
+      const kept = changes.changedLines.filter(line => requested.has(line))
+      if (kept.length !== requested.size || kept.length === changes.changedLines.length) return deny('INVALID_KEEP_LINES')
+      for (const line of kept) changes.baseline[(line - 1) * 2] = changes.approved[(line - 1) * 2]!
+      const authorizationVersion = task.authorizationVersion + 1
+      requireWrite(this.db.prepare(`UPDATE managed_task SET approved_text = ?, authorization_version = ?
+        WHERE task_id = ? AND execution_epoch = ? AND authorization_version = ?`)
+        .run(changes.baseline.join(''), authorizationVersion, taskId, task.executionEpoch, task.authorizationVersion).changes)
+      this.db.prepare('INSERT INTO studio_document_scope_control VALUES (?, ?, ?, ?, ?, ?)')
+        .run(requestId, taskId, task.executionEpoch, task.authorizationVersion, authorizationVersion, JSON.stringify(kept))
+      return accept({ ...task, authorizationVersion })
+    })
+  }
+
+  /** Assistant 的已认证入口按确切任务暂停：从当前绑定取 Worker，沿用原有权限版本和写入围栏。 */
+  pauseStudioDocument(taskId: string, commandId: string): ManagedResult<ManagedTask> {
+    if (!isId(taskId) || !isId(commandId)) return deny('INVALID_INPUT')
+    const target = this.snapshot(() => {
+      const task = this.task(taskId)
+      return task ? accept(task) : deny('TASK_NOT_FOUND')
+    })
+    return target.ok ? this.pause(target.value.workerSessionId, commandId) : target
   }
 
   /** Block writes to the current task before persisting the pause. A failed state or audit write leaves the block in place and the pause can be retried. */

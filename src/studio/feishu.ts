@@ -12,6 +12,7 @@ const MAX_ACTIVE_INPUTS = 16
 const MAX_CARD_CHOICES = 8
 const HEALTH_POLL_MS = 1_000
 const RETRY_MAX_MS = 60_000
+const CARD_CONTENT_BYTES = 28_000
 const messageId = /^om_[a-zA-Z0-9_-]+$/
 const threadId = /^omt?_[a-zA-Z0-9_-]+$/
 const messageCoordinate = z.string().regex(messageId).or(z.literal('')).optional()
@@ -90,17 +91,24 @@ function renderPending(pending: StudioPending, appId: string): object {
     && pending.options.length <= MAX_CARD_CHOICES && pending.options.every(choice => callbackChoice.safeParse(choice).success)
     ? pending.options : []
   const textReply = pending.state === 'pending' && pending.mobile === 'topic' && pending.kind === 'question' && pending.acceptsText
+  const textDecision = pending.state === 'pending' && pending.kind === 'confirmation'
   const context = pending.conversationId === ASSISTANT_CONVERSATION ? 'Assistant 对话' : `项目对话：${excerpt(pending.conversationId, 120)}`
   const who = `发起人：${excerpt(pending.requester, 120)}`
   const where = pending.taskId ? `${context}\n任务：${excerpt(pending.taskId, 120)}` : context
   const status = pending.state === 'expired' ? '已失效' : pending.state === 'resolved' ? '已处理'
-    : choices.length || textReply ? '待你处理' : '仍待确认'
+    : textDecision ? '待你确认' : choices.length || textReply ? '待你处理' : '仍待确认'
   const resolution = pending.state === 'resolved'
     ? `${status}${pending.answeredBy ? ` · 来自 ${pending.answeredBy === 'gui' ? 'GUI' : '飞书'}` : ''}`
-      + (pending.answer ? `\n答复：${excerpt(pending.answer, 800)}` : '')
+      + (pending.kind === 'confirmation' ? `\n${pending.answer === pending.options[0] ? '已记录批准，动作结果另行回报。' : '已记录拒绝。'}`
+        : pending.answer ? `\n答复：${excerpt(pending.answer, 800)}` : '')
     : pending.state === 'expired' ? '此事项已失效，不能再处理。'
-      : textReply ? '请在话题里直接回复这张卡片，Studio 才能将文字登记到此问题。'
-        : choices.length ? '请选择明确的答复。' : '仍待确认：此事项不支持在飞书处理，请在 Studio 查看。'
+      : textDecision ? '可直接回复这条消息说「批准」或「拒绝」，或在私聊用文字明确说明事项和决定。'
+        : textReply ? '请在话题里直接回复这张卡片，Studio 才能将文字登记到此问题。'
+          : choices.length ? '请选择明确的答复。' : '仍待确认：需要按该任务原有的控制流程处理。'
+  // 将范围分段显示，不把原先用于限制卡片按钮的简短摘要当作完整确认信息。
+  const detailChars = Array.from(pending.kind === 'confirmation' ? pending.detail : excerpt(pending.detail, 2_000))
+  const details: string[] = []
+  for (let i = 0; i < detailChars.length; i += 1_500) details.push(detailChars.slice(i, i + 1_500).join(''))
   return {
     schema: '2.0', config: { update_multi: true, enable_forward: false },
     header: {
@@ -112,7 +120,8 @@ function renderPending(pending: StudioPending, appId: string): object {
       { tag: 'column_set', background_style: 'grey-50', columns: [
         { tag: 'column', width: 'weighted', weight: 1, padding: '8px', elements: [block(where), block(who)] },
       ] },
-      ...(pending.detail ? [block(excerpt(pending.detail, 2_000))] : []),
+      ...(pending.kind === 'confirmation' ? [block(pending.title)] : []),
+      ...details.map(block),
       block(resolution),
       ...choices.map((value, index) => ({
         tag: 'button', text: plain(value), type: index === 0 ? 'primary_filled' : 'default', width: 'fill',
@@ -120,6 +129,14 @@ function renderPending(pending: StudioPending, appId: string): object {
       })),
     ] },
   }
+}
+
+/** 正文超过卡片容量时直接发完整文字，不能让批准只覆盖一份截断的摘要。 */
+function confirmationText(item: StudioPending): string {
+  const status = item.state === 'pending' ? '待你确认' : item.state === 'expired' ? '确认已失效'
+    : item.answer === item.options[0] ? '已记录批准，动作结果另行回报' : '已记录拒绝'
+  return `${status} · ${item.requester}\n${item.title}（${item.id}）${item.taskId ? `\n任务：${item.taskId}` : ''}`
+    + (item.state === 'pending' ? `\n\n${item.detail}\n\n可直接回复这条消息说「批准」或「拒绝」。` : '')
 }
 
 /** 为一个已配置的所有者私聊管理长连接；输入和投递结果均由宿主账本登记。 */
@@ -290,6 +307,12 @@ export class StudioFeishuConversation {
     }
     if (!pending) return
     const card = renderPending(pending, appId)
+    if (pending.kind === 'confirmation' && Buffer.byteLength(JSON.stringify(renderPending({ ...pending, state: 'pending' }, appId))) > CARD_CONTENT_BYTES) {
+      if (delivery.kind === 'pending-update' && !cardMessageId) return
+      const receipt = await this.sdk.sendText(ownerOpenId, chatId, confirmationText(pending), key, signal)
+      // 纯文字不能原地更新。确认后另发状态消息，账本仍以原通知定位这一项决定。
+      return receipt && (cardMessageId ?? receipt)
+    }
     if (delivery.kind === 'pending-update') {
       if (!cardMessageId) return
       await this.sdk.patchCard(cardMessageId, card, signal)
