@@ -2,6 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
+import { isStudioSource } from '../app/delivery.ts'
 
 export const newStudioSessionId = (): SessionId => SessionId(`agent-studio-${randomUUID()}`)
 
@@ -14,5 +15,5 @@ export function isStudioOwnerMessage(message: UserMessage): boolean {
 }
 /** Supplemental Host context cannot serve as a source of user instructions or consent. */
 export function isStudioMessageContext(message: UserMessage): boolean {
-  return message.source.kind === 'dsh-superagent' && message.id.startsWith(STUDIO_CONTEXT_PREFIX)
+  return isStudioSource(message.source) && message.id.startsWith(STUDIO_CONTEXT_PREFIX)
 }

@@ -10,7 +10,7 @@
 
 ## 命名与统一入口
 
-- 项目改名为 **Agent Studio**。在 DSH 左侧栏的「工作区」栏上方设置独立的统一入口，形式参考原 Super-Agent 入口，不把 Agent Studio 做成一个普通工作区。
+- 本项目的显示名称统一为 **Agent Studio**，包、插件、预设和项目提供的数据目录使用 `agent-studio` 命名，与上游原型区分。不改用户自定的 DSH 配置档、Git 检出目录或远端仓库名。在 DSH 左侧栏的「工作区」栏上方设置独立的统一入口，不把 Agent Studio 做成一个普通工作区。
 - 打开 Agent Studio 后默认进入 Assistant 对话；也可以进入项目，直接与当前 Leader 对话。在 Studio 设置中可以查看和修改 Studio 插件的部分配置。
 - Studio 的项目和会话不列在 DSH 左侧栏的「工作区」栏里，避免大量底层 Session 挤占普通工作区列表。这是界面展示边界，不要求拆分 DSH 的底层存储或内部索引。
 

@@ -178,7 +178,7 @@ function settingsAsVersions(store: Store): void {
 
 /** Settings save origin names recorded by versions before schema 11, mapped to current `SettingsOrigin` values. */
 const ORIGINS: Readonly<Record<string, SettingsOrigin>> = { web: 'panel', 'orchestrator-tool': 'tool', 'policy-sync': 'sync', 'member-sync': 'sync' }
-/** Source kinds removed from dsh-superagent; the unified `github` Source now ingests Issues via notifications. */
+/** Source kinds removed from agent-studio; the unified `github` Source now ingests Issues via notifications. */
 const REMOVED_SOURCES: readonly string[] = ['github-issue']
 /**
  * Upgrade current and historical settings records to the schema 11 structure: strip removed source kinds from active
@@ -240,7 +240,7 @@ function withoutRemovedFields(value: Stored): Stored {
     return [id, 'config' in fields ? { ...fields, config: withoutMerge(id, fields.config) } : fields]
   })) : undefined
   // Rewrite environment variable prefixes from the project's earlier names in `prepare` commands.
-  if (typeof kept.prepare === 'string') kept.prepare = kept.prepare.replace(/\bDSH_(?:TAG|GO|FREELANCER)_/g, 'DSH_SUPERAGENT_')
+  if (typeof kept.prepare === 'string') kept.prepare = currentVariables(kept.prepare)
   return { ...rest, ...(typeof paused === 'boolean' ? { paused } : {}), ...(executor ? { executor: kept } : {}),
     ...(instances ? { sources: instances } : {}),
     ...(policy ? { policy: { ...policyRest, ...(rules ? { rules } : {}), ...(parts ? { sources: parts } : {}) } } : {}) }
@@ -268,7 +268,9 @@ const READ_TOOLS: Readonly<Record<string, string>> = { orchestrator_tickets: 'ti
  * Rewrites skill and variable prefixes from the project's earlier names (`dsh-tag`, `dsh-go`, `dsh-freelancer`), replaces retired
  * read tools with `orchestrator_read`, and the four routing tools with `orchestrator_route` and their kind.
  */
-const currentNames = (value: string): string => value.replace(/\bdsh-(?:tag|go|freelancer)-/g, 'dsh-superagent-').replace(/\bDSH_(?:TAG|GO|FREELANCER)_/g, 'DSH_SUPERAGENT_')
+const currentVariables = (value: string): string => value.replace(/\bDSH_(?:TAG|GO|FREELANCER|SUPERAGENT)_/g, 'AGENT_STUDIO_')
+const currentBranding = (value: string): string => currentVariables(value).replace(/(?<![\w/.-])dsh-(?:tag|go|freelancer|superagent)-/g, 'agent-studio-')
+const currentNames = (value: string): string => currentBranding(value)
   .replace(/\borchestrator_(?:tickets|threads|decisions|settings_read|prompts_read|models|ticket_inspect)\b/g, name => `orchestrator_read ${READ_TOOLS[name]}`)
   .replace(/\borchestrator_(?:ticket_(accept|attach|stop)|trigger_(ignore))\b/g, (_name, ticket?: string, trigger?: string) =>
     `orchestrator_route (kind ${ticket ?? trigger ?? ''})`)
@@ -278,7 +280,7 @@ function legacyText(value: string): string {
   for (const [from, to] of RENAMED_TOOLS) result = result.replace(new RegExp(`\\b${from}\\b`, 'g'), to)
   return currentNames(result.replaceAll('reply_to_event_id', 'reply_to_trigger_id').replace(/\bevent_id\b/g, 'trigger_id').replace(/\btask_id\b/g, 'ticket_id')
     .replaceAll('related_tasks', 'related_tickets').replace(/(?<![\w/-])event\//g, 'trigger/').replace(/(?<![\w/-])task\//g, 'ticket/').replaceAll('<event-id>', '<trigger-id>')
-    .replace(/\bguide\/([a-z][a-z0-9-]*)\b/g, (_match, name: string) => LEGACY_FIXED.has(name) ? `the ${name} section` : `skill dsh-superagent-${name}`))
+    .replace(/\bguide\/([a-z][a-z0-9-]*)\b/g, (_match, name: string) => LEGACY_FIXED.has(name) ? `the ${name} section` : `skill agent-studio-${name}`))
 }
 /**
  * Upgrade a stored prompt configuration to current sections, tool names, and skill references; legacy configurations take
@@ -290,8 +292,36 @@ function normalize(config: unknown): PromptConfig {
   const current = legacy.success ? { ...teamDefaults, delivery: limit ? teamDefaults.delivery.replace(autoMergeThreshold(200), autoMergeThreshold(Number(limit))) : teamDefaults.delivery,
     skills: Object.fromEntries(Object.entries(legacy.data.guides).filter(([name]) => !LEGACY_FIXED.has(name)).map(([name, body]) => [name, legacyText(body)])) }
     : PromptConfigSchema.parse(config)
-  return { communication: currentNames(current.communication), scope: currentNames(current.scope), delivery: currentNames(current.delivery),
-    skills: Object.fromEntries(Object.entries(current.skills).map(([name, body]) => [name, currentNames(body)])) }
+  return mapPromptText(current, currentNames)
+}
+
+/** Keep all revision numbers and override bases stable; only the executable text adopts the new names. */
+function mapPromptText(config: PromptConfig, update: (text: string) => string): PromptConfig {
+  return { ...config, communication: update(config.communication), scope: update(config.scope), delivery: update(config.delivery),
+    skills: Object.fromEntries(Object.entries(config.skills).map(([name, body]) => [name, update(body)])),
+    ...config.overrides && { overrides: Object.fromEntries(Object.entries(config.overrides)
+      .map(([part, override]) => [part, { ...override, text: update(override.text) }])) } }
+}
+
+/** Upgrade stored prepare commands and prompt text even when no schema migration is needed. */
+export function migrateProjectNames(store: Store): void {
+  const migrated = 'project-names:agent-studio'
+  if (store.get(migrated) === true) return
+  for (const key of store.keys(KV.settings.version)) {
+    const saved = store.get<SettingsVersion>(key)
+    const prepare = saved?.settings?.executor?.prepare
+    if (saved && typeof prepare === 'string' && currentVariables(prepare) !== prepare) {
+      store.set(key, { ...saved, settings: { ...saved.settings, executor: { ...saved.settings.executor, prepare: currentVariables(prepare) } } })
+    }
+  }
+  for (const key of store.keys(KV.prompts.version)) {
+    const saved = store.get<PromptVersion>(key)
+    const config = PromptConfigSchema.safeParse(saved?.config)
+    if (!saved || !config.success) continue
+    const next = mapPromptText(config.data, currentBranding)
+    if (JSON.stringify(next) !== JSON.stringify(config.data)) store.set(key, { ...saved, config: next })
+  }
+  store.set(migrated, true)
 }
 /**
  * Normalize stored prompt revisions to current sections and names (recording original configs under `legacy` when saved

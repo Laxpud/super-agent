@@ -6,6 +6,7 @@ import { ApiError } from './api.ts'
 import { usePanel } from './provider.tsx'
 import { errorText, type T } from './text.ts'
 import { Button } from './controls.tsx'
+import { readPanelStorage } from './storage.ts'
 
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value)
@@ -53,7 +54,7 @@ interface Stored<V, M> { base: V; value: V; revision: number; meta?: M }
 function read<V, M>(key: string | undefined): Stored<V, M> | undefined {
   if (!key) return undefined
   try {
-    const stored = JSON.parse(sessionStorage.getItem(key) ?? 'null') as Partial<Stored<V, M>> | null
+    const stored = JSON.parse(readPanelStorage(key) ?? 'null') as Partial<Stored<V, M>> | null
     // Drop drafts without `base` (stored by older versions) because they cannot be three-way merged.
     return stored && 'base' in stored && 'value' in stored && Number.isInteger(stored.revision) ? stored as Stored<V, M> : undefined
   } catch (error) { void error /* An unreadable draft is dropped; the saved value stays authoritative. */; return undefined }

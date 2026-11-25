@@ -16,7 +16,7 @@ import { PROJECT_NAME_LIMIT, PROJECT_RESULT_QUOTE_LIMIT, PROJECT_TEXT_LIMIT, PRO
 import type { ManagedResult, ManagedWorkerStore } from './store.ts'
 import { sameTextWorkerModel, type PinnedTextWorkerModel } from './text-worker-model-policy.ts'
 
-export const LEADER_PRESET = 'dsh-superagent-studio-leader'
+export const LEADER_PRESET = 'agent-studio-leader'
 export const PROJECT_RESULT_USE_HINT = 'use-result <JSON>'
 export const PROJECT_MODEL_USE_HINT = 'use-model <JSON>'
 export const PROJECT_MODEL_CLEAR_HINT = 'clear-model <work-id> <selection-id>'
@@ -318,7 +318,7 @@ export class StudioProjectControl {
     const dispose = () => { for (const remove of disposers.reverse()) remove(); disposers.length = 0 }
     try {
       disposers.push(agent.ctx.systemPrompt.suppressRuntimeContext())
-      disposers.push(agent.ctx.systemPrompt.section({ name: 'superagent-studio-role', order: 10, complete: true, interpolate: false, text: LEADER_PROMPT }))
+      disposers.push(agent.ctx.systemPrompt.section({ name: 'agent-studio-role', order: 10, complete: true, interpolate: false, text: LEADER_PROMPT }))
       const output = { schema: { type: 'object' as const, required: ['text'], properties: { text: { type: 'string' as const } } },
         render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: z.object({ text: z.string() }).parse(value).text }] }
       // The rc.3 Host admits conditional tools at step preparation; the older development declarations only accept the definition.

@@ -28,11 +28,11 @@ const presetOf = (rows: readonly Row[], id: string) => rows.map(row => row.confi
 
 it('defines the worker preset Executor Sessions run under, with a shell that moves long commands to the background', async () => {
   const rows = await patched()
-  expect(rows.map(row => row.id)).toEqual(['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-feishu', 'dsh-superagent-managed-worker',
-    'dsh-superagent-managed-worker-preset', 'dsh-superagent-studio-assistant-preset', 'dsh-superagent-studio-leader-preset',
-    'dsh-superagent-worker-preset', 'dsh-superagent-router-preset'])
-  expect(rows.filter(row => row.id?.startsWith('dsh-superagent-managed-worker') || row.id?.startsWith('dsh-superagent-studio-'))
-    .map(row => row.disabled)).toEqual([true, true, true, true])
+  expect(rows.map(row => row.id)).toEqual(['agent-studio', 'agent-studio-github', 'agent-studio-feishu', 'agent-studio-managed-worker',
+    'agent-studio-managed-worker-preset', 'agent-studio-assistant-preset', 'agent-studio-leader-preset',
+    'agent-studio-worker-preset', 'agent-studio-router-preset'])
+  expect(rows.filter(row => row.id?.startsWith('agent-studio-managed-worker') || row.id === 'agent-studio-assistant-preset'
+    || row.id === 'agent-studio-leader-preset').map(row => row.disabled)).toEqual([true, true, true, true])
   const preset = presetOf(rows, WORKER_PRESET)
   expect(preset.id).toBe(WORKER_PRESET)
   const plugins = flat(preset.plugins)

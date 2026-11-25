@@ -11,25 +11,25 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 若已在隔离 profile 安装本 bundle，[bundle 补丁](../../cordis.patch.yml) 已提供以下条目，可以直接用这份覆盖层启用 Studio。未安装时，按下方的[源码试用方式](<#从源码树试用>)加载同一份补丁。`stateDir` 必须是 Studio 专用的绝对目录，不应与旧执行器、其他实例或 Worker 工作目录共享。
 
 ```yaml
-- id: dsh-superagent
+- id: agent-studio
   disabled: true
-- id: dsh-superagent-github
+- id: agent-studio-github
   disabled: true
-- id: dsh-superagent-feishu
+- id: agent-studio-feishu
   disabled: true
-- id: dsh-superagent-worker-preset
+- id: agent-studio-worker-preset
   disabled: true
-- id: dsh-superagent-router-preset
+- id: agent-studio-router-preset
   disabled: true
-- id: dsh-superagent-managed-worker
+- id: agent-studio-managed-worker
   disabled: false
   config:
-    stateDir: /absolute/path/to/managed-worker-state
-- id: dsh-superagent-managed-worker-preset
+    stateDir: /home/me/.dsh/agent-studio
+- id: agent-studio-managed-worker-preset
   disabled: false
-- id: dsh-superagent-studio-assistant-preset
+- id: agent-studio-assistant-preset
   disabled: false
-- id: dsh-superagent-studio-leader-preset
+- id: agent-studio-leader-preset
   disabled: false
 ```
 
@@ -41,12 +41,12 @@ Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户
 
 ```sh
 DSH_HOME=/absolute/path/to/studio-test-home dsh --profile web \
-  --patch /absolute/path/to/super-agent/cordis.patch.yml \
+  --patch /absolute/path/to/agent-studio/cordis.patch.yml \
   --patch /absolute/path/to/studio-local.yml \
   --host 127.0.0.1 --port 0 --no-open
 ```
 
-把最后一行的 Web 参数整行换成 `--dump-config`，可以先查看合并后的配置，不启动 Web。正式启动时，`--port 0` 选用空闲端口，从本次启动输出打开回环地址。此方式不安装 bundle，不更新现有 profile。配置后续可选功能时，把新增字段放入 `dsh-superagent-managed-worker` 的 `config`，保留 `stateDir`，原型条目继续禁用。
+把最后一行的 Web 参数整行换成 `--dump-config`，可以先查看合并后的配置，不启动 Web。正式启动时，`--port 0` 选用空闲端口，从本次启动输出打开回环地址。此方式不安装 bundle，不更新现有 profile。配置后续可选功能时，把新增字段放入 `agent-studio-managed-worker` 的 `config`，保留 `stateDir`，原型条目继续禁用。
 
 ## 交代文字任务和取回成果
 
@@ -61,10 +61,10 @@ DSH_HOME=/absolute/path/to/studio-test-home dsh --profile web \
 在隔离 profile 的原有 Studio 条目中，可用 `textWorkerRoutes` 列出允许的组合，用 `textWorkerDefaults` 和 `textWorkerBounds` 分别给 Assistant 和 Leader 指定 Worker 的默认组合和派工范围。保留 `stateDir` 和其他已设选项。下例只展示配置写法，请填写实际的 Provider、模型和思考深度 ID，不要填显示名称或凭据。
 
 ```yaml
-- id: dsh-superagent-managed-worker
+- id: agent-studio-managed-worker
   disabled: false
   config:
-    stateDir: /absolute/path/to/managed-worker-state
+    stateDir: /home/me/.dsh/agent-studio
     textWorkerRoutes:
       - provider: example-provider
         model: example-writing-model
@@ -445,7 +445,7 @@ Studio 只把飞书事件明确标为 `text` 的消息正文当作纯文字输�
 
 #### 现场验收飞书与 Web 的成果交接
 
-准备好[专用机器人与测试私聊](<#飞书私聊登记>)后，按[源码试用步骤](<#从源码树试用>)准备独立 Web profile。启动前，在 `dsh-superagent-managed-worker` 的 `config` 中保留 `stateDir`，加入以下设置并替换示例值。`cwd` 使用另一个空的试用工作目录；`provider` 和 `model` 填在独立 profile 中已配置且获准试用的路线 ID。不需要启用 `feishuDocumentInbox`、文档更正或额度通知。
+准备好[专用机器人与测试私聊](<#飞书私聊登记>)后，按[源码试用步骤](<#从源码树试用>)准备独立 Web profile。启动前，在 `agent-studio-managed-worker` 的 `config` 中保留 `stateDir`，加入以下设置并替换示例值。`cwd` 使用另一个空的试用工作目录；`provider` 和 `model` 填在独立 profile 中已配置且获准试用的路线 ID。不需要启用 `feishuDocumentInbox`、文档更正或额度通知。
 
 ```yaml
 feishuTextInbox:

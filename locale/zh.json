@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Superagent",
-    "description": "监听单个 GitHub 仓库，把获授权的请求转为 Ticket，并在各自的 DSH 会话中执行。"
+    "title": "Agent Studio",
+    "description": "在本机与 Assistant 或项目 Leader 对话、处理待办并查阅来源，可选飞书同步及 GitHub 工单编排。"
   }
 }

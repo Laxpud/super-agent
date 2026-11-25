@@ -3,6 +3,7 @@ import { THREAD_FILTERS, TICKET_FILTERS, type ThreadFilter, type TicketFilter } 
 import type { SetupPlace } from '../setup.ts'
 import { DECISION_FILTERS, type DecisionFilter } from './api.ts'
 import type { T } from './text.ts'
+import { readPanelStorage } from './storage.ts'
 
 export const TABS = ['overview', 'source', 'trigger', 'eval', 'execution', 'settings'] as const
 export type Tab = typeof TABS[number]
@@ -46,13 +47,13 @@ export function parseRoute(value: unknown): Route | undefined {
   }
 }
 
-const ROUTE_KEY = 'dsh-superagent/route'
+const ROUTE_KEY = 'agent-studio/route'
 export interface Location { route: Route; stack: Route[]; group?: SettingsGroup | undefined }
 export const lastSettingsGroup = ({ route, group }: Location): SettingsGroup => route.page === 'settings' ? route.query.group
   : group ?? 'source'
 export function initialLocation(): Location {
   try {
-    const stored = JSON.parse(sessionStorage.getItem(ROUTE_KEY) ?? 'null') as { route?: unknown; stack?: unknown; group?: unknown } | null
+    const stored = JSON.parse(readPanelStorage(ROUTE_KEY) ?? 'null') as { route?: unknown; stack?: unknown; group?: unknown } | null
     const route = parseRoute(stored?.route)
     const stack = Array.isArray(stored?.stack) ? stored.stack as unknown[] : []
     if (route) return { route, stack: stack.flatMap(item => parseRoute(item) ?? []), group: pick(SETTINGS_GROUPS, stored?.group) }

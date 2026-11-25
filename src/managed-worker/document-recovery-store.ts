@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
-import { messageId } from '../app/delivery.js'
+import { currentDeliveryId, messageId } from '../app/delivery.js'
 import type { ManagedResult, ManagedTask } from './store.js'
 
 /** Coordinates supplied synchronously by the Host observer after confirming a native, single-input TRANSPORT termination. */
@@ -234,7 +234,7 @@ export class DocumentRecoveryStore {
     const hold = this.access.hold(task)
     if (hold) return hold
     if (task.authorizationVersion !== failure.authorizationVersion) return 'STALE_AUTHORIZATION'
-    if (failure.sourceMessageId !== messageId(documentContinuationKey(task))) return 'INVALID_CONTINUATION_SOURCE'
+    if (currentDeliveryId(failure.sourceMessageId) !== messageId(documentContinuationKey(task))) return 'INVALID_CONTINUATION_SOURCE'
   }
 
   private failureFor(task: ManagedTask): Row | undefined {

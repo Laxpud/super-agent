@@ -1,24 +1,24 @@
-# dsh-superagent bundle layer: inserts the plugins without configuration, and the agent presets its Sessions run under. The
-# profile supplies the `dsh-superagent` entry's stateDir (see docs/006-deployment.md and examples/profile.cordis.patch.yml); the plugin
+# agent-studio bundle layer: inserts the plugins without configuration, and the agent presets its Sessions run under. The
+# profile supplies the `agent-studio` entry's stateDir (see docs/006-deployment.md and examples/profile.cordis.patch.yml); the plugin
 # refuses to start without stateDir.
 - insert:
-    - id: dsh-superagent
-      name: dsh-superagent
-    - id: dsh-superagent-github
-      name: dsh-superagent/github-watch
+    - id: agent-studio
+      name: agent-studio
+    - id: agent-studio-github
+      name: agent-studio/github-watch
     # Optional Feishu Source; requires configuring a bot CLI after enabling.
-    - id: dsh-superagent-feishu
-      name: dsh-superagent/feishu-watch
+    - id: agent-studio-feishu
+      name: agent-studio/feishu-watch
       disabled: true
     # The managed document Worker starts without GitHub setup. Its preset is also off by default and separate from the legacy Executor.
-    - id: dsh-superagent-managed-worker
+    - id: agent-studio-managed-worker
       name: ./studio-web/index.js
       disabled: true
-    - id: dsh-superagent-managed-worker-preset
+    - id: agent-studio-managed-worker-preset
       name: '@deepseek-ai/dsh-agent-preset'
       disabled: true
       config:
-        id: dsh-superagent-managed-worker
+        id: agent-studio-managed-worker
         name: Agent Studio Document Worker
         description: For managed document tasks only. No shell, filesystem writes, or agent delegation.
         order: 92
@@ -26,11 +26,11 @@
           - id: tool-executor-native
             name: '@deepseek-ai/dsh-tool-executor-native'
     # The Studio Assistant delegates only through its Host plugin, not through general subagent or execution tools.
-    - id: dsh-superagent-studio-assistant-preset
+    - id: agent-studio-assistant-preset
       name: '@deepseek-ai/dsh-agent-preset'
       disabled: true
       config:
-        id: dsh-superagent-studio-assistant
+        id: agent-studio-assistant
         name: Agent Studio Assistant
         description: Delegates text tasks to a managed Worker and retrieves its results. Requires the Studio host entry.
         order: 93
@@ -38,11 +38,11 @@
           - id: tool-executor-native
             name: '@deepseek-ai/dsh-tool-executor-native'
     # The Studio Leader may change the backlog and dispatch work only while it manages the project.
-    - id: dsh-superagent-studio-leader-preset
+    - id: agent-studio-leader-preset
       name: '@deepseek-ai/dsh-agent-preset'
       disabled: true
       config:
-        id: dsh-superagent-studio-leader
+        id: agent-studio-leader
         name: Agent Studio Leader
         description: Manages a Studio project, dispatches restricted text Workers, and retrieves their results. Requires the Studio host entry.
         order: 94
@@ -56,12 +56,12 @@
     # and forked subagents, which would run under this preset; spawned subagents run under `standard`, whose shell moves a
     # command to a background job only after 60 seconds, as a subagent's jobs are killed when it ends. A preset row has no
     # setting that hides it from the preset picker, so its name and description say whom it is for.
-    - id: dsh-superagent-worker-preset
+    - id: agent-studio-worker-preset
       name: '@deepseek-ai/dsh-agent-preset'
       config:
-        id: dsh-superagent-worker
-        name: dsh-superagent 执行器
-        description: dsh-superagent 的执行器 Session 专用，不供手动选择。前台命令超 5 秒转入后台，只含执行工作所需的工具。
+        id: agent-studio-worker
+        name: Agent Studio 执行器
+        description: Agent Studio 的工单执行器 Session 专用，不供手动选择。前台命令超 5 秒转入后台，只含执行工作所需的工具。
         order: 90
         plugins:
           - id: persona
@@ -161,12 +161,12 @@
     # only what the main Session uses: no subagents, web, file search or writes, todo list, questions to a person, presenting,
     # plan mode, plugin manager, scheduling, goals or workflows. No persona: the main Session's prompt is complete, so it has
     # no other section.
-    - id: dsh-superagent-router-preset
+    - id: agent-studio-router-preset
       name: '@deepseek-ai/dsh-agent-preset'
       config:
-        id: dsh-superagent-router
-        name: dsh-superagent 主 Session
-        description: dsh-superagent 的主 Session 专用，不供手动选择。前台命令和任务等待超 5 秒转入后台，只含路由所需的工具。
+        id: agent-studio-router
+        name: Agent Studio 主 Session
+        description: Agent Studio 的工单主 Session 专用，不供手动选择。前台命令和任务等待超 5 秒转入后台，只含路由所需的工具。
         order: 91
         plugins:
           - id: agent-instructions

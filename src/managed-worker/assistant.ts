@@ -15,7 +15,7 @@ import { sameTextWorkerModel as sameModelRoute, textWorkerModelError, type Pinne
   type TextWorkerModelPolicy, type TextWorkerModelSelection as ModelRoute } from './text-worker-model-policy.ts'
 
 export { DRAFT_DELEGATE } from './result-tool-names.ts'
-export const ASSISTANT_PRESET = 'dsh-superagent-studio-assistant'
+export const ASSISTANT_PRESET = 'agent-studio-assistant'
 export const DRAFT_TIMEOUT_MS = 180_000
 const UNCONFIRMED_TEXT_ROUTE_FAILURES = new Set(['NO_ADAPTER', 'UNSUPPORTED_REASONING_EFFORT', 'INVALID_MODEL_INFO',
   'INVALID_MODEL_REASONING', 'INVALID_PREPARED_CALL'])
@@ -374,7 +374,7 @@ export class StudioAssistant {
     const dispose = () => { for (const remove of disposers.reverse()) remove(); disposers.length = 0 }
     try {
       disposers.push(agent.ctx.systemPrompt.suppressRuntimeContext())
-      disposers.push(agent.ctx.systemPrompt.section({ name: 'superagent-studio-role', order: 10, complete: true, interpolate: false,
+      disposers.push(agent.ctx.systemPrompt.section({ name: 'agent-studio-role', order: 10, complete: true, interpolate: false,
         text: role === 'assistant' ? ASSISTANT_PROMPT : role === 'advisor' ? ADVISOR_PROMPT : WORKER_PROMPT }))
       if (role !== 'assistant') return dispose
       // Pass a receipt to the Assistant after delegating. The exact draft belongs to the user-facing result card, not to the next prompt by default.
@@ -511,7 +511,7 @@ export class StudioAssistant {
       // External owner input keeps its own source in the ledger; a local relay must not impersonate a Web owner or an Assistant Session.
       const source: UserMessage['source'] = sender
         ? { kind: 'agent-message', form: 'relay', senderSessionId: sender.id } as unknown as UserMessage['source']
-        : { kind: 'dsh-superagent', form: 'relay' }
+        : { kind: 'agent-studio', form: 'relay' }
       const content: UserMessage['content'][number][] = [{ type: 'text', text }]
       if (kind && context) {
         // Resolve the exact source only after the pre-relay check, and keep its excerpt in this Worker's separate block.

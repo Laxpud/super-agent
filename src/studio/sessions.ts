@@ -6,6 +6,7 @@ import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-ses
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import { ASSISTANT_PRESET, DRAFT_TIMEOUT_MS, createStudioSession, ownerRequest, type StudioAssistant } from '../managed-worker/assistant.ts'
 import { LEADER_PRESET } from '../managed-worker/project.ts'
+import { currentPresetId } from '../infra/preset-names.ts'
 import type { ManagedWorkerStore } from '../managed-worker/store.ts'
 import { installStudioOwnerAnswerer } from '../managed-worker/owner-confirmation.ts'
 import { confirmStudioModel, defaultStudioModel } from './models.ts'
@@ -27,8 +28,8 @@ interface Handle { agent: Agent; dispose(): Promise<void> }
 interface NativeModels { current(): StudioModel | undefined; select(model: StudioModel): void }
 interface NativeSessions {
   agents: { resume(options: { resumeSessionId: SessionId; agentOptions: StudioModel; signal: AbortSignal;
-    setup(ctx: Context): Promise<void> }): Promise<Handle> }
-  agentPresets: { mount(ctx: Context, preset: string): Promise<unknown> }
+    setup(ctx: Context, agent: Agent): Promise<void> }): Promise<Handle> }
+  agentPresets: { mount(ctx: Context, preset: string): Promise<unknown>; presetForSession(session: Session): string | null }
 }
 interface TurnEnd { kind: string; error?: { code?: string } }
 interface NativeTurn {
@@ -118,7 +119,15 @@ export class StudioSessions {
       try {
         // Never reuse or replace a Leader with a different project or management epoch here.
         const handle = await this.native.agents.resume({ resumeSessionId: SessionId(id), agentOptions: model, signal,
-          setup: async ctx => { await this.native.agentPresets.mount(ctx, preset) } })
+          setup: async (ctx, agent) => {
+            await this.native.agentPresets.mount(ctx, preset)
+            const recorded = this.native.agentPresets.presetForSession(agent.session)
+            if (recorded !== preset && currentPresetId(recorded) === preset) {
+              // Upgrade only a matching role of the bound Session. Append a selection, keeping its original event coordinates intact.
+              const session = agent.session as Session & { append(type: 'agent-preset/selected', data: { agentPreset: string }): void }
+              session.append('agent-preset/selected', { agentPreset: preset })
+            }
+          } })
         return { agent: handle.agent, handle, fresh: false }
       } catch (error) {
         if (!assistant || (error as { name?: string })?.name !== 'SessionPersistenceNotFoundError') throw error
@@ -377,7 +386,7 @@ export class StudioSessions {
       + (related ? `This reply is to existing Studio ${related.type} ${related.id}. Continue that item; do not register or delegate a new task for this reply. For an explicit correction to an eligible completed text result, use studio_revise_text if offered.\n` : '')
       + JSON.stringify({ history: context, ...(quote ? { quote: quote.text } : {}) })
     return freezeMessage<UserMessage>({ id: MessageId(`${STUDIO_CONTEXT_PREFIX}${message.id}`), role: 'user', content: [{ type: 'text', text }],
-      source: { kind: 'dsh-superagent', form: 'notice', summary: 'Agent Studio conversation context' } })
+      source: { kind: 'agent-studio', form: 'notice', summary: 'Agent Studio conversation context' } })
   }
 
   /** Read only a registered Studio Session. No use of agents.resume(), attach, or workspace navigation. */

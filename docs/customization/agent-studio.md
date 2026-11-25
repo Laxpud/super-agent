@@ -4,9 +4,15 @@ Agent Studio 是 DSH Web 左侧独立入口，不是普通工作区。打开后�
 
 ## 启用
 
-在仅监听回环地址、单所有者且未启用 LiveShare 的 DSH Web 中使用。以 DSH `0.2.2-rc.5` 为基准，先在源码树执行 `pnpm build`，再按[隔离环境启动方式](managed-worker.md#在隔离环境启用)启用 Studio 宿主和三个预设。`stateDir` 必须是该 Studio 实例专用的绝对路径。原型按既有方式单独启用；试用 Studio 时可保持原型条目关闭。
+在仅监听回环地址、单所有者且未启用 LiveShare 的 DSH Web 中使用。以 DSH `0.2.2-rc.5` 为基准，先在源码树执行 `pnpm build`，再按[隔离环境启动方式](managed-worker.md#在隔离环境启用)启用 Studio 宿主和三个预设。`stateDir` 必须是该 Studio 实例专用的绝对路径，例如 `/home/me/.dsh/agent-studio`。可选的 GitHub 工单服务使用独立目录，启用 Studio 时无需启动它。
 
 GUI 使用 DSH 的所有者浏览器登录，不需额外的 Web Token。默认用宿主工作目录建立新的 Assistant Session，可用 `studioCwd` 指定绝对路径。不要将 DSH Web 暴露到公网。
+
+## 从旧命名升级
+
+保留现有 DSH 配置档。先停止旧版 Studio 接收新工作、等待在途轮次结束，再停用旧 bundle。旧 Studio 数据库为 `managed-worker.sqlite`；用 SQLite 的备份接口将完整数据库复制到尚未使用的新目录，并检查副本完整性，再将 `stateDir` 指向它。勿同时启用两个数据库副本，也不要在旧宿主持有目录锁时复制主文件。确认对话和任务可查前，保留原库与旧安装包用于回退。
+
+宿主和预设使用 `agent-studio` 命名；迁移部署覆盖层时保留原有业务配置，只改对应的条目标识和数据目录。Studio 恢复已有 Assistant 或 Leader 会话时识别旧预设并记录新标识。旧 DSH 会话日志及其中的来源坐标、工作文件和外部作业不随 SQLite 迁移。
 
 ## 对话、话题与来源
 
@@ -23,7 +29,7 @@ Studio 分配的底层 Session 不出现在浏览器普通工作区列表；Stud
 
 ## 绑定飞书 Assistant 私聊（可选）
 
-准备一个独立的自建应用与机器人，在飞书配置长连接接收 `im.message.receive_v1` 和「卡片回传交互」`card.action.trigger`，开通以机器人身份发送、回复私聊与更新消息卡片所需的权限。验证机器人、操作者和私聊 ID 后，在 Studio 宿主条目 `dsh-superagent-managed-worker` 的 `config` 下填写下列字段；不用同时启用旧的 `feishuTextInbox` 或 `feishuDocumentInbox`。
+准备一个独立的自建应用与机器人，在飞书配置长连接接收 `im.message.receive_v1` 和「卡片回传交互」`card.action.trigger`，开通以机器人身份发送、回复私聊与更新消息卡片所需的权限。验证机器人、操作者和私聊 ID 后，在 Studio 宿主条目 `agent-studio-managed-worker` 的 `config` 下填写下列字段；不用同时启用旧的 `feishuTextInbox` 或 `feishuDocumentInbox`。
 
 ```yaml
 studioCwd: /absolute/path/to/workspace

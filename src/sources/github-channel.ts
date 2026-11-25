@@ -31,9 +31,11 @@ export async function sendGithub(host: Pick<SourceContext, 'commands'>, message:
       rootId = source ? source.in_reply_to_id ?? source.id : undefined
     }
     const path = rootId === undefined ? `issues/${number}/comments` : `pulls/${number}/comments`
-    const marker = `<!-- dsh-superagent:${message.id} -->`
+    const marker = `<!-- agent-studio:${message.id} -->`
+    // A reply sent before the rename can still be waiting for acknowledgement in the outbox.
+    const markers = [marker, `<!-- dsh-superagent:${message.id} -->`]
     const mine = (comment: z.infer<typeof CommentSchema>) => sameName(comment.user?.login ?? '', github.login)
-      && (rootId === undefined || comment.in_reply_to_id === rootId) && (comment.body ?? '').includes(marker)
+      && (rootId === undefined || comment.in_reply_to_id === rootId) && markers.some(value => (comment.body ?? '').includes(value))
     if ((await commands.pages(CommentSchema, path)).some(mine)) return 'sent'
     const target = rootId === undefined ? path : `${path}/${rootId}/replies`
     await commands.api(z.unknown(), target, '--method', 'POST', '-f', `body=${message.text}\n\n${marker}`)

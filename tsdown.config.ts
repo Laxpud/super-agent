@@ -14,7 +14,7 @@ export default defineConfig([
   { entry: { index: 'src/index.ts', 'github-watch': 'src/sources/github.ts', 'feishu-watch': 'src/sources/feishu.ts',
     'managed-worker': 'src/managed-worker/index.ts' }, outDir: 'lib', format: 'esm', fixedExtension: false, platform: 'node', target: 'es2024', dts: true, clean: true, deps: { neverBundle: [/^@deepseek-ai\//, 'zod', 'proper-lockfile', '@larksuiteoapi/node-sdk'] } },
   { entry: { client: 'src/client/index.tsx' }, outDir: 'lib', format: 'cjs', platform: 'browser', dts: false, clean: false, plugins: [raw],
-    deps: { neverBundle: clientModules }, outputOptions: clientOutput('dsh-superagent') },
+    deps: { neverBundle: clientModules }, outputOptions: clientOutput('agent-studio') },
   { entry: { client: 'src/studio-web/index.tsx' }, outDir: 'studio-web/lib', format: 'cjs', platform: 'browser', dts: false,
-    deps: { neverBundle: clientModules }, outputOptions: clientOutput('dsh-superagent-studio-web') },
+    deps: { neverBundle: clientModules }, outputOptions: clientOutput('agent-studio-web') },
 ])

@@ -7,18 +7,24 @@ import type {} from '@deepseek-ai/dsh-session-persistence'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
-    'dsh-superagent': { kind: 'dsh-superagent' } & ContextFormed
+    'agent-studio': { kind: 'agent-studio' } & ContextFormed
   }
 }
 
 type Seen = { ids: Set<string>; loaded?: Promise<void> }
-/** The id of the message delivered under `requestId`, the same on every retry. */
-export const messageId = (requestId: string) => MessageId(`dsh-superagent:${requestId}`)
+const LEGACY_SOURCE = 'dsh-superagent'
+const LEGACY_PREFIX = `${LEGACY_SOURCE}:`
+/** The id of a new delivery. Its request identity is stable across retries and the project rename. */
+export const messageId = (requestId: string) => MessageId(`agent-studio:${requestId}`)
+/** Compare IDs from old inboxes and logs without rewriting the original message or source coordinates. */
+export const currentDeliveryId = (id: string): string => id.startsWith(LEGACY_PREFIX) ? messageId(id.slice(LEGACY_PREFIX.length)) : id
+export const isStudioSource = (source: { kind: string }): boolean => source.kind === 'agent-studio' || source.kind === LEGACY_SOURCE
+
 /** Extracts the idempotency key from current or legacy plugin message sources. */
 function deliveryId(message: UserMessage): string | undefined {
   // Persisted sources may predate the current producer-specific source map.
   const source: { kind: string; plugin?: unknown; rpcId?: unknown } = message.source
-  if (source.kind === 'dsh-superagent' || (source.kind === 'plugin' && source.plugin === 'dsh-superagent')) return message.id
+  if (isStudioSource(source) || (source.kind === 'plugin' && source.plugin === LEGACY_SOURCE)) return currentDeliveryId(message.id)
   // Requests admitted by the former user RPC retain their original attribution.
   if (source.kind === 'user' && 'rpcId' in source && typeof source.rpcId === 'string') return messageId(source.rpcId)
 }
@@ -26,7 +32,7 @@ function deliveryId(message: UserMessage): string | undefined {
 /**
  * Delivers messages to DSH agents at most once per request ID across active and restored Sessions.
  * Tracks delivered message IDs from live Session events, persisted history, and pending inboxes so retries from `Sessions` do not duplicate messages,
- * and marks delivered messages with `dsh-superagent`'s own source (`dsh-superagent`) rather than user RPCs so they are never mistaken for messages written by a person.
+ * and marks delivered messages with `agent-studio`'s own source (`agent-studio`) rather than user RPCs so they are never mistaken for messages written by a person.
  */
 export class AgentDelivery {
   private readonly seen = new WeakMap<Session, Seen>()
@@ -73,8 +79,8 @@ export class AgentDelivery {
     const id = messageId(requestId)
     const pending = [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => deliveryId(message) === id)
     if (!seen.ids.has(id) && !pending) {
-      const source = typeof mode === 'object' ? { kind: 'dsh-superagent' as const, form: 'notice' as const, summary: mode.inject }
-        : { kind: 'dsh-superagent' as const, form: 'relay' as const }
+      const source = typeof mode === 'object' ? { kind: 'agent-studio' as const, form: 'notice' as const, summary: mode.inject }
+        : { kind: 'agent-studio' as const, form: 'relay' as const }
       const message = freezeMessage({ id, role: 'user' as const, content: [{ type: 'text' as const, text }], source })
       if (typeof mode === 'object') { agent.inject(message); seen.ids.add(id) }
       else if (mode === 'steer') agent.steer(message)

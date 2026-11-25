@@ -1,10 +1,9 @@
 {
-  "name": "dsh-superagent",
-  "author": "DeepSeek Harness Team <team@dsh.dev>",
+  "name": "agent-studio",
   "license": "MIT",
   "version": "0.1.0",
   "private": true,
-  "description": "A proactive agent for one GitHub repository, as a DSH (DeepSeek Harness) bundle: it listens to GitHub and optionally Feishu, evaluates requests under a Policy, turns authorized ones into Tickets, and executes each in its own DSH Session.",
+  "description": "A local single-owner AI workspace for Assistant and project conversations in DeepSeek Harness, with optional Feishu sync and GitHub Ticket orchestration.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -21,6 +20,7 @@
       "default": "./lib/managed-worker.js"
     },
     "./package.json": "./package.json",
+    "./icon": "./studio-web/icon.svg",
     "./locale/*.json": "./locale/*.json"
   },
   "files": [

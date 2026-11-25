@@ -1,7 +1,7 @@
 /** Studio 界面的词条由宿主 locale 服务统一解析。 */
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 
-export const NS = 'dshSuperagentStudio'
+export const NS = 'agentStudio'
 export const en = {
   preparing: 'Preparing Studio call…', running: 'Studio call running…', receipt: 'Studio tool receipt',
   stopped: 'Studio call interrupted', failed: 'Studio call failed', noOutput: 'No text was recorded.',

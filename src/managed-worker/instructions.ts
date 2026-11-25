@@ -4,7 +4,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
-import { messageId, type AgentDelivery } from '../app/delivery.ts'
+import { currentDeliveryId, isStudioSource, messageId, type AgentDelivery } from '../app/delivery.ts'
 import { sharedDocumentCoordinates, sharedDocumentError } from './document-command.ts'
 import { documentIntent } from './document-intent.ts'
 import { DOCUMENT_CONTINUATION_PREFIX, documentContinuationKey } from './document-recovery-store.ts'
@@ -38,17 +38,18 @@ function continuationText({ task, text }: Continuation): string {
 }
 
 function isDocumentRelay(message: UserMessage): boolean {
-  return message.source.kind === 'dsh-superagent' && message.id.startsWith(continuationPrefix)
+  return isStudioSource(message.source) && currentDeliveryId(message.id).startsWith(continuationPrefix)
 }
 
 /** Resolve only the exact continuation generated from the current approved snapshot, not text that merely resembles it. */
 export function verifiedDocumentRelay(store: ManagedWorkerStore, agent: Agent, message: UserMessage): ManagedTask | undefined {
   if (!isDocumentRelay(message)) return
-  const fields = message.id.slice(continuationPrefix.length).split(':')
+  const id = currentDeliveryId(message.id)
+  const fields = id.slice(continuationPrefix.length).split(':')
   const revision = versionArg.safeParse(fields[2])
   if (!revision.success) return
   const result = store.documentContinuation(agent.id, revision.data)
-  if (!result.ok || message.id !== messageId(documentContinuationKey(result.value.task)) || message.content.length !== 1
+  if (!result.ok || id !== messageId(documentContinuationKey(result.value.task)) || message.content.length !== 1
     || message.content[0]?.type !== 'text' || message.content[0].text !== continuationText(result.value)) return
   return result.value.task
 }

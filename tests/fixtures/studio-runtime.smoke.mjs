@@ -103,15 +103,15 @@ try {
   mkdirSync(workspace)
   process.chdir(workspace)
   const patch = join(fixture, 'offline.patch.json')
-  const disabled = ['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-feishu', 'dsh-superagent-worker-preset',
-    'dsh-superagent-router-preset', 'llm-deepseek', 'llm-deepseek-account', 'llm-pi-ai', 'deepseek-account',
+  const disabled = ['agent-studio', 'agent-studio-github', 'agent-studio-feishu', 'agent-studio-worker-preset',
+    'agent-studio-router-preset', 'llm-deepseek', 'llm-deepseek-account', 'llm-pi-ai', 'deepseek-account',
     'plugin-package-inventory-deepseek', 'web-search-deepseek', 'web-deepseek-api', 'session-title-llm']
   writeFileSync(patch, JSON.stringify([
     ...disabled.map(id => ({ id, disabled: true })),
     { id: 'web-runtime', config: { openBrowser: false, printUrl: false, surfaceContext: false } },
     { id: 'agent-default-model', config: { provider, model } },
-    { id: 'dsh-superagent-managed-worker', disabled: false, config: { stateDir: join(fixture, 'studio'), studioCwd: workspace } },
-    ...['dsh-superagent-managed-worker-preset', 'dsh-superagent-studio-assistant-preset', 'dsh-superagent-studio-leader-preset']
+    { id: 'agent-studio-managed-worker', disabled: false, config: { stateDir: join(fixture, 'studio'), studioCwd: workspace } },
+    ...['agent-studio-managed-worker-preset', 'agent-studio-assistant-preset', 'agent-studio-leader-preset']
       .map(id => ({ id, disabled: false })),
   ]))
   const load = name => import(pathToFileURL(anchored.resolve(name)).href)
@@ -206,8 +206,8 @@ try {
     'Native API operator login'))
   await post('state', {}, { auth: apiCookie, expected: 403 })
   const page = await checkStatus(await fetch(`${origin}/`, { headers: { cookie }, signal: AbortSignal.timeout(5_000) }), 200, 'Authenticated Web shell')
-  assert.ok((await page.text()).includes('dsh-superagent-studio-web'), 'The authenticated shell advertises the Studio Client')
-  const studioBundle = ctx.clientModules.graph().entries.find(entry => entry.id === 'dsh-superagent-studio-web')
+  assert.ok((await page.text()).includes('agent-studio-web'), 'The authenticated shell advertises the Studio Client')
+  const studioBundle = ctx.clientModules.graph().entries.find(entry => entry.id === 'agent-studio-web')
   assert.ok(studioBundle?.url, 'The mounted Studio Host contributes its built Client')
   const bundle = await checkStatus(await fetch(new URL(studioBundle.url, `${origin}/`), { headers: { cookie }, signal: AbortSignal.timeout(5_000) }),
     200, 'Studio Client bundle')
@@ -288,7 +288,7 @@ try {
     assert.equal(ctx.agents.get(leader.id), undefined)
     const coldLeader = await ctx.sessionQuery.readSession(leader.id)
     assert.equal(coldLeader.session.origin, undefined)
-    assert.equal(coldLeader.session.agentPreset, 'dsh-superagent-studio-leader')
+    assert.equal(coldLeader.session.agentPreset, 'agent-studio-leader')
     rooms.push({ ...plan, id: project.id, leaderId: leader.id })
   }
   assert.deepEqual(calls.map(call => [call.model, call.reasoningEffort]),

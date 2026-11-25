@@ -9,6 +9,7 @@ import s from '@deepseek-ai/schemastery'
 import { lockSync } from 'proper-lockfile'
 import { z } from 'zod'
 import { AgentDelivery } from '../app/delivery.ts'
+import { currentPresetId } from '../infra/preset-names.ts'
 import { StudioFeishuConversation } from '../studio/feishu.ts'
 import { registerStudioHttp } from '../studio/http.ts'
 import { ASK_STUDIO_OWNER } from '../studio/pending.ts'
@@ -53,7 +54,7 @@ import { StudioStudy, isStudyTool, studyOutput } from './study.ts'
 import { createTextWorkerModelPolicy, TextWorkerBoundsConfig, TextWorkerDefaultsConfig, TextWorkerRouteConfig } from './text-worker-model-policy.ts'
 import { watchdogCommand } from './watchdog.ts'
 
-export const name = 'dsh-superagent-managed-worker'
+export const name = 'agent-studio-managed-worker'
 export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'permissionPresets', 'sandboxPolicy', 'sessionPersistence', 'systemPrompt', 'tools', 'webServer', 'llm']
 const StudioRoleModel: s<StudioModel> = s.object({ provider: s.string().required(), model: s.string().required(), reasoningEffort: s.string() })
 export const Config = s.object({
@@ -97,7 +98,7 @@ export const Config = s.object({
 })
 type Config = ReturnType<typeof Config>
 
-const PRESET = 'dsh-superagent-managed-worker'
+const PRESET = 'agent-studio-managed-worker'
 const TEXT_LIMIT = 32_000
 const version = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
 
@@ -219,7 +220,7 @@ export function apply(context: Context, config: Config): void {
 
   const scopes = new Map<Agent, StudioScope>()
   const permits = new Map<ToolExecutionToken, ManagedWritePermit>()
-  const presetOf = (agent: Agent) => ctx.agentPresets.presetForSession(agent.session)
+  const presetOf = (agent: Agent) => currentPresetId(ctx.agentPresets.presetForSession(agent.session))
   const presetFor = (role: StudioRole) => role === 'assistant' ? ASSISTANT_PRESET : role === 'leader' ? LEADER_PRESET : PRESET
   const currentSession = (agent: Agent): boolean => ctx.agents.get(agent.id) === agent
   const restricted = (agent: Agent): boolean => ctx.permissionPresets.current(agent.session) === 'read-only'
@@ -405,7 +406,8 @@ export function apply(context: Context, config: Config): void {
   ctx.on('tools/result', exec => { permits.delete(exec.token); return undefined })
   ctx.on('agent/created', ({ agent }) => { configure(agent); return undefined })
   ctx.on('agent/disposed', ({ agent }) => { scopes.get(agent)?.dispose(); scopes.delete(agent) })
-  ctx.on('agent-preset/selected', (id, preset) => {
+  ctx.on('agent-preset/selected', (id, selected) => {
+    const preset = currentPresetId(selected)
     if (!roleForPreset(preset)) return
     const agent = ctx.agents.get(id as SessionId)
     if (!agent) return
