@@ -1,4 +1,8 @@
-# dsh-superagent
+# Agent Studio
+
+Agent Studio is a single-owner workspace for talking to an Assistant and the current Leader of each project in DeepSeek Harness. Its sidebar entry is separate from Workspaces, and its Assistant can share a text conversation and pending questions with a bound Feishu bot. See the [Agent Studio setup and usage guide](docs/customization/agent-studio.md).
+
+## Original dsh-superagent prototype
 
 > **Research prototype for reference only, not an official DeepSeek product.** This code grew out of our team's day-to-day development work, with much of the engineering done by coding agents. Treat it as research code, not production-ready software. It may still contain bugs, and its coding style and engineering practices may be inconsistent. Review and adapt it before using it in your own environment.
 >

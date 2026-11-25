@@ -1,4 +1,6 @@
-# SuperAgent Studio：文字任务、项目与受管文档
+# Agent Studio：文字任务、项目与受管文档
+
+日常对话、飞书同步、待我处理和模型设置见 [Agent Studio 使用指南](agent-studio.md)。本篇保留受管执行和原生命令的权限与操作说明。
 
 Studio 可以把独立的文字任务交给 Worker，并保存其原文供用户取回。用户还可以建立独立于仓库的项目，选择当前管理会话并登记待办。受管文档入口只允许替换数据库里已明确授权的正文。Studio 不接管 GitHub Ticket，也不能写普通工作区文件。Studio 宿主和配套预设默认关闭；原型的 GitHub、飞书和执行器预设维持原有行为。
 
@@ -48,7 +50,7 @@ DSH_HOME=/absolute/path/to/studio-test-home dsh --profile web \
 
 ## 交代文字任务和取回成果
 
-1. 在新会话中选择 **SuperAgent Studio Assistant**，选择支持工具调用的模型，用普通消息提出一个独立的纯文字任务，例如「把这三条材料整理成一个简短比较表」。当前只转交该条请求，不自动带上过去的聊天、附件或文件；请把所需文字放在同一条消息。Worker 不具备业务工具，其模型按[文字派工配置](<#限定普通文字-worker-的模型组合>)选择。
+1. 在新会话中选择 **Agent Studio Assistant**，选择支持工具调用的模型，用普通消息提出一个独立的纯文字任务，例如「把这三条材料整理成一个简短比较表」。当前只转交该条请求，不自动带上过去的聊天、附件或文件；请把所需文字放在同一条消息。Worker 不具备业务工具，其模型按[文字派工配置](<#限定普通文字-worker-的模型组合>)选择。
 2. 在原会话先展开该轮的「已完成」过程，再展开 **Worker result** 工具卡片。卡片显示 Worker 原文、任务 ID、产出 Bot、会话、执行轮次及消息位置。普通文字任务保存成果后，DSH 用这张卡片交付，不再调用 Assistant 转述。如果页面只显示 `studio_delegate_draft` 的普通回执，先按下述命令取回原文，再检查这次启动是否加载了 Studio 浏览器组件。
 3. 在这个会话用 `/studio-result` 取回最新任务，或在任意 Studio Assistant 会话用 `/studio-result <任务ID>` 取回指定任务。此命令不调用模型，不需要 Worker 在线。宿主重启后，已经保存的成果仍可读；未完成的任务显示为中断，不自动再派一遍。
 
@@ -121,11 +123,11 @@ DSH_HOME=/absolute/path/to/studio-test-home dsh --profile web \
 
 已接入项目创建、管理权移交和文字待办派工。不会把复杂任务自动升级为项目。
 
-在 **SuperAgent Studio Assistant** 会话中，可以直接用普通话说明这是要长期推进的项目，以及要达到什么目标，例如「把刚完成的资料对照接着做成长期项目，维护每月的差异记录」。不需要固定句式或命令。先核对原生确认框里的项目名称、目标和关联成果，然后选择 **Create project**。Assistant 的建议本身不创建项目；拒绝、跳过或等待超时都不立项。确认后会建立独立的 Leader 会话，不启动 Worker。关联成果目前限原 Assistant 会话里已完成的文字任务，不重做。用 `/studio-project proposal` 或带上回执中的建议 ID，可在该 Assistant 会话查看决定；宿主重启不会继续等待旧问答。
+在 **Agent Studio Assistant** 会话中，可以直接用普通话说明这是要长期推进的项目，以及要达到什么目标，例如「把刚完成的资料对照接着做成长期项目，维护每月的差异记录」。不需要固定句式或命令。先核对原生确认框里的项目名称、目标和关联成果，然后选择 **Create project**。Assistant 的建议本身不创建项目；拒绝、跳过或等待超时都不立项。确认后会建立独立的 Leader 会话，不启动 Worker。关联成果目前限原 Assistant 会话里已完成的文字任务，不重做。用 `/studio-project proposal` 或带上回执中的建议 ID，可在该 Assistant 会话查看决定；宿主重启不会继续等待旧问答。
 
 也可以直接在 Leader 会话中操作：
 
-1. 在未绑定项目的 **SuperAgent Studio Leader** 会话中提交 `/studio-project create {"name":"资料整理","objective":"持续整理研究记录"}`。回执给出项目 ID、Leader Bot、当前会话及管理轮次 `1`。可用 `leaderBotId` 复用已有 Leader Bot，用 `originTaskId` 引用一个已经完成的文字任务；引用原成果不重新派工。
+1. 在未绑定项目的 **Agent Studio Leader** 会话中提交 `/studio-project create {"name":"资料整理","objective":"持续整理研究记录"}`。回执给出项目 ID、Leader Bot、当前会话及管理轮次 `1`。可用 `leaderBotId` 复用已有 Leader Bot，用 `originTaskId` 引用一个已经完成的文字任务；引用原成果不重新派工。
 2. 在当前 Leader 会话中用普通消息要求登记一项自包含的文字待办，将所需材料放在同一条消息里。登记保留原文与来源，不会启动 Worker。用 `/studio-project work` 可查看最近 20 项。需要执行时，让当前 Leader 派工指定待办 ID。普通派工使用 Leader 的[派工默认组合](<#限定普通文字-worker-的模型组合>)，或在未设默认值时沿用会话选择；只想改这一次时，可[另行选择组合](<#为一项待办选择一次派工模型>)。文字 Worker 不能用工具或修改文档。
 3. 用 `/studio-project work <待办ID>` 查看原请求、状态和 Worker 的原始结果，不调用模型。在同一项目的 Leader 会话中，Worker 结束或宿主重启后仍可取回已保存结果。已经开始的工作中断后会留下状态，不会自动重跑。
 4. 要换管理会话，在从未绑定项目的 Leader 会话中提交 `/studio-project take <项目ID> <当前管理轮次>`。默认保留 Leader Bot；末尾可追加已有 Leader Bot ID 或 `new` 以换负责人。旧会话仍可用 `work` 查询本项目的工作记录，但不能再登记或派工。移交前尚未开始的保留名额会释放，由当前 Leader 决定是否继续原待办；已经开始的 Worker 可保存原出处的结果。
@@ -341,7 +343,7 @@ Assistant 和工具卡只显示回执。用 `/studio-result <任务ID>` 取回�
 
 ## 文档写入控制
 
-要替换已明确授权的文档，请在新的普通会话中选择 **SuperAgent managed document Worker**。不要在 Assistant、受托起草文字的 Worker、旧执行器或 DSH 子代理会话中登记这项授权。文档 Worker 使用只读沙箱，写入只能通过宿主注册的 `studio_write_document` 动作。
+要替换已明确授权的文档，请在新的普通会话中选择 **Agent Studio Document Worker**。不要在 Assistant、受托起草文字的 Worker、旧执行器或 DSH 子代理会话中登记这项授权。文档 Worker 使用只读沙箱，写入只能通过宿主注册的 `studio_write_document` 动作。
 
 1. **登记一条确切授权。** 在 Worker 会话中提交 `/studio-doc start {"initial":"旧正文","replacement":"获准的新正文"}`。回执包含任务 ID、执行轮次、授权版本和文档版本。用 `/studio-doc continue <授权版本>` 让 Worker 提交这次修改。只有登记的新正文与预期文档版本 `1` 完全匹配时，动作才可能把文档更新到版本 `2`。普通聊天文本不增加权限。多个任务要修改同一文档时，按下文用文档 ID 绑定，不要分别用 `initial` 创建副本。
 2. **暂停和查看状态。** 在当前 Worker 会话中提交 `/studio-doc pause`。收到 `Pause effective` 时，暂停与新授权版本已经提交。随时可用 `/studio-doc status` 查看状态，不会返回正文。若回执说暂停未保存，宿主仍阻止该任务写入，而且不提供可用的恢复版本；可重试暂停，或在宿主重启后重新打开会话查看状态。
@@ -369,7 +371,7 @@ Assistant 和工具卡只显示回执。用 `/studio-result <任务ID>` 取回�
 
 ### 多个任务修改同一文档
 
-在 **SuperAgent managed document Worker** 会话中，用 `/studio-doc doc-new {"text":"起始正文"}` 创建共享文档，回执给出文档 ID 和修订 `1`。这一步不创建任务，也不授予 Worker 写入权。`/studio-doc doc-read <文档ID> [修订号]` 可查看正文；省略修订号则读取当前版本。
+在 **Agent Studio Document Worker** 会话中，用 `/studio-doc doc-new {"text":"起始正文"}` 创建共享文档，回执给出文档 ID 和修订 `1`。这一步不创建任务，也不授予 Worker 写入权。`/studio-doc doc-read <文档ID> [修订号]` 可查看正文；省略修订号则读取当前版本。
 
 - **让任务基于同一版本工作。** 在各自尚未绑定的文档 Worker 会话中提交 `/studio-doc start {"documentId":"<文档ID>","expectedVersion":1,"replacement":"该任务获准的新正文"}`，然后用回执中的授权版本继续。任务的基准修订不会随文档改动自动更新。
 - **直接编辑。** 所有者可提交 `/studio-doc doc-save {"documentId":"<文档ID>","expectedVersion":1,"text":"人工修订"}`。只有文档仍在指定修订时才保存；该命令不恢复暂停任务，也不替它完成工作。
@@ -421,7 +423,7 @@ Studio 只把飞书事件明确标为 `text` 的消息正文当作纯文字输�
 
 ### 从 Web 或飞书继续同一个文档任务
 
-可在 Studio 宿主配置中启用 `documentContinuations: true`（默认关闭）。在普通 **SuperAgent Studio Assistant** Web 会话单独发「继续那个任务」。只有一个未完成的受管文档任务时，宿主才会直接定位；有多项时只返回候选，不替你选择。也可发「继续文档任务 <任务ID>」明确指向原任务。
+可在 Studio 宿主配置中启用 `documentContinuations: true`（默认关闭）。在普通 **Agent Studio Assistant** Web 会话单独发「继续那个任务」。只有一个未完成的受管文档任务时，宿主才会直接定位；有多项时只返回候选，不替你选择。也可发「继续文档任务 <任务ID>」明确指向原任务。
 
 在启用了文档接收的白名单飞书私聊中，同一句话只指已绑定的文档任务，不能指定其他任务。先在 Web 的当前 Worker 用 `/studio-doc bind-feishu` 完成绑定。续做句式须独立发送；例如「请继续那个任务，谢谢」不会走接续路线，在飞书仍按原文档收件流程处理。要调整范围或暂停，请另发更正。
 
@@ -435,9 +437,9 @@ Studio 只把飞书事件明确标为 `text` 的消息正文当作纯文字输�
 
 1. 发送以 `draft:` 或 `起草：` 开头的消息，把所需材料放在同一条消息中，例如 `draft: 把下列数据整理成比较表……`。不带这些前缀不会发起文字任务。每个私聊同时只执行一个文字任务，已知迟到的请求不会派工。收到忙碌回执后，若仍要执行，请等当前任务结束再另发新消息；原消息不会补派。收到任务 ID 后不必重发。
 2. Worker 只收到前缀后的文字，不具备工具、文档写入权或外部操作权限。Studio 保存原文和结果出处，再尝试以[纯文字回复](<https://open.feishu.cn/document/server-docs/im-v1/message/reply>)发送，不解析结果里的图片地址或下载内容。超出回复限制时给出取回方式。
-3. 在同一私聊发 `result <任务ID>`，或在任何 **SuperAgent Studio Assistant** 会话用 `/studio-result <任务ID>`，无需再次调用模型。会话结束或宿主重启后仍可取回已保存结果；中断的任务不会自动重做。
+3. 在同一私聊发 `result <任务ID>`，或在任何 **Agent Studio Assistant** 会话用 `/studio-result <任务ID>`，无需再次调用模型。会话结束或宿主重启后仍可取回已保存结果；中断的任务不会自动重做。
 
-**没收到回复、也不知道任务 ID？** 在 **SuperAgent Studio Assistant** Web 会话用 `/studio-result feishu`。它按消息发送时间（UTC）倒序列出当前配置私聊中最多 8 个已保存的文字任务。按时间和原消息 ID 核对，复制对应的 `/studio-result <任务ID>` 取回。列表不含正文，也不能确认机器人回复是否送达。查不到不等于原消息未被处理，不要仅凭此重发。
+**没收到回复、也不知道任务 ID？** 在 **Agent Studio Assistant** Web 会话用 `/studio-result feishu`。它按消息发送时间（UTC）倒序列出当前配置私聊中最多 8 个已保存的文字任务。按时间和原消息 ID 核对，复制对应的 `/studio-result <任务ID>` 取回。列表不含正文，也不能确认机器人回复是否送达。查不到不等于原消息未被处理，不要仅凭此重发。
 
 无论是否兼顾文档更正，Studio 都先按消息 ID 登记文字命令，再检查参数、额度和 Worker 是否空闲。已登记的消息重投不会变成新指令，重启或切换模式也不例外。旧版纯文字模式未登记的拒绝不在这项保护内。
 
@@ -458,9 +460,9 @@ feishuTextInbox:
 
 启动前关闭本次用于确认私聊 ID 的探针。同一应用的长连接之间不会广播事件；不要启动第二个监听者，也不要接管其他进程。只给这次独立启动传入 `STUDIO_FEISHU_APP_SECRET`，预检配置时不需要密钥。
 
-1. 先用 `--dump-config` 核对 Studio 只启用了一份宿主，原型监听仍关闭。正式启动后，在 **SuperAgent managed document Worker** 会话用 `/studio-doc feishu-status` 确认监听就绪；无需登记或绑定文档。监听就绪还不是飞书送达证据。
+1. 先用 `--dump-config` 核对 Studio 只启用了一份宿主，原型监听仍关闭。正式启动后，在 **Agent Studio Document Worker** 会话用 `/studio-doc feishu-status` 确认监听就绪；无需登记或绑定文档。监听就绪还不是飞书送达证据。
 2. 在测试私聊只发送一次普通文字：`draft: 用三列表格比较虚构的甲、乙方案，只列数据。甲耗时 4 小时、需 2 人；乙耗时 6 小时、需 1 人。表头为方案、耗时、人数。` 在飞书原消息的回复串核对实际回复、任务 ID 和保存的结果。若没有回复，先用 `/studio-result feishu` 查找，不重发本次输入。
-3. 等文字 Worker 结束后，在同一个独立 Web 页新建空白会话，从工作区旁的 Agent 预设菜单选 **SuperAgent Studio Assistant**。不用先发普通消息，直接执行 `/studio-result <同一任务ID>`，点击对话记录中的 `studio-result` 命令行展开正文。通过条件是飞书实际收到结果或可用的取回指引，Web 展示同一任务的已保存正文和 Worker 出处，不再派工。只有 Web 取回成功而飞书没收到回复时，记录为取回通过、真实发件未确认，别算作整条链路通过。记录任务 ID、两端状态与正文是否一致，不附密钥或私人聊天。
+3. 等文字 Worker 结束后，在同一个独立 Web 页新建空白会话，从工作区旁的 Agent 预设菜单选 **Agent Studio Assistant**。不用先发普通消息，直接执行 `/studio-result <同一任务ID>`，点击对话记录中的 `studio-result` 命令行展开正文。通过条件是飞书实际收到结果或可用的取回指引，Web 展示同一任务的已保存正文和 Worker 出处，不再派工。只有 Web 取回成功而飞书没收到回复时，记录为取回通过、真实发件未确认，别算作整条链路通过。记录任务 ID、两端状态与正文是否一致，不附密钥或私人聊天。
 
 验收后在启动终端按 Ctrl+C，仅退出本次试用宿主；Studio 会关闭它持有的 SDK 长连接，不需要用 `lark-cli` 停止任何进程。历史 SQLite 记录不需要迁移；如果以前用 CLI 启动过 Studio，在独立配置里移除旧的 `cli` 字段，保持四个身份 ID 不变。
 

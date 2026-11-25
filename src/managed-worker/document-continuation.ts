@@ -41,10 +41,14 @@ export class StudioDocumentContinuation {
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore, private readonly delivery: AgentDelivery,
     private readonly ready: (agent: Agent, role: Role) => boolean, private readonly stopping: AbortSignal) {}
 
-  reviewWeb(step: OwnerInboxStep, input: OwnerInboxInput): Promise<void> | undefined {
+  reviewWeb(step: OwnerInboxStep, input: OwnerInboxInput, topicTaskId?: string): Promise<void> | undefined {
     const intent = documentContinuationIntent(input.text)
     if (!intent) return
-    return this.track(this.web(step, input, intent))
+    if (topicTaskId && intent.taskId && intent.taskId !== topicTaskId) {
+      publishOwnerInboxReceipt(step.agent, input, 'studio-document-continuation', refused('TASK_SCOPE_MISMATCH'))
+      return Promise.resolve()
+    }
+    return this.track(this.web(step, input, topicTaskId ? { taskId: topicTaskId } : intent))
   }
 
   /** The listener calls this only after checking the dedicated bot, private chat and owner. */

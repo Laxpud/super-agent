@@ -4,6 +4,9 @@ import { chmodSync, closeSync, fchmodSync, lstatSync, mkdirSync, openSync, realp
 import { dirname, resolve } from 'node:path'
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
+import { studioArtifacts, studioBlockingItems, studioHiddenIds, studioPendingRecord, studioProject, studioProjects, studioRelatedWork, studioSession } from '../studio/domain.ts'
+import { StudioStore } from '../studio/store.ts'
+import { StudioRevisionStore } from '../studio/revision-store.ts'
 import { ADVISOR_SCHEMA, AdvisorStore, interruptAdvice } from './advisor-store.js'
 import { BOT_EXPERIENCE_SCHEMA, BotExperienceStore } from './bot-experience-store.js'
 import { DOCUMENT_CONTINUATION_SCHEMA, appendDocumentContinuationClaim, feishuDocumentContinuationLate, feishuDocumentContinuationSeen,
@@ -389,6 +392,8 @@ export class ManagedWorkerStore {
   readonly studies: StudyStore
   readonly advice: AdvisorStore
   readonly memory: MemoryStore
+  readonly studio: StudioStore
+  readonly revisions: StudioRevisionStore
 
   /** Open the database under the host directory lock. Do not enable actions until the recovery transaction has committed. */
   constructor(path: string, quotaPoolIds: readonly string[] = [], private readonly quotaNoticeScope?: string,
@@ -539,6 +544,12 @@ export class ManagedWorkerStore {
         adviceAuthority: sessionId => this.projects.adviceAuthority(sessionId),
         workEvidence: (projectId, workId) => this.projects.workEvidence(projectId, workId),
       })
+      // Studio's UI ledger shares this connection, but owns its transactions after the host run has been established.
+      const assertStudioRun = () => this.assertStudioRun()
+      this.studio = new StudioStore(this.db, assertStudioRun)
+      this.revisions = new StudioRevisionStore(this.db, assertStudioRun)
+      this.studio.recover()
+      this.revisions.recover()
     } catch (error) {
       try { this.close() } catch { /* Preserve the initialization error. */ }
       throw error
@@ -983,7 +994,7 @@ export class ManagedWorkerStore {
   /** Check permanent secondary roles without reentering any facade's transaction. */
   private studioExecutionSessionBound(sessionId: string): boolean {
     return !!(this.draftBinding(sessionId) || this.feishuDraftBinding(sessionId) || this.studies.binding(sessionId)
-      || this.advice.binding(sessionId) || this.projects.workerBound(sessionId))
+      || this.advice.binding(sessionId) || this.projects.workerBound(sessionId) || this.revisions.sourceBinding(sessionId))
   }
 
   /** Advice and preference proposals require an Assistant binding without any other permanent Session role. */
@@ -1727,6 +1738,25 @@ export class ManagedWorkerStore {
 
   private ownsRun(): boolean {
     return !!this.db.prepare('SELECT 1 FROM managed_host_run WHERE singleton = 1 AND run_id = ? AND clean = 0').get(this.#runId)
+  }
+
+  /** These owner-facing projections read the same ledgers as the command handlers. */
+  studioProjects() { this.assertStudioRun(); return studioProjects(this.db) }
+  studioHiddenIds() { this.assertStudioRun(); return studioHiddenIds(this.db) }
+  studioProject(id: string) { this.assertStudioRun(); return studioProject(this.db, id) }
+  studioSession(id: string) { this.assertStudioRun(); return studioSession(this.db, id) }
+  studioRelatedWork(room: string, requestId: string, messageId: string) {
+    this.assertStudioRun()
+    return this.revisions.link(room, requestId, messageId) ?? studioRelatedWork(this.db, room, requestId, messageId)
+  }
+  studioArtifacts(room: string, requestId: string, messageId: string) {
+    this.assertStudioRun(); return studioArtifacts(this.db, room, requestId, messageId)
+  }
+  studioBlockingItems() { this.assertStudioRun(); return studioBlockingItems(this.db) }
+  studioPendingRecord(id: string) { this.assertStudioRun(); return studioPendingRecord(this.db, id) }
+
+  private assertStudioRun(): void {
+    if (!this.ownsRun()) throw new Error('Agent Studio no longer owns its state')
   }
 
   /** Historical bindings are readable but no longer grant execution authority. */

@@ -19,7 +19,7 @@
       disabled: true
       config:
         id: dsh-superagent-managed-worker
-        name: SuperAgent managed document Worker
+        name: Agent Studio Document Worker
         description: For managed document tasks only. No shell, filesystem writes, or agent delegation.
         order: 92
         plugins:
@@ -31,7 +31,7 @@
       disabled: true
       config:
         id: dsh-superagent-studio-assistant
-        name: SuperAgent Studio Assistant
+        name: Agent Studio Assistant
         description: Delegates text tasks to a managed Worker and retrieves its results. Requires the Studio host entry.
         order: 93
         plugins:
@@ -43,7 +43,7 @@
       disabled: true
       config:
         id: dsh-superagent-studio-leader
-        name: SuperAgent Studio Leader
+        name: Agent Studio Leader
         description: Manages a Studio project, dispatches restricted text Workers, and retrieves their results. Requires the Studio host entry.
         order: 94
         plugins:

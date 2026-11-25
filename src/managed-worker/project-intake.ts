@@ -1,9 +1,8 @@
 /** Prepare a project from an exact owner message; only the live native answer can turn it into a project. */
-import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
+import { newStudioSessionId } from '../studio/source.ts'
 import { draftWorkerRoute, ownerRequest, createStudioSession } from './assistant.ts'
 import { LEADER_PRESET, projectText } from './project.ts'
 import { confirmWithOwner, ownerConfirmationAvailable } from './owner-confirmation.ts'
@@ -57,7 +56,7 @@ export class StudioProjectIntake {
         let committed = false
         try {
           if (!this.available(agent)) throw new Error('PROJECT_CONFIRMATION_UNAVAILABLE')
-          const confirmed = await confirmWithOwner(agent, signal, { id: proposal.proposalId, approve: 'Create project',
+          const confirmed = await confirmWithOwner(agent, signal, { id: proposal.proposalId, approve: 'Create project', allowMobile: true,
             question: `Create the ongoing project “${proposal.name}”?`,
             detail: `Owner's words: ${proposal.intentQuote}\n\nObjective: ${proposal.objective}\n\n${proposal.originTaskId
               ? `Carry forward completed task ${proposal.originTaskId} without rerunning it.` : 'No earlier task is linked.'}\n${proposal.leaderBotId
@@ -68,7 +67,7 @@ export class StudioProjectIntake {
 
           // A passive Leader Session must exist durably before its ID becomes the current management binding.
           // No model is invoked here. A failed confirmation write leaves at most an unbound Session, not a second project.
-          const leaderSessionId = SessionId(randomUUID())
+          const leaderSessionId = newStudioSessionId()
           const leader = await createStudioSession(this.ctx, leaderSessionId, LEADER_PRESET, route, signal)
           await leader.dispose()
           signal.throwIfAborted()
@@ -76,6 +75,7 @@ export class StudioProjectIntake {
           const result = this.store.projects.confirmProposal(agent.id, proposal.proposalId, leaderSessionId)
           if (!result.ok) throw new Error(`Project creation could not be confirmed: ${result.reason}`)
           committed = true
+          this.store.studio.registerSession({ id: leaderSessionId, conversationId: result.value.projectId, role: 'leader', createdAt: Date.now() })
           return { text: `Project created from the owner's confirmation. No Worker was started.\n${projectText(result.value)}` }
         } finally {
           if (!committed) {

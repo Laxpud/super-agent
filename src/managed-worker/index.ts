@@ -9,6 +9,13 @@ import s from '@deepseek-ai/schemastery'
 import { lockSync } from 'proper-lockfile'
 import { z } from 'zod'
 import { AgentDelivery } from '../app/delivery.ts'
+import { StudioFeishuConversation } from '../studio/feishu.ts'
+import { registerStudioHttp } from '../studio/http.ts'
+import { ASK_STUDIO_OWNER } from '../studio/pending.ts'
+import { StudioService } from '../studio/service.ts'
+import { REVISE_STUDIO_TASK } from '../studio/sessions.ts'
+import type { StudioModel } from '../studio/protocol.ts'
+import { DRAFT_DELEGATE, STUDY_DELEGATE } from './result-tool-names.ts'
 import type { AdvisorRoute } from './advisor-store.ts'
 import { AdvisorConfig, StudioAdvisor, advisorSelection, isAdvisorTool } from './advisor.ts'
 import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool, type RestrictedTextRole } from './assistant.ts'
@@ -38,7 +45,7 @@ import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
 import { StudioProjectJobMonitor } from './project-job-monitor.ts'
 import { STUDIO_JOB_HINT, StudioProjectJobControl } from './project-job.ts'
 import { LEADER_PRESET, PROJECT_MODEL_CLEAR_HINT, PROJECT_MODEL_USE_HINT, PROJECT_RESULT_USE_HINT, PROJECT_WORK_BLOCK_HINT,
-  StudioProjectControl, isLeaderTool } from './project.ts'
+  RECORD_WORK, StudioProjectControl, isLeaderTool } from './project.ts'
 import { StudioQuotaNotices } from './quota-notices.ts'
 import { QuotaPoolConfig, StudioQuotaControl, quotaProviderMap } from './quota.ts'
 import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
@@ -47,9 +54,15 @@ import { createTextWorkerModelPolicy, TextWorkerBoundsConfig, TextWorkerDefaults
 import { watchdogCommand } from './watchdog.ts'
 
 export const name = 'dsh-superagent-managed-worker'
-export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'permissionPresets', 'sandboxPolicy', 'sessionPersistence', 'systemPrompt', 'tools', 'webServer']
+export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'permissionPresets', 'sandboxPolicy', 'sessionPersistence', 'systemPrompt', 'tools', 'webServer', 'llm']
+const StudioRoleModel: s<StudioModel> = s.object({ provider: s.string().required(), model: s.string().required(), reasoningEffort: s.string() })
 export const Config = s.object({
   stateDir: s.string().required().description('Absolute directory reserved for the Studio database.'),
+  studioCwd: s.string().default('').description('Workspace directory for new Assistant Sessions; defaults to the Host working directory.'),
+  assistantModel: s.union([s.const(null), StudioRoleModel]).default(null).description('Initial Assistant model selection for Agent Studio.'),
+  leaderModel: s.union([s.const(null), StudioRoleModel]).default(null).description('Initial Leader model selection for Agent Studio.'),
+  feishuConversation: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
+    .description('Bind the unified Assistant conversation to an exact Feishu bot and owner private chat. Mutually exclusive with legacy inboxes.'),
   guiDocumentInbox: s.boolean().default(false).description('Hold pending document writes for owner review when a new chat message arrives in the bound document Worker.'),
   documentContinuations: s.boolean().default(false)
     .description('Route standalone owner continuation requests in Studio Assistant and the linked Feishu document inbox to the current document Worker without changing authorization.'),
@@ -103,7 +116,7 @@ function roleForPreset(preset: string | null): StudioRole | undefined {
 /** Only the rc.3 additions used here are declared. The running host provides the services; no second Cordis or DSH runtime is loaded. */
 type ManagedHost = Context & {
   agentPresets: { presetForSession(session: Agent['session']): string | null }
-  connection: { allowsRemoteAuthorities: boolean; browserPeer: { principal: { kind: string } } }
+  connection: Parameters<typeof registerStudioHttp>[1] & { allowsRemoteAuthorities: boolean }
   commands: { register(command: { name: string; description: string; input: { hint: string }; recordInput: boolean;
     handler(input: CommandInput): CommandResult | Promise<CommandResult> }): () => void }
   sandboxPolicy: { resolve(request: { session: Agent['session'] }): { mode: string } }
@@ -159,9 +172,14 @@ export function apply(context: Context, config: Config): void {
     throw new Error('Studio job watcher requires systemdJobInbox and a polling interval of 5–300 seconds')
   }
   const providerPool = quotaProviderMap(quotaPools)
-  if (feishuDocumentInbox && feishuTextInbox) throw new Error('Choose one Studio Feishu inbox; use feishuTextInbox.documentCorrections for both routes')
+  const conversationInbox = config.feishuConversation
+  const cwd = config.studioCwd || process.cwd()
+  if (!isAbsolute(cwd)) throw new Error('Agent Studio studioCwd must be absolute')
+  if ([feishuDocumentInbox, feishuTextInbox, conversationInbox].filter(Boolean).length > 1) {
+    throw new Error('Configure only one Studio Feishu inbox; the unified Assistant conversation does not share a legacy listener')
+  }
   const feishuConfig = feishuDocumentInbox ?? feishuTextInbox
-  if (feishuConfig) validateFeishuInbox(feishuConfig)
+  if (feishuConfig || conversationInbox) validateFeishuInbox((feishuConfig ?? conversationInbox)!)
   if (feishuTextInbox) validateFeishuTextRoute(feishuTextInbox)
   const combinedFeishu = feishuTextInbox?.documentCorrections === true
   const feishuTextScope = feishuTextInbox ? { scope: feishuSourceScope(feishuTextInbox), documentCorrections: combinedFeishu } : undefined
@@ -172,7 +190,8 @@ export function apply(context: Context, config: Config): void {
   const feishuScope = feishuConfig ? feishuSourceScope(feishuConfig) : undefined
   const quotaNoticeScope = quotaFeishuAlerts ? feishuScope : undefined
   const documentFailureNoticeScope = documentFailureFeishuAlerts ? feishuScope : undefined
-  const feishuSdk = feishuConfig ? new StudioFeishuSdk(feishuConfig.appId, takeFeishuAppSecret()) : undefined
+  const transportConfig = feishuConfig ?? conversationInbox
+  const feishuSdk = transportConfig ? new StudioFeishuSdk(transportConfig.appId, takeFeishuAppSecret()) : undefined
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   let available = true
   const channelStop = new AbortController()
@@ -208,6 +227,18 @@ export function apply(context: Context, config: Config): void {
   const ready = (agent: Agent, role: StudioRole): boolean => available && controlReady(ctx) && currentSession(agent)
     && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
   const channelReady = () => available && controlReady(ctx)
+  let conversationChannel: StudioFeishuConversation | undefined
+  const wakeConversationChannel = () => conversationChannel?.wake()
+  // A channel config can start a verified long connection only on the same owner Host that serves the GUI.
+  const studio = new StudioService(ctx, store, cwd, { assistant: config.assistantModel ?? null, leader: config.leaderModel ?? null },
+    ready, channelStop.signal, () => conversationChannel?.state ?? 'disabled', wakeConversationChannel)
+  if (conversationInbox && feishuSdk) {
+    conversationChannel = new StudioFeishuConversation(feishuSdk, conversationInbox, studio.feishu, channelReady,
+      message => ctx.logger.warn('%s', message))
+  }
+  store.studio.deactivateFeishu(conversationChannel?.scope)
+  // Keep native commands usable on earlier supported hosts without exposing an unauthenticated Studio API.
+  if (typeof ctx.connection.admit === 'function') ctx.effect(() => registerStudioHttp(ctx, ctx.connection, channelReady, studio.operations))
   let failureNotices: StudioDocumentFailureNotices | undefined
   const failureNoticeReady = () => failureNotices?.wake()
   const recovery = documentRecovery ? new StudioDocumentRecovery(ctx, store, agent => ready(agent, 'document-worker'),
@@ -215,6 +246,7 @@ export function apply(context: Context, config: Config): void {
   const quota = new StudioQuotaControl(ctx, store, quotaPools, providerPool, quotaFeishuAlerts)
   const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), ready, provider => quota.denial(provider),
     memory, channelStop.signal, textWorkerModels)
+  studio.sessions.setWorkerRunner(drafts)
   ctx.on('llm/stream', (options, next) => drafts.stream(options, next))
   // On hosts with this optional extension, native command receipts and the exact Worker relay stay out of supplemental log uploads.
   ctx.inject(['sessionLogDeepSeek'], scope => {
@@ -250,7 +282,8 @@ export function apply(context: Context, config: Config): void {
   /** A persisted binding wins over the picker, so a retired or finished Worker cannot become a different role on resume. */
   function roleOf(agent: Agent): StudioRole | undefined {
     if (store.advice.binding(agent.id)) return 'advisor'
-    if (store.draftBinding(agent.id) || store.studies.binding(agent.id) || store.feishuDraftBinding(agent.id) || store.projects.workerBound(agent.id)) {
+    if (store.draftBinding(agent.id) || store.studies.binding(agent.id) || store.feishuDraftBinding(agent.id)
+      || store.projects.workerBound(agent.id) || store.revisions.sourceBinding(agent.id)) {
       return 'draft-worker'
     }
     if (store.binding(agent.id)) return 'document-worker'
@@ -268,6 +301,7 @@ export function apply(context: Context, config: Config): void {
     try {
       // Drain channel attempts, lookups, and text work before closing the Store. External jobs are not owned by this Host.
       if (channelRun) await channelRun
+      await studio.sessions.drain()
       if (quotaNoticeRun) await quotaNoticeRun
       await feishuText?.drain()
       await advisors.drain()
@@ -326,6 +360,8 @@ export function apply(context: Context, config: Config): void {
           return result.value
         },
       })
+      // The Studio directory is a display index. It does not grant or change role authority.
+      studio.observeSession(agent, role)
       scopes.set(agent, { role, dispose() { try { unregister() } finally { unmask() } } })
     } catch (error) { unmask(); throw error }
   }
@@ -339,8 +375,15 @@ export function apply(context: Context, config: Config): void {
       return exec.name === TOOL ? documentGuardFeedback('STORAGE_ERROR', {}) : 'Studio tool denied: STORAGE_ERROR'
     }
     if (!role || !agent) return exec.name === TOOL || exec.name === PROPOSE_PROJECT || exec.name === PROPOSE_PREFERENCE || isAssistantTool(exec.name)
-      || isStudyTool(exec.name) || isLeaderTool(exec.name) || isAdvisorTool(exec.name) ? 'Studio tool denied: INVALID_EXECUTION' : undefined
+      || isStudyTool(exec.name) || isLeaderTool(exec.name) || isAdvisorTool(exec.name)
+      || exec.name === ASK_STUDIO_OWNER || exec.name === REVISE_STUDIO_TASK ? 'Studio tool denied: INVALID_EXECUTION' : undefined
     if (!ready(agent, role) || exec.parent !== undefined) return 'Studio tool denied: INVALID_EXECUTION'
+    if (exec.name === ASK_STUDIO_OWNER) return studio.sessions.canAsk(agent) ? undefined : 'Studio tool denied: INVALID_EXECUTION'
+    if (exec.name === REVISE_STUDIO_TASK) return studio.sessions.canRevise(agent) ? undefined : 'Studio tool denied: INVALID_EXECUTION'
+    if (studio.sessions.isExistingTaskReply(agent) && (exec.name === DRAFT_DELEGATE || exec.name === STUDY_DELEGATE
+      || exec.name === RECORD_WORK || exec.name === PROPOSE_PROJECT)) {
+      return 'Studio task already exists for this reply. Continue the existing item instead of creating new work.'
+    }
     if (role === 'assistant') {
       const denial = drafts.preferenceRouteDenial(agent, exec.callId, exec.name)
       if (denial) return denial
@@ -392,12 +435,14 @@ export function apply(context: Context, config: Config): void {
       const input = currentOwnerInboxInput(step)
       if (input) {
         step.signal.throwIfAborted()
-        const continuation = role === 'assistant' && continuations?.reviewWeb(step, input)
+        const relatedDocument = studio.sessions.relatedDocumentId(agent)
+        const existingTopic = studio.sessions.isExistingTaskReply(agent)
+        const continuation = role === 'assistant' && (!existingTopic || relatedDocument) && continuations?.reviewWeb(step, input, relatedDocument)
         if (continuation) {
           await continuation
           return { kind: 'enter', messages: [] }
         }
-        const registration = projectFactIntake.review(step, input, role)
+        const registration = !existingTopic && projectFactIntake.review(step, input, role)
         if (registration) {
           await registration
           return { kind: 'enter', messages: [] }
@@ -422,6 +467,10 @@ export function apply(context: Context, config: Config): void {
       // Verify the messages the native loop will actually admit, after any downstream pre-step transforms.
       const selection = (step as typeof step & { modelSelection?: AdvisorRoute }).modelSelection
       if (!drafts.admit(agent, decision.messages, turn, selection, step.signal)) return { kind: 'reject' }
+    }
+    if (decision.kind === 'enter' && (role === 'assistant' || role === 'leader')) {
+      const context = studio.sessions.contextFor(agent, decision.messages, step.step)
+      if (context) return { ...decision, messages: [context, ...decision.messages] }
     }
     return decision
   })
@@ -508,7 +557,7 @@ export function apply(context: Context, config: Config): void {
       if (!ready(agent, 'assistant')) {
         // Start with the diagnosis shown in the collapsed row; put the recovery steps in the expandable body.
         const text = presetOf(agent) !== ASSISTANT_PRESET
-          ? 'Use SuperAgent Studio Assistant to read results.\n'
+          ? 'Use Agent Studio Assistant to read results.\n'
             + 'In a new blank session in the same Studio Web profile, choose that Agent preset beside the workspace picker. '
             + 'Run /studio-result <task-id> there, or /studio-result feishu to find recent Feishu tasks. No chat message is needed.'
           : 'This Studio Assistant is not ready to read results.\n'
@@ -584,7 +633,13 @@ export function apply(context: Context, config: Config): void {
         return result.ok ? { kind: 'success', text: intake.describe(agent, result.value) }
           : { kind: 'error', text: `Cannot read project proposal: ${result.reason}.` }
       }
-      return projects.command(agent, commandId, rawInput, assistant || ready(agent, 'leader'))
+      const result = projects.command(agent, commandId, rawInput, assistant || ready(agent, 'leader'))
+      if (result.kind === 'success') {
+        // A legacy owner command can create or adopt a Leader before its first conversation turn.
+        try { studio.observeSession(agent, assistant ? 'assistant' : 'leader'); wakeConversationChannel() }
+        catch { ctx.logger.warn('Agent Studio could not index a native project record') }
+      }
+      return result
     },
   }))
   if (projectJobs) ctx.effect(() => ctx.commands.register({
@@ -622,8 +677,9 @@ export function apply(context: Context, config: Config): void {
       return quota.command(agent.id, commandId, rawInput)
     },
   }))
-  if (feishu) channelRun = feishu.run(channelStop.signal)
+  if (conversationChannel) channelRun = ctx.agents.withoutInitiator(() => conversationChannel!.run(channelStop.signal))
+  else if (feishu) channelRun = feishu.run(channelStop.signal)
   if (quotaNotices) quotaNoticeRun = ctx.agents.withoutInitiator(() => quotaNotices.run(channelStop.signal))
   if (jobMonitor) projectJobRun = ctx.agents.withoutInitiator(() => jobMonitor.run(channelStop.signal))
-  ctx.logger.info('SuperAgent Studio ready (no GitHub source)')
+  ctx.logger.info('Agent Studio ready (no GitHub source)')
 }

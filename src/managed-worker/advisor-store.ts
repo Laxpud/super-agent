@@ -1,6 +1,7 @@
 /** Durable requests, model routes, and outcomes for independent Studio Advisor consultations. */
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
+import { newStudioSessionId } from '../studio/source.ts'
 import type { StudioProjectBinding } from './project-store.js'
 import type { ManagedResult, StudioDraftResult } from './store.js'
 import { assistantSourceUsed } from './study-store.js'
@@ -259,7 +260,7 @@ export class AdvisorStore {
       if (Buffer.byteLength(inputText) > INPUT_BYTE_LIMIT) return deny('ADVICE_INPUT_TOO_LARGE')
       // The shared Advisor admits at most one live consultation, including across a Leader handoff.
       if (this.db.prepare(`SELECT 1 FROM studio_advice WHERE ${LIVE} LIMIT 1`).get()) return deny('ADVICE_BUSY')
-      const advisorSessionId = randomUUID()
+      const advisorSessionId = newStudioSessionId()
       if (this.access.sessionBound(advisorSessionId)) return deny('SESSION_ALREADY_BOUND')
       const bot = this.db.prepare('SELECT bot_id FROM studio_advisor_bot WHERE singleton = 1').get()
       const advisorBotId = bot ? bot.bot_id : randomUUID()

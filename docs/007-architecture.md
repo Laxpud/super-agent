@@ -454,7 +454,22 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
-| `src/studio-web/index.tsx` | Registers Studio's opt-in, read-only tool rows; displays recorded results and provenance without including them in inference |
+| `src/studio/protocol.ts` | Browser-safe contracts for stable conversations, native source coordinates, settings and pending items |
+| `src/studio/source.ts` | Reserved native Session identities and exact attribution for a Studio owner input or supplemental context |
+| `src/studio/store.ts` | Holds the shared SQLite timeline, topics, model defaults, Session record index, pending states and Feishu delivery claims; no distinct per-channel conversation |
+| `src/studio/domain.ts` | Reads the existing project, execution and hold ledgers to resolve the current Leader, provenance and owner work without changing its authority |
+| `src/studio/sessions.ts` | Delivers one native turn per Studio input, selects the current role, captures visible replies and opens source logs read-only |
+| `src/studio/revision-store.ts` | Reserves and settles a new text revision on the original task after verifying the owner reply and its native management scope |
+| `src/studio/pending.ts` | Persists a question and accepts one exact answer while its owner request remains live |
+| `src/studio/models.ts` | Builds the Studio role catalog and verifies concrete model and reasoning-effort combinations |
+| `src/studio/service.ts` | Joins Web and Feishu intake to one conversation, task and pending-item API |
+| `src/studio/http.ts` | Browser-owner-authenticated Studio operations with validated input and bounded responses |
+| `src/studio/feishu.ts` | Maintains one verified private-chat connection and mirrors visible text, topic replies and exact pending-card states |
+| `src/studio-web/index.tsx` | Adds the standalone sidebar entry and main panel, preserving the native tool-result presentation |
+| `src/studio-web/workspaces.ts` | Keeps implicit and explicitly bound Studio Sessions out of the browser catalog presentation without changing Host storage |
+| `src/studio-web/studio.tsx`, `conversation.tsx`, `records.tsx`, `pending.tsx`, `settings.tsx` | Studio navigation, Assistant and Leader chats, record reader, shared pending actions and role defaults |
+| `src/studio-web/api.ts`, `drafts.ts`, `query.ts` | Validated same-origin API calls, independent conversation drafts and cancellable view queries |
+| `src/studio-web/ui.tsx`, `locales.ts`, `styles.ts` | Shared Studio view controls, bilingual strings and Host theme tokens |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
 | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |
@@ -523,6 +538,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx` | The settings groups, drafts and history, the prompts, the Deployment page, and the panel's search, glossary and route memory |
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
+| `tests/studio-store.spec.ts`, `studio-revision-store.spec.ts` | Shared timeline, pending and delivery recovery; exact same-task revisions and stale management fencing |
+| `tests/studio-service.spec.ts`, `studio-feishu.spec.ts` | Shared conversation intake, topic and card addressing, SDK payloads and Feishu binding with offline network fixtures |
+| `tests/studio-web.spec.tsx`, `studio-workspace.spec.ts` | Sidebar/main entry, owner view flows and reversible projection of Studio Sessions out of the browser catalog |
+| `tests/fixtures/studio-runtime.smoke.mjs` | Opt-in installed DSH rc.5 Host smoke test using native authorization, SQLite and Session lifecycle with a local deterministic model adapter |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
 

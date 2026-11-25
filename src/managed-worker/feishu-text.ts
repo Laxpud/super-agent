@@ -1,8 +1,8 @@
 /** Route one explicitly requested Feishu text task to the restricted Worker and preserve its result independently of delivery. */
-import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
+import { newStudioSessionId } from '../studio/source.ts'
 import { draftOutput, type StudioAssistant } from './assistant.ts'
 import { FEISHU_DRAFT_LIST_LIMIT } from './feishu-draft-store.ts'
 import { DRAFT_TEXT_LIMIT, type ManagedWorkerStore, type StudioFeishuDraftTask, type StudioFeishuInstruction } from './store.ts'
@@ -87,7 +87,7 @@ export class StudioFeishuText {
     }
     const denial = this.workers.providerDenial(this.config.provider)
     if (denial) { reply(`No text task was started. ${denial}`); return }
-    const workerId = SessionId(randomUUID())
+    const workerId = newStudioSessionId()
     const reserved = this.store.startFeishuDraft(source, request, workerId)
     if (!reserved.ok) { reply(`No new task was confirmed: ${reserved.reason}.`); return }
     const { task, created } = reserved.value

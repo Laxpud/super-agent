@@ -1,6 +1,7 @@
 /** Durable inputs, single-use Worker reservations, and results for unprojected Studio studies. */
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
+import { newStudioSessionId } from '../studio/source.ts'
 import { guiDocumentContinuationSeen } from './document-continuation-store.js'
 import type { ManagedResult, StudioDraftResult } from './store.js'
 
@@ -256,7 +257,7 @@ export class StudyStore {
       // Allocate a different task, Bot, and Session for every investigation and the final synthesis before any launch.
       for (const [index, excerpt] of [...parts, undefined].entries()) {
         const step: StudyStep = { taskId: randomUUID(), ordinal: index + 1, kind: excerpt === undefined ? 'synthesis' : 'investigation',
-          ...(excerpt === undefined ? {} : { excerpt }), workerBotId: randomUUID(), workerSessionId: randomUUID(), executionEpoch: 1, state: 'pending' }
+          ...(excerpt === undefined ? {} : { excerpt }), workerBotId: randomUUID(), workerSessionId: newStudioSessionId(), executionEpoch: 1, state: 'pending' }
         if (this.access.sessionBound(step.workerSessionId)) return deny('SESSION_ALREADY_BOUND')
         requireWrite(insert.run(step.taskId, taskId, step.ordinal, step.kind, excerpt ?? null, step.workerBotId, step.workerSessionId).changes)
         steps.push(step)
