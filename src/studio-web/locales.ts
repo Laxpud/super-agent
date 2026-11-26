@@ -1,8 +1,10 @@
 /** Studio 界面的词条由宿主 locale 服务统一解析。 */
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
+import { configurationEn, configurationZh } from './settings-locales.ts'
 
 export const NS = 'agentStudio'
 export const en = {
+  ...configurationEn,
   preparing: 'Preparing Studio call…', running: 'Studio call running…', receipt: 'Studio tool receipt',
   stopped: 'Studio call interrupted', failed: 'Studio call failed', noOutput: 'No text was recorded.',
   studio: 'Agent Studio', navigation: 'Studio navigation', assistant: 'Assistant', project: 'Project conversation',
@@ -56,6 +58,7 @@ export const en = {
 } as const
 
 export const zh: Record<keyof typeof en, string> = {
+  ...configurationZh,
   preparing: '正在准备 Studio 调用…', running: 'Studio 正在处理…', receipt: 'Studio 工具回执',
   stopped: 'Studio 调用已中断', failed: 'Studio 调用失败', noOutput: '没有记录文本。',
   studio: 'Agent Studio', navigation: 'Studio 导航', assistant: 'Assistant', project: '项目对话',

@@ -5,6 +5,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
 import { STUDIO_API, STUDIO_HEADER, STUDIO_TEXT_LIMIT, type StudioInput, type StudioOp, type StudioResult } from './protocol.ts'
 import { StudioError } from './pending.ts'
+import { configurationChange, feishuCheck } from './settings-schema.ts'
 import { StudioStoreError } from './store.ts'
 
 // IDs are opaque but bounded; text is kept verbatim so native owner evidence can check exact excerpts.
@@ -15,7 +16,10 @@ const model = z.strictObject({ provider: id, model: id, reasoningEffort: id.exac
 const schemas = {
   state: z.strictObject({}),
   models: z.strictObject({}),
-  settings: z.strictObject({ revision: coord, assistant: model.nullable(), leader: model.nullable() }),
+  configuration: z.strictObject({}),
+  saveConfiguration: configurationChange,
+  feishuCheck,
+  settings: z.strictObject({ revision: coord, scope: z.string().regex(/^[a-f0-9]{64}$/u).exactOptional(), assistant: model.nullable(), leader: model.nullable() }),
   timeline: z.strictObject({ conversationId: id, topicId: id.exactOptional(), before: coord.positive().exactOptional() }),
   message: z.strictObject({ conversationId: id, id }),
   send: z.strictObject({ conversationId: id, requestId: id, text: text(STUDIO_TEXT_LIMIT), replyTo: id.exactOptional(), quoteId: id.exactOptional() }),
@@ -34,7 +38,8 @@ interface BrowserConnection {
 }
 
 async function body(request: IncomingMessage): Promise<unknown> {
-  const max = 256 * 1024
+  // A complete settings proposal may include 64 model combinations and 32 provider pools.
+  const max = 512 * 1024
   if (Number(request.headers['content-length']) > max) throw new StudioError('REQUEST_TOO_LARGE', 'Studio request is too large.', 413)
   let bytes = 0
   const parts: Buffer[] = []

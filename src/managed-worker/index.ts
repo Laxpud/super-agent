@@ -1,4 +1,5 @@
 /** Opt-in Studio roles independent of GitHub setup. Only a bound document Worker can request a managed write. */
+import { createHash } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -10,12 +11,16 @@ import { lockSync } from 'proper-lockfile'
 import { z } from 'zod'
 import { AgentDelivery } from '../app/delivery.ts'
 import { currentPresetId } from '../infra/preset-names.ts'
+import { StudioConfigurationControl } from '../studio/configuration.ts'
 import { StudioFeishuConversation } from '../studio/feishu.ts'
+import { StudioFeishuSetup } from '../studio/feishu-setup.ts'
 import { registerStudioHttp } from '../studio/http.ts'
-import { ASK_STUDIO_OWNER } from '../studio/pending.ts'
+import { ASK_STUDIO_OWNER, StudioError } from '../studio/pending.ts'
+import type { FeishuState, StudioModel } from '../studio/protocol.ts'
 import { StudioService } from '../studio/service.ts'
 import { REVISE_STUDIO_TASK } from '../studio/sessions.ts'
-import type { StudioModel } from '../studio/protocol.ts'
+import { StudioCredentials } from '../studio/settings-credentials.ts'
+import { confirmStudioDirectory, STUDIO_DB, type StudioDirectorySwitch } from '../studio/settings-directory.ts'
 import { DRAFT_DELEGATE, STUDY_DELEGATE } from './result-tool-names.ts'
 import type { AdvisorRoute } from './advisor-store.ts'
 import { AdvisorConfig, StudioAdvisor, advisorSelection, isAdvisorTool } from './advisor.ts'
@@ -29,7 +34,7 @@ import { DOCUMENT_WRITE_TOOL as TOOL, GUARD_REVIEW_HINT, documentGuardReviewComm
 import type { DocumentGuardCapture } from './document-guard-store.ts'
 import { DOCUMENT_GUARD_HINT, documentGuardCommand, documentGuardFeedback } from './document-guard.ts'
 import { StudioDocumentRecovery } from './document-recovery.ts'
-import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, feishuSourceScope, takeFeishuAppSecret, validateFeishuInbox } from './feishu-inbox.ts'
+import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, feishuSourceScope, validateFeishuInbox } from './feishu-inbox.ts'
 import { StudioFeishuSdk } from './feishu-sdk.ts'
 import { StudioFeishuText, feishuDraftOutput, feishuDraftsCommand, validateFeishuTextRoute } from './feishu-text.ts'
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
@@ -95,8 +100,12 @@ export const Config = s.object({
     .description('Allow the owner to attach and check existing local systemd user jobs in a Studio project.'),
   systemdJobPollSeconds: s.number().default(0)
     .description('Seconds between bounded checks of attached jobs, 5–300. Zero disables the watcher and automatic post-processing.'),
+  // GUI 工作流的内部引用，不是额外的用户配置。只保存标识；密钥和目录准备证明各由专属存储提供。
+  studioFeishuCredentialId: s.string().default(''),
+  studioDirectoryToken: s.string().default(''),
 })
-type Config = ReturnType<typeof Config>
+export type StudioHostConfig = ReturnType<typeof Config>
+type Config = StudioHostConfig
 
 const PRESET = 'agent-studio-managed-worker'
 const TEXT_LIMIT = 32_000
@@ -161,7 +170,7 @@ function receipt(operation: string, result: ManagedResult<ManagedTask>, showResu
 }
 
 /** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
-export function apply(context: Context, config: Config): void {
+export async function apply(context: Context, config: Config): Promise<void> {
   const { stateDir, guiDocumentInbox, documentContinuations, advisor, memory, feishuDocumentInbox, feishuTextInbox, quotaPools,
     quotaFeishuAlerts, watchdog, documentRecovery, documentFailureFeishuAlerts, systemdJobInbox, systemdJobPollSeconds } = config
   const ctx = localOwnerHost(context)
@@ -192,9 +201,16 @@ export function apply(context: Context, config: Config): void {
   const quotaNoticeScope = quotaFeishuAlerts ? feishuScope : undefined
   const documentFailureNoticeScope = documentFailureFeishuAlerts ? feishuScope : undefined
   const transportConfig = feishuConfig ?? conversationInbox
-  const feishuSdk = transportConfig ? new StudioFeishuSdk(transportConfig.appId, takeFeishuAppSecret()) : undefined
+  const credentials = new StudioCredentials(ctx)
+  const credential = await credentials.load(transportConfig ?? undefined, config.studioFeishuCredentialId)
+  const feishuSdk = transportConfig && credential.secret ? new StudioFeishuSdk(transportConfig.appId, credential.secret) : undefined
+  const setup = new StudioFeishuSetup()
+  // 只有保留了准备凭据的新目录才可启用；复制未落盘时，DSH 会拒绝本次配置激活。
+  confirmStudioDirectory(stateDir, config.studioDirectoryToken)
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   let available = true
+  let applyingSettings = false
+  let directorySwitch: StudioDirectorySwitch | undefined
   const channelStop = new AbortController()
   let channelRun: Promise<void> | undefined
   let projectJobRun: Promise<void> | undefined
@@ -207,7 +223,7 @@ export function apply(context: Context, config: Config): void {
   } })
   let store: ManagedWorkerStore
   try {
-    store = new ManagedWorkerStore(join(stateDir, 'managed-worker.sqlite'), quotaPools.map(pool => pool.id),
+    store = new ManagedWorkerStore(join(stateDir, STUDIO_DB), quotaPools.map(pool => pool.id),
       quotaNoticeScope, feishuTextScope, documentFailureNoticeScope)
   }
   catch (error) { unlock(); throw error }
@@ -225,21 +241,48 @@ export function apply(context: Context, config: Config): void {
   const currentSession = (agent: Agent): boolean => ctx.agents.get(agent.id) === agent
   const restricted = (agent: Agent): boolean => ctx.permissionPresets.current(agent.session) === 'read-only'
     && ctx.sandboxPolicy.resolve({ session: agent.session }).mode === 'read-only'
-  const ready = (agent: Agent, role: StudioRole): boolean => available && controlReady(ctx) && currentSession(agent)
+  const channelReady = () => available && !applyingSettings && controlReady(ctx)
+  const ready = (agent: Agent, role: StudioRole): boolean => channelReady() && currentSession(agent)
     && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
-  const channelReady = () => available && controlReady(ctx)
   let conversationChannel: StudioFeishuConversation | undefined
+  let feishu: StudioFeishuInbox | undefined
   const wakeConversationChannel = () => conversationChannel?.wake()
+  const feishuState = (): FeishuState => conversationChannel?.state ?? feishu?.connectionState
+    ?? (transportConfig ? 'credential-missing' : 'disabled')
   // A channel config can start a verified long connection only on the same owner Host that serves the GUI.
-  const studio = new StudioService(ctx, store, cwd, { assistant: config.assistantModel ?? null, leader: config.leaderModel ?? null },
-    ready, channelStop.signal, () => conversationChannel?.state ?? 'disabled', wakeConversationChannel)
+  const defaults = { assistant: config.assistantModel ?? null, leader: config.leaderModel ?? null }
+  const settingsScope = createHash('sha256').update(JSON.stringify([stateDir, config.studioDirectoryToken, defaults])).digest('hex')
+  const studio = new StudioService(ctx, store, cwd, defaults, ready, channelStop.signal, feishuState, wakeConversationChannel, settingsScope)
   if (conversationInbox && feishuSdk) {
     conversationChannel = new StudioFeishuConversation(feishuSdk, conversationInbox, studio.feishu, channelReady,
-      message => ctx.logger.warn('%s', message))
+      message => ctx.logger.warn('%s', message), value => setup.receive(value))
   }
-  store.studio.deactivateFeishu(conversationChannel?.scope)
-  // Keep native commands usable on earlier supported hosts without exposing an unauthenticated Studio API.
-  if (typeof ctx.connection.admit === 'function') ctx.effect(() => registerStudioHttp(ctx, ctx.connection, channelReady, studio.operations))
+  // 缺密钥只是暂时不可连接，同一绑定的历史分界不能因此丢失。
+  store.studio.deactivateFeishu(conversationInbox ? feishuSourceScope(conversationInbox) : undefined)
+  const configuration = new StudioConfigurationControl(ctx, config, { credentials, credential, setup, feishuState,
+    quiesce(next, directory) {
+      if (!channelReady() || studio.sessions.busy || [...scopes.keys()].some(agent => agent.status !== 'idle')) {
+        throw new StudioError('STUDIO_CONFIG_WORK_ACTIVE', 'Wait until the current Studio work ends before applying settings.', 409)
+      }
+      // 不让改名、移除映射或启用空账本变相清除已登记或尚未核实的额度停止。
+      if (directory?.mode === 'empty' || JSON.stringify(next.quotaPools) !== JSON.stringify(quotaPools)) {
+        for (const pool of quotaPools) {
+          const status = store.quotaStatus(pool.id)
+          if (!status.ok || status.value) throw new StudioError('STUDIO_QUOTA_HOLD', 'Resolve active quota holds before changing this configuration.', 409)
+        }
+      }
+      if (next.feishu.mode === 'text' && directory?.mode !== 'empty' &&
+        !store.canConfigureFeishuText(feishuSourceScope(next.feishu.binding), next.feishu.documentCorrections)) {
+        throw new StudioError('STUDIO_FEISHU_SCOPE_CONFLICT', 'The private chat is linked to a document and needs combined mode.', 409)
+      }
+      applyingSettings = true
+      directorySwitch = directory
+      return () => { applyingSettings = false; directorySwitch = undefined }
+    },
+  })
+  // 同一入口只对本机所有者开放；设置不注册为 Agent 工具或会话命令。
+  if (typeof ctx.connection.admit === 'function') ctx.effect(() => registerStudioHttp(ctx, ctx.connection, channelReady,
+    { ...studio.operations, ...configuration.operations }))
   let failureNotices: StudioDocumentFailureNotices | undefined
   const failureNoticeReady = () => failureNotices?.wake()
   const recovery = documentRecovery ? new StudioDocumentRecovery(ctx, store, agent => ready(agent, 'document-worker'),
@@ -270,9 +313,9 @@ export function apply(context: Context, config: Config): void {
   const delivery = new AgentDelivery(ctx)
   const continuations = documentContinuations ? new StudioDocumentContinuation(ctx, store, delivery, ready, channelStop.signal) : undefined
   const feishuText = feishuTextInbox ? new StudioFeishuText(store, drafts, feishuTextInbox, channelStop.signal, channelReady) : undefined
-  const feishu = feishuConfig && feishuSdk && new StudioFeishuInbox(ctx, store, feishuSdk, feishuConfig, channelReady, feishuText,
+  if (feishuConfig && feishuSdk) feishu = new StudioFeishuInbox(ctx, store, feishuSdk, feishuConfig, channelReady, feishuText,
     !!feishuDocumentInbox || combinedFeishu, failureNoticeReady,
-    continuations && ((source, intent, signal) => continuations.receiveFeishu(source, intent, signal)))
+    continuations && ((source, intent, signal) => continuations.receiveFeishu(source, intent, signal)), value => setup.receive(value))
   if (documentFailureNoticeScope && feishu) {
     failureNotices = new StudioDocumentFailureNotices(ctx, store, () => feishu.noticeDestination(), channelStop.signal,
       () => ctx.logger.warn('Studio Feishu document failure notice was not confirmed; check /studio-health document <task-id>'))
@@ -302,6 +345,7 @@ export function apply(context: Context, config: Config): void {
     try {
       // Drain channel attempts, lookups, and text work before closing the Store. External jobs are not owned by this Host.
       if (channelRun) await channelRun
+      await setup.stop()
       await studio.sessions.drain()
       if (quotaNoticeRun) await quotaNoticeRun
       await feishuText?.drain()
@@ -317,7 +361,11 @@ export function apply(context: Context, config: Config): void {
       for (const scope of scopes.values()) scope.dispose()
       scopes.clear()
       // Admit no work after marking the run clean. A lost lock or failed shutdown leaves recovery to the next run.
-      if (heldLock) store.finishRun()
+      if (heldLock) {
+        store.finishRun()
+        // 新实例启动前确认有完整账本或已准备好的空账本；不移动或删除原目录。
+        await directorySwitch?.prepare(store)
+      }
     } finally {
       try { store.close() } finally { unlock() }
     }
@@ -405,7 +453,7 @@ export function apply(context: Context, config: Config): void {
     return undefined
   }))
   ctx.on('tools/result', exec => { permits.delete(exec.token); return undefined })
-  ctx.on('agent/created', ({ agent }) => { configure(agent); return undefined })
+  ctx.on('agent/created', ({ agent }) => { if (available && !applyingSettings) configure(agent); return undefined })
   ctx.on('agent/disposed', ({ agent }) => { scopes.get(agent)?.dispose(); scopes.delete(agent) })
   ctx.on('agent-preset/selected', (id, selected) => {
     const preset = currentPresetId(selected)
@@ -414,7 +462,7 @@ export function apply(context: Context, config: Config): void {
     if (!agent) return
     // DSH is still publishing the selection event. Wait until that append returns before recording read-only permissions.
     queueMicrotask(() => {
-      if (!available) return
+      if (!available || applyingSettings) return
       try {
         if (!currentSession(agent) || presetOf(agent) !== preset) return
         // The loop assembles prompts and tools before pre-step. An overlapping turn may already have taken the old snapshot.
@@ -481,7 +529,7 @@ export function apply(context: Context, config: Config): void {
   recovery?.install()
 
   if (guiDocumentInbox) captureDocumentInstructions(ctx, store, session => {
-    if (!available || !controlReady(ctx)) return false
+    if (!channelReady()) return false
     const agent = ctx.agents.get(session.id)
     // Restrictions on the role's tools do not turn a message to its exact live Session into an untracked input.
     return agent?.session === session && scopes.get(agent)?.role === 'document-worker'
@@ -496,7 +544,7 @@ export function apply(context: Context, config: Config): void {
     recordInput: false,
     handler({ agent, commandId, rawInput, signal }) {
       signal.throwIfAborted()
-      if (!available || !controlReady(ctx)) return rejected('CONTROL_UNAVAILABLE')
+      if (!channelReady()) return rejected('CONTROL_UNAVAILABLE')
       if (rawInput.length > TEXT_LIMIT * 12 + 128) return rejected('INPUT_TOO_LARGE')
       const [, verb, argument = ''] = /^\s*(\S+)(?:\s+([\s\S]*))?$/.exec(rawInput.trim()) ?? []
       if (!ready(agent, 'document-worker')) return verb === 'guard' || verb === 'guard-review'

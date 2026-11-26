@@ -468,10 +468,17 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/studio/service.ts` | Joins Web and Feishu intake to one conversation, task and pending-item API |
 | `src/studio/http.ts` | Browser-owner-authenticated Studio operations with validated input and bounded responses |
 | `src/studio/feishu.ts` | Maintains one verified private-chat connection and mirrors visible text, topic replies and exact pending-card states |
+| `src/studio/settings-protocol.ts`, `settings-schema.ts` | Defines the full owner settings view and validates versioned changes and private-chat verification requests |
+| `src/studio/configuration.ts` | Checks effective revisions and runtime constraints, then applies Studio settings through the DSH profile configuration editor |
+| `src/studio/feishu-setup.ts` | Confirms the bot and private chat using an expiring owner challenge without dispatching or recording it in the conversation |
+| `src/studio/settings-credentials.ts`, `settings-directory.ts` | Uses DSH credentials for Feishu and prepares verified SQLite copies or explicitly empty data directories after a clean stop |
 | `src/studio-web/index.tsx` | Adds the standalone sidebar entry and main panel, preserving the native tool-result presentation |
 | `src/studio-web/workspaces.ts` | Keeps implicit and explicitly bound Studio Sessions out of the browser catalog presentation without changing Host storage |
 | `src/studio-web/studio.tsx`, `conversation.tsx`, `records.tsx`, `pending.tsx`, `settings.tsx` | Studio navigation, Assistant and Leader chats, record reader, shared pending actions and role defaults |
 | `src/studio-web/api.ts`, `drafts.ts`, `query.ts` | Validated same-origin API calls, independent conversation drafts and cancellable view queries |
+| `src/studio-web/configuration.tsx`, `settings-sections.tsx` | Stages and reviews edits across settings groups, reads back their effect, and handles the separate data directory confirmation |
+| `src/studio-web/settings-feishu.tsx` | Starts a bounded Feishu verification without keeping the secret in a saved draft, and shows the exact binding and connection state |
+| `src/studio-web/settings-fields.tsx`, `settings-locales.ts` | Accessible settings fields, confirmation dialogs and localized recovery guidance |
 | `src/studio-web/ui.tsx`, `locales.ts`, `styles.ts` | Shared Studio view controls, bilingual strings and Host theme tokens |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |

@@ -21,8 +21,25 @@ const optional = (value: unknown, check: (value: unknown) => boolean) => value =
 const items = (value: unknown, check: (value: unknown) => boolean) => Array.isArray(value) && value.every(check)
 const source = (value: unknown) => object(value) && text(value.sessionId) && whole(value.eventSeq)
 const model = (value: unknown) => object(value) && text(value.provider) && text(value.model) && optional(value.reasoningEffort, text)
-const settings = (value: unknown) => object(value) && whole(value.revision)
-  && (value.assistant === null || model(value.assistant)) && (value.leader === null || model(value.leader))
+const nullableModel = (value: unknown) => value === null || model(value)
+const settings = (value: unknown) => object(value) && whole(value.revision) && optional(value.scope, revision)
+  && nullableModel(value.assistant) && nullableModel(value.leader)
+const feishuState = (value: unknown) => choice(value, ['disabled', 'connecting', 'online', 'offline', 'identity-mismatch', 'credential-missing'])
+const binding = (value: unknown) => object(value) && [value.appId, value.botOpenId, value.ownerOpenId, value.chatId].every(text)
+const feishu = (value: unknown) => object(value) && (value.mode === 'off' || (binding(value.binding) && (
+  value.mode === 'conversation' || value.mode === 'document' || (value.mode === 'text' && text(value.cwd) && model(value.route)
+    && typeof value.documentCorrections === 'boolean'))))
+const pinned = (value: unknown) => object(value) && model(value) && text(value.reasoningEffort)
+const selection = (value: unknown) => value === null || pinned(value)
+const bounds = (value: unknown) => object(value) && selection(value.min) && selection(value.max)
+const bothRoles = (value: unknown, check: (value: unknown) => boolean) => object(value) && check(value.assistant) && check(value.leader)
+const revision = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value)
+const configuration = (value: unknown) => object(value) && text(value.stateDir) && text(value.studioCwd) && feishu(value.feishu)
+  && [value.assistantModel, value.leaderModel, value.advisor].every(nullableModel) && items(value.textWorkerRoutes, pinned)
+  && bothRoles(value.textWorkerDefaults, selection) && bothRoles(value.textWorkerBounds, bounds)
+  && items(value.quotaPools, row => object(row) && text(row.id) && items(row.providers, text)) && whole(value.systemdJobPollSeconds)
+  && [value.guiDocumentInbox, value.documentContinuations, value.memory, value.quotaFeishuAlerts, value.watchdog, value.documentRecovery,
+    value.documentFailureFeishuAlerts, value.systemdJobInbox].every(field => typeof field === 'boolean')
 const session = (value: unknown) => object(value) && text(value.id) && text(value.conversationId) && whole(value.createdAt)
   && choice(value.role, ['assistant', 'leader', 'document-worker', 'draft-worker', 'advisor', 'subagent'])
 const pending = (value: unknown) => object(value) && [value.id, value.conversationId, value.title, value.detail, value.requester].every(text)
@@ -44,9 +61,17 @@ function readable(op: StudioOp, value: unknown): boolean {
     && text(option.label) && items(option.reasoningEfforts, text))
   if (!object(value)) return false
   switch (op) {
-    case 'state': return whole(value.pendingCount) && settings(value.settings) && choice(value.feishu, ['disabled', 'connecting', 'online', 'offline', 'identity-mismatch'])
+    case 'state': return whole(value.pendingCount) && settings(value.settings) && feishuState(value.feishu)
       && items(value.projects, project => object(project) && text(project.id) && text(project.name) && text(project.objective))
       && optional(value.hiddenSessionIds, list => items(list, text))
+    case 'configuration': return revision(value.revision) && optional(value.profile, text) && typeof value.writable === 'boolean'
+      && typeof value.credentialsWritable === 'boolean' && configuration(value.config) && object(value.feishu)
+      && feishuState(value.feishu.state) && choice(value.feishu.credential, ['none', 'startup', 'stored', 'missing'])
+    case 'saveConfiguration': return revision(value.revision) && optional(value.credentialCleanup, state => state === 'unconfirmed')
+    case 'feishuCheck': return text(value.id) && ((value.state === 'connecting' || value.state === 'waiting') ? text(value.phrase) && whole(value.expiresAt)
+      : value.state === 'verified' ? binding(value.binding) && whole(value.expiresAt) : value.state === 'failed'
+        ? choice(value.reason, ['FEISHU_BOT_UNCONFIRMED', 'FEISHU_BOT_MISMATCH', 'FEISHU_CONNECTION_UNCONFIRMED'])
+        : value.state === 'cancelled' || value.state === 'expired')
     case 'settings': return settings(value)
     case 'timeline': return items(value.items, message)
     case 'message': case 'send': return message(value)
@@ -59,7 +84,7 @@ function readable(op: StudioOp, value: unknown): boolean {
 
 export const callStudio: StudioCall = async (op, input, signal) => {
   // 请求有上限，避免网络挂起后阻塞轮询，也避免写入未应答时自动重发。
-  const timeout = AbortSignal.timeout(op === 'send' || op === 'answer' || op === 'settings' ? 30_000 : 15_000)
+  const timeout = AbortSignal.timeout(op === 'saveConfiguration' ? 120_000 : op === 'send' || op === 'answer' || op === 'settings' ? 30_000 : 15_000)
   const bounded = signal ? AbortSignal.any([signal, timeout]) : timeout
   let response: Response | undefined
   let data: unknown

@@ -5,6 +5,7 @@ import { failureText, type StudioCall } from './api.ts'
 import type { Address, Drafts } from './drafts.ts'
 import type { T } from './locales.ts'
 import type { QuerySnapshot } from './query.ts'
+import type { SettingsSection } from './settings-fields.tsx'
 
 export interface ChatView extends Address { kind: 'chat'; cursors?: number[] }
 export type StudioView = ChatView
@@ -12,7 +13,7 @@ export type StudioView = ChatView
   | { kind: 'pending'; cursors?: number[] }
   | { kind: 'records'; query?: string; cursors?: number[] }
   | { kind: 'record'; sessionId: string; focusSeq?: number; cursors?: number[] }
-  | { kind: 'settings' }
+  | { kind: 'settings'; section?: SettingsSection }
 interface Location { view: StudioView; previous?: Location }
 
 interface StudioFace {

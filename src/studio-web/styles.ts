@@ -119,6 +119,30 @@ export const styles = `
 .as-studio .as-model-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr)); }
 .as-studio .as-model-grid label { display: grid; gap: 4px; min-width: 0; font-size: 12px; color: var(--dsw-alias-label-secondary); }
 .as-studio .as-model-grid select { width: 100%; font-size: 13px; }
+.as-studio .as-feishu-state { display: inline-flex; align-items: center; gap: 5px; }
+.as-studio .as-settings-nav { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--dsw-alias-border-l2); padding-bottom: 10px; }
+.as-studio .as-settings-nav [aria-current='page'] { border-color: var(--dsw-alias-border-selected); font-weight: 650; }
+.as-studio .as-config-view { display: grid; gap: 12px; min-width: 0; }
+.as-studio .as-config-view[hidden] { display: none; }
+.as-studio .as-setting-panel { padding: 0; border: 0; margin: 0; min-width: 0; }
+.as-studio .as-setting-panel:empty { display: none; }
+.as-studio .as-setting-field { display: grid; gap: 4px; min-width: 0; align-content: start; }
+.as-studio .as-setting-field select { width: 100%; }
+.as-studio .as-setting-toggle { display: grid; align-items: center; grid-template-columns: auto minmax(0, 1fr); gap: 4px 8px; min-width: 0; }
+.as-studio .as-setting-toggle input { inline-size: 16px; block-size: 16px; min-height: 0; padding: 0; margin: 3px 2px; accent-color: var(--dsw-alias-button-primary-fill); }
+.as-studio .as-setting-toggle label { line-height: 1.5; cursor: pointer; }
+.as-studio .as-setting-toggle p { grid-column: 2; }
+.as-studio .as-setting-row { display: grid; gap: 4px; min-width: 0; }
+.as-studio .as-settings-code { display: block; padding: 7px 9px; background: var(--dsw-alias-bg-layer-2); border-radius: 7px; overflow-wrap: anywhere; }
+.as-studio .as-settings a { color: var(--dsw-alias-label-primary); text-decoration: underline; text-underline-offset: 2px; }
+.as-studio .as-settings-dialog {
+  width: min(90%, 34rem); max-height: 85vh; padding: 16px; overflow: auto; margin: auto;
+  border: 1px solid var(--dsw-alias-border-l2); border-radius: 12px;
+  color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-layer-1);
+}
+.as-studio .as-settings-dialog::backdrop { background: var(--dsw-alias-bg-overlay); }
+.as-studio .as-settings-dialog form { display: grid; gap: 12px; }
+.as-studio .as-settings-changes { margin-block: 0; padding-inline-start: 22px; }
 .as-studio .as-visually-hidden { position: absolute; clip-path: inset(50%); width: 1px; height: 1px; overflow: hidden; white-space: nowrap; }
 @media (pointer: coarse) {
   .as-studio :is(button, input, select, summary) { min-height: 44px; }

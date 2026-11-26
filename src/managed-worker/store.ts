@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import { chmodSync, closeSync, fchmodSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
-import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
+import { backup, DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { types } from 'node:util'
 import { studioArtifacts, studioBlockingItems, studioHiddenIds, studioPendingRecord, studioProject, studioProjects, studioRelatedWork, studioSession } from '../studio/domain.ts'
 import { StudioStore } from '../studio/store.ts'
@@ -593,6 +593,18 @@ export class ManagedWorkerStore {
     })
   }
 
+  /** 请求切换目录时，只有已关闭所有写入口并确认写入账本结束标记，才可使用新目录。 */
+  assertStateSealed(): void {
+    const clean = this.db.prepare('SELECT clean FROM managed_host_run WHERE singleton = 1 AND run_id = ?').get(this.#runId)
+    if (clean?.clean !== 1) throw new Error('Cannot switch Studio state before a confirmed clean stop')
+  }
+
+  /** 在旧进程仍持有目录锁时复制包括 WAL 在内的完整 SQLite 快照。 */
+  async copySettingsState(target: string): Promise<void> {
+    this.assertStateSealed()
+    await backup(this.db, target, { rate: 256 })
+  }
+
   /** Close without attesting that the run was safe to resume. Used on both normal teardown and storage failure. */
   close(): void {
     if (this.closed) return
@@ -988,6 +1000,12 @@ export class ManagedWorkerStore {
   feishuDraftScopeAvailable(scope: string): boolean {
     if (this.feishuText?.scope !== scope) return false
     const result = this.snapshot(() => accept(!this.hasExclusiveFeishuDocument(scope)))
+    return result.ok && result.value
+  }
+
+  /** 配置变更时只核对目标私聊是否与已登记的文档冲突，不以当前是否启用文字入口为前提。 */
+  canConfigureFeishuText(scope: string, combined: boolean): boolean {
+    const result = this.snapshot(() => accept(combined || this.instructions.feishuTask(scope) === undefined))
     return result.ok && result.value
   }
 

@@ -4,6 +4,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import s from '@deepseek-ai/schemastery'
 import { z } from 'zod'
+import type { FeishuState } from '../studio/protocol.ts'
 import { documentContinuationIntent, type DocumentContinuationIntent } from './document-continuation-intent.ts'
 import type { StudioFeishuSdk } from './feishu-sdk.ts'
 import { feishuTextCommand, type FeishuTextRoute, type StudioFeishuText } from './feishu-text.ts'
@@ -81,20 +82,11 @@ export function validateFeishuInbox(config: FeishuInboxConfig): void {
   }
 }
 
-/** Consume the launch-only credential before starting any Studio work. Never put it in the profile or subprocess environment. */
-export function takeFeishuAppSecret(): string {
-  const secret = process.env.STUDIO_FEISHU_APP_SECRET
-  delete process.env.STUDIO_FEISHU_APP_SECRET
-  if (!secret || !secret.isWellFormed() || /\s|\0/u.test(secret)) {
-    throw new Error('Provide the dedicated Feishu App Secret in STUDIO_FEISHU_APP_SECRET when launching Studio')
-  }
-  return secret
-}
-
 /** Own the private bot listener and its limited best-effort receipts, without starting the GitHub-backed Runtime. */
 export class StudioFeishuInbox {
   private listening = false
   private state = 'waiting for the bot connection'
+  connectionState: FeishuState = 'connecting'
   private readonly scope: string
   private readonly replies = new Set<Promise<void>>()
   private readonly continuations = new Set<Promise<void>>()
@@ -103,7 +95,7 @@ export class StudioFeishuInbox {
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore, private readonly sdk: StudioFeishuSdk,
     private readonly config: FeishuInboxConfig, private readonly allowed: () => boolean, private readonly text: StudioFeishuText | undefined,
     private readonly documentCorrections: boolean, private readonly onNoticeReady?: () => void,
-    private readonly onDocumentContinuation?: FeishuDocumentContinuation) {
+    private readonly onDocumentContinuation?: FeishuDocumentContinuation, private readonly verificationMessage?: (value: unknown) => boolean) {
     this.scope = feishuSourceScope(config)
   }
 
@@ -135,6 +127,7 @@ export class StudioFeishuInbox {
     while (!signal.aborted) {
       if (!this.allowed()) {
         this.state = 'waiting for the local owner Web host'
+        this.connectionState = 'offline'
         await delay(1_000, undefined, { signal }).catch(() => {})
         continue
       }
@@ -143,10 +136,12 @@ export class StudioFeishuInbox {
       const active = AbortSignal.any([signal, connection.signal])
       try {
         this.state = 'checking bot identity'
+        this.connectionState = 'connecting'
         const bot = await this.sdk.botOpenId(active)
         active.throwIfAborted()
         if (bot !== this.config.botOpenId) {
           this.state = 'the verified bot does not match the configured Feishu identity'
+          this.connectionState = 'identity-mismatch'
           return
         }
         if (!this.allowed()) continue
@@ -157,6 +152,7 @@ export class StudioFeishuInbox {
             this.listening = true
             this.noticeChannel = { signal: active }
             this.state = 'listening for the configured private chat'
+            this.connectionState = 'online'
             this.onNoticeReady?.()
           },
           problem: () => {
@@ -175,6 +171,7 @@ export class StudioFeishuInbox {
       } finally {
         this.listening = false
         this.noticeChannel = undefined
+        if (this.connectionState !== 'identity-mismatch') this.connectionState = 'offline'
         connection.abort()
         // An aborted connection cannot start more replies, but its continuation callbacks may still be settling.
         await Promise.all([...this.continuations, ...this.replies])
@@ -187,7 +184,7 @@ export class StudioFeishuInbox {
 
   /** Record synchronously, before starting any outbound receipt or allowing the next event to run. */
   private receive(value: unknown, signal: AbortSignal): void {
-    if (signal.aborted || !this.listening || !this.allowed()) return
+    if (signal.aborted || !this.listening || !this.allowed() || this.verificationMessage?.(value)) return
     const event = liveMessage.safeParse(value)
     if (!event.success) return
     const { app_id: app, sender, message: data } = event.data

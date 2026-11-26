@@ -1,4 +1,6 @@
 /** Browser-safe contract for the owner-facing Studio. Session IDs are provenance, never conversation addresses. */
+import type { ConfigurationChange, ConfigurationReceipt, ConfigurationSnapshot, FeishuCheck, FeishuCheckResult } from './settings-protocol.ts'
+
 export const ASSISTANT_CONVERSATION = 'assistant'
 export const STUDIO_API = '/agent-studio/api'
 export const STUDIO_HEADER = 'x-agent-studio-request'
@@ -37,10 +39,12 @@ export interface StudioModel { provider: string; model: string; reasoningEffort?
 export interface StudioModelOption { provider: string; model: string; label: string; reasoningEfforts: string[] }
 export interface StudioSettings {
   revision: number
+  /** 数据目录或缺省设置改变时，旧数据库版本不能用于保存当前对话模型。 */
+  scope?: string
   assistant: StudioModel | null
   leader: StudioModel | null
 }
-export type FeishuState = 'disabled' | 'connecting' | 'online' | 'offline' | 'identity-mismatch'
+export type FeishuState = 'disabled' | 'connecting' | 'online' | 'offline' | 'identity-mismatch' | 'credential-missing'
 export interface StudioState {
   projects: StudioProjectSummary[]
   pendingCount: number
@@ -94,6 +98,9 @@ export interface StudioSend {
 export interface StudioOperations {
   state: { input: Record<string, never>; result: StudioState }
   models: { input: Record<string, never>; result: StudioModelOption[] }
+  configuration: { input: Record<string, never>; result: ConfigurationSnapshot }
+  saveConfiguration: { input: ConfigurationChange; result: ConfigurationReceipt }
+  feishuCheck: { input: FeishuCheck; result: FeishuCheckResult }
   settings: { input: StudioSettings; result: StudioSettings }
   timeline: { input: { conversationId: string; topicId?: string; before?: number }; result: StudioPage<StudioMessage> }
   message: { input: { conversationId: string; id: string }; result: StudioMessage }

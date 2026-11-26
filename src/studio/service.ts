@@ -12,6 +12,7 @@ import { ASSISTANT_CONVERSATION, STUDIO_TEXT_LIMIT, type FeishuState, type Studi
 import { StudioSessions } from './sessions.ts'
 import type { StudioFeishuInput, StudioFeishuPort } from './feishu.ts'
 import type { StudioHttpOperations } from './http.ts'
+import type { StudioConfigurationOp } from './settings-protocol.ts'
 
 /** Offer the same Assistant and pending state to the authorized Web and Feishu entry points. */
 export class StudioService {
@@ -19,7 +20,8 @@ export class StudioService {
 
   constructor(private readonly ctx: Context, private readonly domain: ManagedWorkerStore, cwd: string,
     defaults: Pick<StudioSettings, 'assistant' | 'leader'>, ready: (agent: Agent, role: 'assistant' | 'leader') => boolean,
-    private readonly stopping: AbortSignal, private readonly feishuState: () => FeishuState, private readonly wake: () => void) {
+    private readonly stopping: AbortSignal, private readonly feishuState: () => FeishuState, private readonly wake: () => void,
+    private readonly settingsScope?: string) {
     this.sessions = new StudioSessions(ctx, domain, cwd, defaults, ready, stopping, wake)
   }
 
@@ -195,18 +197,24 @@ export class StudioService {
     return this.store.settlePending(id, 'resolved', value, 'gui') ?? this.store.pendingItem(id) ?? item
   }
 
-  private async saveSettings(input: StudioSettings, request: AbortSignal): Promise<StudioSettings> {
-    const signal = AbortSignal.any([request, this.stopping])
-    if (input.revision !== this.sessions.settings.revision) throw new StudioError('SETTINGS_CONFLICT', 'Studio settings changed. Reload them before saving.', 409)
-    await Promise.all([input.assistant, input.leader].map(route => route ? confirmStudioModel(this.ctx, route, signal) : undefined))
-    signal.throwIfAborted()
-    return this.store.saveSettings(input)
+  private scoped(settings: StudioSettings): StudioSettings {
+    return this.settingsScope ? { ...settings, scope: this.settingsScope } : settings
   }
 
-  readonly operations: StudioHttpOperations = {
+  private async saveSettings(input: StudioSettings, request: AbortSignal): Promise<StudioSettings> {
+    const signal = AbortSignal.any([request, this.stopping])
+    if ((input.scope !== undefined && input.scope !== this.settingsScope) || input.revision !== this.sessions.settings.revision) {
+      throw new StudioError('SETTINGS_CONFLICT', 'Studio settings changed. Reload them before saving.', 409)
+    }
+    await Promise.all([input.assistant, input.leader].map(route => route ? confirmStudioModel(this.ctx, route, signal) : undefined))
+    signal.throwIfAborted()
+    return this.scoped(this.store.saveSettings(input))
+  }
+
+  readonly operations: Omit<StudioHttpOperations, StudioConfigurationOp> = {
     state: () => {
       this.refreshBlockers()
-      return { projects: this.domain.studioProjects(), pendingCount: this.store.pendingCount(), settings: this.sessions.settings,
+      return { projects: this.domain.studioProjects(), pendingCount: this.store.pendingCount(), settings: this.scoped(this.sessions.settings),
         feishu: this.feishuState(), hiddenSessionIds: this.domain.studioHiddenIds() }
     },
     models: (_input, signal) => studioModelOptions(this.ctx, AbortSignal.any([signal, this.stopping])),

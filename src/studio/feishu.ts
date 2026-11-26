@@ -148,7 +148,8 @@ export class StudioFeishuConversation {
   private wakeDelivery: (() => void) | undefined
 
   constructor(private readonly sdk: StudioFeishuSdk, config: FeishuInboxConfig, private readonly port: StudioFeishuPort,
-    private readonly ready: () => boolean, private readonly warn: (message: string) => void) {
+    private readonly ready: () => boolean, private readonly warn: (message: string) => void,
+    private readonly verificationMessage?: (value: unknown) => boolean) {
     validateFeishuInbox(config)
     this.config = { ...config }
     this.scope = feishuSourceScope(this.config)
@@ -235,6 +236,7 @@ export class StudioFeishuConversation {
   }
 
   private receive(raw: unknown, cutover: number, signal: AbortSignal, inputs: Set<Promise<void>>): void {
+    if (this.verificationMessage?.(raw)) return
     const source = readTextEvent(raw, this.config, this.scope, cutover)
     if (!source) return
     if (inputs.size >= MAX_ACTIVE_INPUTS) {
