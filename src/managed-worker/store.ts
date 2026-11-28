@@ -7,6 +7,7 @@ import { studioActiveTasks, studioArtifacts, studioBlockingItems, studioDelivery
 import { ASSISTANT_CONVERSATION, GUARD_PENDING_CHOICES, GUARD_PENDING_PREFIX, type StudioCheckResult, type StudioPending, type StudioRecordRole,
   type StudioMessage, type StudioProjectSummary, type StudioRole, type StudioTaskScope, type StudioTaskStatus, type StudioWorkerPermission } from '../studio/protocol.ts'
 import { STUDIO_OWNER_PREFIX } from '../studio/source.ts'
+import { StudioSelfUpdateLedger } from '../studio/self-update-ledger.ts'
 import { TASK_WRITE_PENDING_PREFIX, STUDIO_SCHEMA, STUDIO_FORWARD_SCHEMA, StudioStore } from '../studio/store.ts'
 import { MemoryStore } from './memory-store.ts'
 import { ProjectArchiveStore } from './project-archive-store.ts'
@@ -392,7 +393,7 @@ export class ManagedWorkerStore {
       const access = { db, write: <T>(fn: () => T) => this.write(fn), assertActive: () => this.assertActive(),
         expireTaskConfirmationsInTx: (taskId: string) => this.studio.expireTaskConfirmationsInTx(taskId),
         interruptProjectInTx: (projectId: string, epoch: number) => this.studio.interruptProjectInTx(projectId, epoch) }
-      this.studio = new StudioStore(db, access.assertActive, true)
+      this.studio = new StudioStore(db, access.assertActive, true, () => this.assertReadable())
       this.projects = new ProjectStore(access, this.protectedRoots)
       this.memory = new MemoryStore(access)
       this.projectArchive = new ProjectArchiveStore(access)
@@ -454,6 +455,58 @@ export class ManagedWorkerStore {
       this.#expireWriteConfirmations()
       this.#db.prepare('UPDATE studio_host_run SET clean = 1 WHERE singleton = 1 AND run_id = ?').run(this.#runId)
     })
+  }
+
+  get runId(): string { return this.#runId }
+
+  enableSelfUpdateLedger(): StudioSelfUpdateLedger {
+    return new StudioSelfUpdateLedger(this.#db, this.studio, this.#runId, operation => this.write(operation))
+  }
+
+  /** 同一个已封存的运行仍可提供只读查询；更换运行或关闭连接后不再读取。 */
+  assertReadable(): void {
+    if (this.#closed || !this.#db.prepare('SELECT 1 FROM studio_host_run WHERE singleton = 1 AND run_id = ?').get(this.#runId)) {
+      throw new Error('Studio host run is no longer readable')
+    }
+  }
+
+  /** 阻塞项已静止，可跨重启保留；可能执行或等待批准的任务必须先自然完成。 */
+  updateWorkBusy(): boolean {
+    this.assertReadable()
+    return !!this.#db.prepare(`SELECT 1 FROM studio_task WHERE status IN ('queued', 'running', 'waiting_approval')
+      UNION ALL SELECT 1 FROM studio_task_execution WHERE ended_at IS NULL LIMIT 1`).get()
+  }
+
+  sqliteHealth(): { version: number; ok: boolean } {
+    try {
+      this.assertReadable()
+      const version = Number(this.#db.prepare('PRAGMA user_version').get()?.user_version ?? 0)
+      return { version, ok: version === CURRENT_STUDIO_VERSION && this.#db.prepare('SELECT 1 AS ok').get()?.ok === 1 }
+    } catch { return { version: 0, ok: false } }
+  }
+
+  /** 先确认无忙读者，再封存运行并把封存标记本身落入主库；失败不能生成可交接回执。 */
+  checkpointAndSeal(): { runId: string; checkpointed: true; sealedAt: string } {
+    if (this.#db.isTransaction) throw new Error('Studio WAL checkpoint requires no outer transaction')
+    this.assertActive()
+    const truncate = () => {
+      if (this.#db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get()?.busy !== 0) throw new Error('Studio WAL checkpoint is busy or failed')
+    }
+    truncate()
+    this.write(() => {
+      // 更新不等同于常规关停：活动工作未排空时拒绝封存，不撤销执行，也不制造新的飞书投递。
+      if (this.updateWorkBusy() || this.studio.feishuOutboxBusy()) throw new Error('Studio writes have not drained')
+      const result = this.#db.prepare('UPDATE studio_host_run SET clean = 1 WHERE singleton = 1 AND run_id = ? AND clean = 0').run(this.#runId)
+      if (result.changes !== 1) throw new Error('Studio run was not sealed')
+    })
+    try { truncate() } catch (error) { this.resumeAfterSeal(this.#runId); throw error }
+    return { runId: this.#runId, checkpointed: true, sealedAt: studioNow() }
+  }
+
+  /** 只有尚未交接的同一进程可撤销封存；新运行仍不能接过旧回执。 */
+  resumeAfterSeal(runId: string): void {
+    if (runId !== this.#runId || !this.#transaction(() => this.#db.prepare(`UPDATE studio_host_run SET clean = 0
+      WHERE singleton = 1 AND run_id = ? AND clean = 1`).run(runId).changes)) throw new Error('Studio run seal could not be released')
   }
 
   assertStateSealed(): void {

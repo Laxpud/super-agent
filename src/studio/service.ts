@@ -9,13 +9,23 @@ import { verifyWorkspaceIdentity, WorkspacePathError } from '../managed-worker/w
 import { confirmStudioModel, studioModelOptions } from './models.ts'
 import { StudioError } from './pending.ts'
 import { classifyOwnerInput, namesConfirmation, refersToThisConfirmation, type OwnerInput, type TextDecision } from './owner-text.ts'
-import { ASSISTANT_CONVERSATION, GUARD_PENDING_CHOICES, GUARD_PENDING_PREFIX, GUARD_PENDING_TEXT_HINT, STUDIO_TEXT_LIMIT,
-  type FeishuState, type StudioFeishuMessageStatus, type StudioForwardSummary, type StudioMessage, type StudioMessageStatus, type StudioPending,
+import { ASSISTANT_CONVERSATION, GUARD_PENDING_CHOICES, GUARD_PENDING_PREFIX, GUARD_PENDING_TEXT_HINT, SELF_UPDATE_PENDING_ID, SELF_UPDATE_CHOICES, STUDIO_TEXT_LIMIT,
+  type FeishuState, type StudioHealthStatus, type StudioFeishuMessageStatus, type StudioForwardSummary, type StudioMessage, type StudioMessageStatus, type StudioPending,
   type StudioPreference, type StudioProjectArchive, type StudioProjectCoordinate, type StudioProjectCreate, type StudioProjectSummary, type StudioSend, type StudioSettings } from './protocol.ts'
 import { StudioSessions } from './sessions.ts'
 import type { StudioFeishuInput, StudioFeishuPort } from './feishu.ts'
 import type { StudioHttpOperations } from './http.ts'
 import type { StudioConfigurationOp } from './settings-protocol.ts'
+import { resolveLoadedBuildInfo } from './build-info.ts'
+import { disabledSelfUpdateStatus, studioBuildIdentity, type StudioSelfUpdate } from './self-update.ts'
+
+interface StudioServiceRuntime {
+  readonly updates?: StudioSelfUpdate
+  draining(): boolean
+  sealed(): boolean
+  available(): boolean
+  configOk(): boolean
+}
 
 type FeishuLookup = { scope: string; verifiedMessage(id: string, cutover: number, signal: AbortSignal): Promise<StudioFeishuInput> }
 const preferenceView = ({ prefKey, ...value }: StoredPreference): StudioPreference => ({ ...value, key: prefKey })
@@ -26,12 +36,30 @@ const projectView = ({ id, name, objective, workspacePath, state, managementEpoc
 export class StudioService {
   readonly sessions: StudioSessions
   private feishuLookup?: FeishuLookup
+  private ownerLookups = 0
 
   constructor(private readonly ctx: Context, private readonly domain: ManagedWorkerStore, cwd: string,
     defaults: Pick<StudioSettings, 'assistant' | 'leader'>, ready: (agent: Agent, role: 'assistant' | 'leader') => boolean,
     private readonly stopping: AbortSignal, private readonly feishuState: () => FeishuState, private readonly wake: () => void,
-    private readonly settingsScope?: string) {
+    private readonly settingsScope?: string, private readonly runtime?: StudioServiceRuntime) {
     this.sessions = new StudioSessions(ctx, domain, cwd, defaults, ready, stopping, wake)
+  }
+
+  /** 健康读取不经过普通状态查询，不刷新待办或调用 Feishu / 模型适配器。 */
+  health(): StudioHealthStatus {
+    const build = studioBuildIdentity(resolveLoadedBuildInfo())
+    const sqlite = this.domain.sqliteHealth(), configOk = this.runtime?.configOk() ?? !this.stopping.aborted
+    const feishu = this.feishuState(), transportOk = feishu === 'disabled' || feishu === 'online'
+    const draining = this.runtime?.draining() ?? false
+    const ok = configOk && sqlite.ok && transportOk
+    const ready = ok && !draining && (this.runtime?.available() ?? !this.stopping.aborted)
+    return { ...build, ok, ready, phase: draining ? 'draining' : ready ? 'ready' : 'starting', pid: process.pid, sqlite, feishu, configOk }
+  }
+
+  get busy(): boolean { return this.sessions.busy || this.ownerLookups > 0 }
+
+  private assertAccepting(): void {
+    if (this.runtime?.draining()) throw new StudioError('STUDIO_DRAINING', 'Studio is draining for a managed update.', 503)
   }
 
   private get store() { return this.domain.studio }
@@ -93,6 +121,22 @@ export class StudioService {
         this.reply(message.id, '没有找到对应的任务。未停止任何工作。')
       } else if (this.sessions.stopTask(task.taskId)) this.reply(message.id, `已停止任务 ${task.taskId}，其他任务不受影响。`)
       else this.reply(message.id, '该任务不再运行，没有改变任何工作。')
+      return
+    }
+    if (input.kind === 'self-update-decision') {
+      const id = input.id ?? direct?.id
+      if (!id || input.approve === undefined || (direct && direct.id !== id) || message.conversationId !== ASSISTANT_CONVERSATION) {
+        this.reply(message.id, '没有作出更新决定：请直接回复确认消息，或指定确切的更新待办 ID。'); return
+      }
+      const item = this.store.pendingItem(id)
+      if (!item || message.createdAt < item.createdAt) { this.reply(message.id, '找不到当前的更新待办。'); return }
+      try {
+        const settled = this.answerConfirmation(id, SELF_UPDATE_CHOICES[input.approve ? 0 : 1], message.channel === 'feishu' ? 'feishu' : 'gui', 'text')
+        this.reply(message.id, `${this.describeDecision(settled)}：${settled.title}。`)
+      } catch (error) {
+        if (!(error instanceof StudioError)) throw error
+        this.reply(message.id, '未作出更新决定：该事项已处理、失效或不可确认。')
+      }
       return
     }
     if (input.kind === 'guard-decision') { this.reply(message.id, this.guardTextDecision(message, input, direct)); return }
@@ -176,11 +220,12 @@ export class StudioService {
       return
     }
     if (id && /^om_/u.test(id) && message.conversationId === ASSISTANT_CONVERSATION) {
+      this.ownerLookups++
       void this.feishuStatus(id, kind === 'resubmit', this.stopping).then(status => {
         if (!this.stopping.aborted) this.reply(message.id, this.intakeText(status))
       }, error => {
         if (!this.stopping.aborted) this.reply(message.id, error instanceof StudioError ? error.message : '未能确认飞书消息的受理状态。')
-      }).catch(() => { if (!this.stopping.aborted) this.ctx.logger.warn('Studio could not publish the Feishu intake query') }).finally(() => this.wake())
+      }).catch(() => { if (!this.stopping.aborted) this.ctx.logger.warn('Studio could not publish the Feishu intake query') }).finally(() => { this.ownerLookups--; this.wake() })
       return
     }
     if (kind === 'resubmit') { this.reply(message.id, '请在 Assistant 指定精确的飞书消息 ID。'); return }
@@ -280,6 +325,7 @@ export class StudioService {
     if (item.state !== 'pending') return `没有再次作出决定：${item.title}，${this.describeDecision(item)}。`
     if (message.createdAt < item.createdAt) return '这条消息早于当前确认，未作出决定。'
     if (item.id.startsWith(GUARD_PENDING_PREFIX)) return GUARD_PENDING_TEXT_HINT
+    if (SELF_UPDATE_PENDING_ID.test(item.id)) return '更新决定须直接回复对应确认消息，或指定确切更新待办 ID。'
     const selected = item.options[parsed.approve ? 0 : 1]
     if (item.options.length !== 2 || selected === undefined) return '该事项没有可对应的批准或拒绝选项。'
     try {
@@ -293,6 +339,7 @@ export class StudioService {
 
   /** Refresh the status of managed blockers without invoking a model, changing a job, or clearing a hold. */
   refreshBlockers(): void {
+    if (this.runtime?.draining()) return
     const current = new Map(this.domain.studioBlockingItems().map(item => [item.id, item]))
     const previous = new Map(this.store.openBlockers().map(item => [item.id, item]))
     for (const item of current.values()) if (!previous.has(item.id)) this.store.addPending(item)
@@ -382,7 +429,20 @@ export class StudioService {
     return preferenceView(item)
   }
 
+  private updates(): StudioSelfUpdate {
+    if (!this.runtime?.updates) throw new StudioError('STUDIO_SELF_UPDATE_DISABLED', 'Studio self-update is not provisioned for this Host.', 409)
+    return this.runtime.updates
+  }
+
+  private answerConfirmation(id: string, value: string, by: 'gui' | 'feishu', via: 'gui' | 'card' | 'text') {
+    this.assertAccepting()
+    return SELF_UPDATE_PENDING_ID.test(id) ? this.updates().answer(id, value, by) : this.sessions.answer(id, value, by, via)
+  }
+
   readonly operations: Omit<StudioHttpOperations, StudioConfigurationOp> = {
+    selfUpdateStatus: ({ updateId }) => this.runtime?.updates?.status(updateId) ?? disabledSelfUpdateStatus(),
+    prepareSelfUpdate: (input, signal) => this.updates().prepareUpdate(input, signal),
+    rollbackSelfUpdate: (input, signal) => this.updates().rollbackSelfUpdate(input, signal),
     state: () => {
       this.refreshBlockers()
       return { projects: this.domain.studioProjects(), archivedProjects: this.domain.studioProjects('archived'), pendingCount: this.store.pendingCount(), settings: this.scoped(this.sessions.settings),
@@ -456,7 +516,7 @@ export class StudioService {
           ? { ...item, recordSessionId } : item
       }) }
     },
-    answer: ({ id, value }) => studioBlockTarget(id) ? this.answerBlock(id, value, 'gui') : this.sessions.answer(id, value, 'gui', 'gui'),
+    answer: ({ id, value }) => studioBlockTarget(id) ? this.answerBlock(id, value, 'gui') : this.answerConfirmation(id, value, 'gui', 'gui'),
     records: ({ query, before }) => this.store.records(query, before),
     record: ({ sessionId, from }, signal) => this.sessions.record(sessionId, from ?? 0, signal),
   }
@@ -465,7 +525,7 @@ export class StudioService {
   private answerCard({ scope, messageId, pendingId, value }: Parameters<StudioFeishuPort['answer']>[0]): boolean {
     const item = this.store.feishuQuestion(scope, messageId)
     if (!item || item.id !== pendingId || item.state !== 'pending' || item.mobile !== 'card' || !item.options.includes(value)) return false
-    try { return this.sessions.answer(item.id, value, 'feishu', 'card').state === 'resolved' }
+    try { return this.answerConfirmation(item.id, value, 'feishu', 'card').state === 'resolved' }
     catch (error) { if (error instanceof StudioError) return false; throw error }
   }
 
@@ -477,6 +537,7 @@ export class StudioService {
 
   private receiveFeishu(input: StudioFeishuInput, signal: AbortSignal, recovered = false): Promise<void> {
     signal.throwIfAborted()
+    this.assertAccepting()
     // A callback must point to the exact bound conversation/card; old-history replies are never new assignments.
     const anchors = [...new Set([input.parentId, input.rootId].filter((id): id is string => !!id))]
     const card = input.parentId ?? input.rootId
@@ -521,10 +582,15 @@ export class StudioService {
   }
 
   readonly feishu: StudioFeishuPort = {
-    activate: (scope, at) => this.store.activateFeishu(scope, at),
+    activate: (scope, at) => {
+      if (!this.runtime?.draining()) return this.store.activateFeishu(scope, at)
+      const cutover = this.store.feishuCutover(scope)
+      if (cutover === undefined || this.runtime.sealed()) throw new StudioError('STUDIO_DRAINING', 'Studio is draining for a managed update.', 503)
+      return cutover
+    },
     receive: (input, signal) => this.receiveFeishu(input, signal),
     answer: input => this.answerCard(input),
-    next: scope => { this.refreshBlockers(); return this.store.nextFeishu(scope) },
+    next: scope => { if (!this.runtime?.sealed()) { this.refreshBlockers(); return this.store.nextFeishu(scope) } },
     finish: (id, remoteId) => this.store.finishFeishu(id, remoteId),
   }
 

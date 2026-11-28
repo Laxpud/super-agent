@@ -5,9 +5,9 @@ import { DatabaseSync } from 'node:sqlite'
 import { randomUUID } from 'node:crypto'
 import { validateStudioCopy, type ManagedWorkerStore } from '../managed-worker/store.ts'
 import { StudioError } from './pending.ts'
-import type { DirectoryMode } from './settings-protocol.ts'
+import { STUDIO_DB, type DirectoryMode } from './settings-protocol.ts'
 
-export const STUDIO_DB = 'managed-worker.sqlite'
+export { STUDIO_DB } from './settings-protocol.ts'
 const MARKER = '.studio-directory'
 const TOKEN = /^[a-f0-9-]{36}$/u
 const pathError = () => new StudioError('STUDIO_DIRECTORY_INVALID', 'Choose a new absolute directory in an existing, trusted parent.', 400)

@@ -6,6 +6,15 @@ export interface FeishuBinding { appId: string; botOpenId: string; ownerOpenId: 
 export type FeishuMode = 'disabled' | 'conversation'
 export type FeishuConfiguration = { mode: 'disabled' } | { mode: 'conversation'; binding: FeishuBinding }
 export type { WorkerModelDefaultsConfig, WorkerModelRouteConfig }
+export const STUDIO_DB = 'managed-worker.sqlite'
+
+/** 仅由部署层登记；不属于 StudioConfiguration，也不允许通过保存请求覆盖。 */
+export interface StudioSelfUpdateConfig {
+  repoPath?: string
+  installRoot?: string
+  reloadCommand?: { executable: string; args: string[]; cwd?: string; dshHome?: string; profileName?: string }
+  healthTimeoutMs?: number
+}
 
 export interface StudioConfiguration {
   stateDir: string
@@ -25,6 +34,8 @@ export interface ConfigurationSnapshot {
   credentialsWritable: boolean
   revision: string
   config: StudioConfiguration
+  /** 仅提示已由部署层登记；不披露仓库、安装路径或重载配方。 */
+  selfUpdate?: { registered: true }
   feishu: { state: FeishuState; credential: CredentialState }
 }
 

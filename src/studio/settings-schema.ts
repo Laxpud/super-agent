@@ -12,6 +12,7 @@ const model = z.strictObject({ provider: id, model: id, reasoningEffort: id.exac
 const revision = z.string().regex(/^[a-f0-9]{64}$/u)
 const feishu = z.discriminatedUnion('mode', [z.strictObject({ mode: z.literal('disabled') }),
   z.strictObject({ mode: z.literal('conversation'), binding })])
+// 部署层的 selfUpdate 不属于可写配置草稿；严格对象也会拒绝回传只读的登记提示。
 const config = z.strictObject({ stateDir: path.min(1), studioCwd: path.min(1), assistantModel: model.nullable(), leaderModel: model.nullable(),
   feishu, workerModelRoutes: z.array(model.extend({ id })).max(64),
   workerModelDefaults: z.strictObject({ assistant: id.exactOptional(), leader: id.exactOptional() }),

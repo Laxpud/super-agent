@@ -130,6 +130,7 @@ export class StudioConfigurationControl {
   readonly operations: Pick<StudioHttpOperations, StudioConfigurationOp> = {
     configuration: () => ({ profile: this.runtime.credentials.profile?.name, writable: this.#writable(),
       credentialsWritable: this.runtime.credentials.writable, revision: this.#revision, config: this.#base,
+      ...(this.initial.selfUpdate && { selfUpdate: { registered: true as const } }),
       feishu: { state: this.runtime.feishuState(), credential: this.runtime.credential.state } }),
     saveConfiguration: (input, signal) => this.#save(input, signal),
     feishuCheck: (input, signal) => {
@@ -164,6 +165,7 @@ export class StudioConfigurationControl {
     try {
       let directory: StudioDirectorySwitch | undefined
       if (config.stateDir !== this.#base.stateDir || change) {
+        if (this.initial.selfUpdate) throw error('STUDIO_CONFIG_UPDATE_REGISTERED', 'A deployment-managed Studio state directory cannot be moved here.')
         if (!change || change.confirmation !== config.stateDir || config.stateDir === this.#base.stateDir) {
           throw error('STUDIO_DIRECTORY_CONFIRMATION', 'Confirm the exact target directory and how to initialize it.')
         }

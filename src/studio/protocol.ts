@@ -3,6 +3,7 @@ import type { ConfigurationChange, ConfigurationReceipt, ConfigurationSnapshot, 
 
 export const ASSISTANT_CONVERSATION = 'assistant'
 export const STUDIO_API = '/agent-studio/api'
+export const STUDIO_HEALTH = '/agent-studio/health'
 export const STUDIO_HEADER = 'x-agent-studio-request'
 export const STUDIO_TEXT_LIMIT = 32_000
 export const STUDIO_PAGE_SIZE = 40
@@ -134,6 +135,51 @@ export interface StudioSettings {
   leader: StudioModel | null
 }
 export type FeishuState = 'disabled' | 'connecting' | 'online' | 'offline' | 'identity-mismatch' | 'credential-missing'
+export interface StudioBuildInfo { version: string; buildId: string; artifactFingerprint: string; packageRoot: string }
+export type StudioBuildIdentity = Omit<StudioBuildInfo, 'packageRoot'>
+export interface StudioHealthStatus extends StudioBuildIdentity {
+  ok: boolean
+  ready: boolean
+  phase: 'ready' | 'draining' | 'starting'
+  pid: number
+  sqlite: { version: number; ok: boolean }
+  feishu: FeishuState
+  configOk: boolean
+}
+
+export const STUDIO_SELF_UPDATE_PHASES = ['prechecking', 'failed_precheck', 'awaiting_confirmation', 'expired', 'cancelled', 'approved',
+  'draining', 'failed_drain', 'stopping', 'switching', 'starting', 'succeeded', 'rolling_back', 'rolled_back', 'recovery_required'] as const
+export type StudioSelfUpdatePhase = typeof STUDIO_SELF_UPDATE_PHASES[number]
+export interface StudioSelfUpdateRecord {
+  updateId: string
+  kind: 'update' | 'rollback'
+  phase: StudioSelfUpdatePhase
+  createdAt: number
+  updatedAt: number
+  baselineBuildId: string
+  baselineFingerprint: string
+  candidateBuildId: string
+  candidateFingerprint?: string
+  projectId?: string
+  projectEpoch?: number
+  rollbackOf?: string
+  pendingId?: string
+  expiresAt?: number
+  sourceHead?: string
+  sourceFingerprint?: string
+  failedPhase?: StudioSelfUpdatePhase
+  exitCode?: number | null
+  logPath: string
+}
+export interface StudioSelfUpdateStatus {
+  enabled: boolean
+  managedReload: boolean
+  current: StudioBuildIdentity
+  record: StudioSelfUpdateRecord | null
+}
+export const SELF_UPDATE_CHOICES = ['批准更新', '取消更新'] as const
+export const SELF_UPDATE_PENDING_ID = /^self-update(?:-rollback)?:[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u
+
 export interface StudioState {
   projects: StudioProjectSummary[]
   archivedProjects?: StudioProjectSummary[]
@@ -190,7 +236,14 @@ export interface StudioSend {
   quoteId?: string
 }
 
+export interface StudioSelfUpdateRequest { requestId: string; expectedCurrentFingerprint: string }
+export interface StudioPrepareSelfUpdate extends StudioSelfUpdateRequest { projectId?: string; expectedEpoch?: number }
+export interface StudioRollbackSelfUpdate extends StudioSelfUpdateRequest { updateId: string }
+
 export interface StudioOperations {
+  selfUpdateStatus: { input: { updateId?: string }; result: StudioSelfUpdateStatus }
+  prepareSelfUpdate: { input: StudioPrepareSelfUpdate; result: StudioSelfUpdateRecord }
+  rollbackSelfUpdate: { input: StudioRollbackSelfUpdate; result: StudioSelfUpdateRecord }
   state: { input: Record<string, never>; result: StudioState }
   models: { input: Record<string, never>; result: StudioModelOption[] }
   configuration: { input: Record<string, never>; result: ConfigurationSnapshot }

@@ -305,7 +305,8 @@ function confirmationNotice(item: StudioPending): string {
 
 /** Conversations and their outbox share the caller's connection, but own their synchronous write transactions. */
 export class StudioStore {
-  constructor(private readonly db: DatabaseSync, private readonly assertActive: () => void, private readonly unifiedSessions = false) {
+  constructor(private readonly db: DatabaseSync, private readonly assertActive: () => void, private readonly unifiedSessions = false,
+    private readonly assertReadable = assertActive) {
     if (!unifiedSessions) this.write(() => db.exec(STUDIO_SCHEMA))
   }
 
@@ -326,7 +327,7 @@ export class StudioStore {
   }
 
   assistantSession(): string | undefined {
-    this.assertActive()
+    this.assertReadable()
     return this.db.prepare('SELECT session_id FROM agent_studio_assistant WHERE singleton = 1').get()?.session_id as string | undefined
   }
 
@@ -339,7 +340,7 @@ export class StudioStore {
   }
 
   settings(defaults: Pick<StudioSettings, 'assistant' | 'leader'>): StudioSettings {
-    this.assertActive()
+    this.assertReadable()
     const row = this.db.prepare('SELECT revision, assistant, leader FROM agent_studio_settings WHERE singleton = 1').get()
     return row ? { revision: row.revision as number, assistant: JSON.parse(row.assistant as string) as StudioModel | null,
       leader: JSON.parse(row.leader as string) as StudioModel | null } : { ...defaults, revision: 0 }
@@ -448,7 +449,7 @@ export class StudioStore {
   }
 
   private readForward(field: 'origin_message_id' | 'project_message_id' | 'forward_id', id: string): ForwardRoute | undefined {
-    this.assertActive()
+    this.assertReadable()
     if (!this.unifiedSessions) return
     const row = this.db.prepare(`${FORWARD_SELECT} WHERE f.${field} = ?`).get(id) as unknown as ForwardRow | undefined
     return row && decodeForward(row)
@@ -491,14 +492,14 @@ export class StudioStore {
   }
 
   message(conversationId: string, id: string): StudioMessage | undefined {
-    this.assertActive()
+    this.assertReadable()
     const row = this.messageRow(id, conversationId)
     return row && decodeMessage(row)
   }
 
   /** Fetch the newest matching page below the exclusive sequence, then display that page oldest first. */
   messages(conversationId: string, topicId?: string, before?: number): StudioPage<StudioMessage> {
-    this.assertActive()
+    this.assertReadable()
     const rows = this.db.prepare(`${MESSAGES} WHERE m.conversation_id = ? AND m.topic_id IS ? ${before === undefined ? '' : 'AND m.sequence < ?'}
       ORDER BY m.sequence DESC LIMIT ?`).all(conversationId, topicId ?? null, ...(before === undefined ? [] : [before]), STUDIO_PAGE_SIZE + 1) as unknown as MessageRow[]
     return page(rows, decodeMessage, row => row.sequence, true)
@@ -526,7 +527,7 @@ export class StudioStore {
   }
 
   routeControlled(id: string): boolean {
-    this.assertActive()
+    this.assertReadable()
     return !!this.db.prepare('SELECT 1 FROM agent_studio_route_control WHERE target_id = ?').get(id)
   }
 
@@ -638,14 +639,14 @@ export class StudioStore {
   }
 
   session(id: string): StudioSessionRecord | undefined {
-    this.assertActive()
+    this.assertReadable()
     if (this.unifiedSessions) return studioSession(this.db, id)
     const row = this.sessionRow(id)
     return row && decodeSession(row)
   }
 
   records(query?: string, before?: number): StudioPage<StudioSessionRecord> {
-    this.assertActive()
+    this.assertReadable()
     if (this.unifiedSessions) return studioRecords(this.db, query, before)
     const match = query?.trim().toLowerCase() ?? ''
     const rows = this.db.prepare(`SELECT * FROM agent_studio_session WHERE
@@ -691,32 +692,39 @@ export class StudioStore {
   }
 
   pendingItem(id: string): StudioPending | undefined {
-    this.assertActive()
+    this.assertReadable()
     const row = this.pendingRow(id)
     return row && decodePending(row)
   }
 
   /** 文字确认必须找全当前候选，不能因为分页截断就把多个匹配误判成唯一。 */
   openConfirmations(): StudioPending[] {
-    this.assertActive()
+    this.assertReadable()
     return (this.db.prepare(`SELECT * FROM agent_studio_pending WHERE state = 'pending' AND kind = 'confirmation'
       ORDER BY sequence DESC`).all() as unknown as PendingRow[]).map(decodePending)
   }
 
   recentDecisions(): StudioPending[] {
-    this.assertActive()
+    this.assertReadable()
     return (this.db.prepare(`SELECT * FROM agent_studio_pending WHERE state <> 'pending' AND kind = 'confirmation'
       ORDER BY sequence DESC LIMIT ?`).all(STUDIO_PAGE_SIZE) as unknown as PendingRow[]).map(decodePending)
   }
 
+  feishuOutboxBusy(): boolean {
+    this.assertReadable()
+    const binding = this.binding()
+    return !!binding && !!this.db.prepare(`SELECT 1 FROM agent_studio_feishu_outbox
+      WHERE generation = ? AND state IN ('queued', 'claimed') LIMIT 1`).get(binding.generation)
+  }
+
   pendingCount(): number {
-    this.assertActive()
+    this.assertReadable()
     return this.db.prepare("SELECT COUNT(*) AS count FROM agent_studio_pending WHERE (state = 'pending') = 1").get()?.count as number
   }
 
   /** Expose only active durable blockers for reconciliation against the owning domain ledger. */
   openBlockers(): StudioPending[] {
-    this.assertActive()
+    this.assertReadable()
     const rows = this.db.prepare(`SELECT * FROM agent_studio_pending WHERE kind = 'blocked' AND (state = 'pending') = 1
       ORDER BY sequence DESC`).all() as unknown as PendingRow[]
     return rows.map(decodePending)
@@ -724,7 +732,7 @@ export class StudioStore {
 
   /** Pack priority in the low bit so a cursor can cross into history even if the boundary item was just settled. */
   pending(before?: number): StudioPage<StudioPending> {
-    this.assertActive()
+    this.assertReadable()
     const rows = this.db.prepare(`SELECT * FROM agent_studio_pending
       ${before === undefined ? '' : "WHERE ((state = 'pending'), sequence) < (?, ?)"}
       ORDER BY (state = 'pending') DESC, sequence DESC LIMIT ?`)
@@ -802,30 +810,30 @@ export class StudioStore {
 
   /** 状态只能查询当前绑定代的已登记入站消息，不能把机器人出站消息当成用户原文。 */
   feishuInput(scope: string, remoteId: string): StudioMessage | undefined {
-    this.assertActive()
+    this.assertReadable()
     const binding = this.binding(scope)
     const id = binding && this.inboundId(binding.generation, remoteId)
     return id ? this.message(ASSISTANT_CONVERSATION, id) : undefined
   }
 
-  feishuCutover(scope: string): number | undefined { this.assertActive(); return this.binding(scope)?.cutover }
+  feishuCutover(scope: string): number | undefined { this.assertReadable(); return this.binding(scope)?.cutover }
 
   feishuMessage(scope: string, remoteId: string): StudioMessage | undefined {
-    this.assertActive()
+    this.assertReadable()
     const binding = this.binding(scope)
     const row = binding && this.feishuMessageRow(binding.generation, remoteId)
     return row && decodeMessage(row)
   }
 
   feishuThread(scope: string, threadId: string): StudioMessage | undefined {
-    this.assertActive()
+    this.assertReadable()
     const binding = this.binding(scope)
     const root = binding && this.threadRoot(binding.generation, threadId)
     return root && decodeMessage(root)
   }
 
   feishuQuestion(scope: string, remoteId: string): StudioPending | undefined {
-    this.assertActive()
+    this.assertReadable()
     const binding = this.binding(scope)
     const delivery = binding && this.sentRemote(binding.generation, remoteId)
     const item = delivery?.kind === 'pending' && delivery.pending_id ? this.pendingRow(delivery.pending_id) : undefined

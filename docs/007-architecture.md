@@ -286,6 +286,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 - Setup probes only GitHub and Feishu account fields (`SETUP_FIELDS`). Only those Sources receive account setup problems through `SourceContext.problem`.
 
 
+## Managed Studio self-update
+
+The deployment registers one trusted source repository, one owner-only state directory, and one owner-only install tree per profile. The initial `current` symlink must already resolve to an update-capable release under `releases/`. The loader and the Client must resolve that same package through `current` on each boot; shared runtime dependencies must be resolvable from the managed releases. The Linux reload recipe runs in the foreground and must keep its PID (a wrapper must `exec` the profile). Use an explicit profile name and, if Feishu is enabled, an existing stored credential rather than a launch-only environment secret. The state directory must be short enough for its `runtime/health.sock` Unix address.
+
+Preparation returns before the check finishes. It hashes tracked and unignored worktree content (including local edits), installs lockfile dependencies into a private build store, and runs `pnpm check` from that copy. The registered source and its scripts must be trusted: the copied tree and reduced environment isolate build inputs and configuration, not the operating-system privileges of a build script. The required pnpm tool version must already be installed or cached. The Host never switches on a check alone. On approval it drains existing work, verifies both releases and delegates a durable SQLite seal to the controller. If the controller cannot prove restoration, it retains the journal and snapshots and does not retry automatically.
+
 ## Modules
 
 | Path | Responsibility |
@@ -396,8 +402,13 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/studio/owner-text.ts` | Recognizes bounded owner text queries, confirmation decisions, explicit task clearance and scoped stop or redirect commands |
 | `src/studio/pending.ts` | Persists pending confirmations and settles the exact live decision through supported channels |
 | `src/studio/models.ts` | Builds the model catalog and verifies a concrete model and reasoning effort |
-| `src/studio/service.ts` | Shares the Assistant conversation between Web and one Feishu private chat, exposes project and task reads, and resolves task blockers without replaying execution |
-| `src/studio/http.ts` | Validates owner cookie admission, same-origin request requirements and input schemas for Studio operations |
+| `src/studio/service.ts` | Shares the Assistant conversation between Web and one Feishu private chat, routes both channels into the same transaction-backed confirmation path, and exposes a health read without reconciling blockers |
+| `src/studio/http.ts` | Validates owner cookie admission, same-origin request requirements and input schemas; maintenance gates mutations while leaving reads available |
+| `src/studio/build-info.ts` | Freezes the physically loaded Host identity, hashes the sorted release asset paths and bytes, and verifies the matching Web Client build marker |
+| `src/studio/health.ts` | Serves nonce-bound health snapshots in the private Unix runtime directory and probes without browser credentials |
+| `src/studio/self-update.ts`, `self-update-ledger.ts` | Coordinates request idempotency, source and baseline gates, expiring cross-channel consent and one-use execution qualification without changing the SQLite schema version |
+| `src/studio/self-update-build.ts`, `self-update-files.ts` | Capture the Git worktree in a private copy, run the fixed lockfile-install/check pipeline with an isolated dependency store and a reduced environment, and verify/sync release trees and atomic state files |
+| `src/studio/self-update-controller.ts`, `self-update-runner.ts` | Hand a sealed run to a detached Linux controller that checks exact process identities, switches one managed pointer, verifies the new Host and attempts at most one restoration |
 | `src/studio/feishu.ts` | Maintains one verified private-chat connection and mirrors visible text, topic replies and pending-card states |
 | `src/studio/feishu-binding.ts` | Validates the bot and owner private-chat binding and retains the stable scope used by existing SQLite records |
 | `src/studio/feishu-sdk.ts` | Uses the official Node SDK to verify the bot, listen for private-chat events and validate delivery receipts without logging credentials or payloads |

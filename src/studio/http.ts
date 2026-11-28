@@ -3,7 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
-import { STUDIO_API, STUDIO_HEADER, STUDIO_TASK_STATUSES, STUDIO_TEXT_LIMIT, type StudioInput, type StudioOp, type StudioResult } from './protocol.ts'
+import { STUDIO_API, STUDIO_HEADER, STUDIO_HEALTH, STUDIO_TASK_STATUSES, STUDIO_TEXT_LIMIT, type StudioHealthStatus, type StudioInput, type StudioOp, type StudioResult } from './protocol.ts'
 import { StudioError } from './pending.ts'
 import { configurationChange, feishuCheck } from './settings-schema.ts'
 import { StudioStoreError } from './store.ts'
@@ -22,7 +22,13 @@ const preferenceScope = { projectId: id.exactOptional() }
 const preference = { ...preferenceScope, key: z.string().regex(/^[a-z][a-z0-9-]{0,63}$/u) }
 const version = { expectedVersion: coord.positive() }
 const feishuMessage = z.strictObject({ messageId: z.string().max(256).regex(/^om_[a-zA-Z0-9_-]+$/u) })
+const updateId = z.string().regex(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u)
+const updateRequest = { requestId: id, expectedCurrentFingerprint: z.string().regex(/^[a-f0-9]{64}$/u) }
 const schemas = {
+  selfUpdateStatus: z.strictObject({ updateId: updateId.exactOptional() }),
+  prepareSelfUpdate: z.strictObject({ ...updateRequest, projectId: id.exactOptional(), expectedEpoch: coord.positive().exactOptional() })
+    .refine(input => (input.projectId === undefined) === (input.expectedEpoch === undefined)),
+  rollbackSelfUpdate: z.strictObject({ ...updateRequest, updateId }),
   state: z.strictObject({}),
   models: z.strictObject({}),
   configuration: z.strictObject({}),
@@ -81,10 +87,10 @@ async function body(request: IncomingMessage): Promise<unknown> {
   catch { throw new StudioError('INVALID_JSON', 'Expected a Studio JSON request.') }
 }
 
-function send(response: ServerResponse, status: number, value: unknown): void {
+function send(response: ServerResponse, status: number, value: unknown, allow?: string): void {
   if (response.destroyed) return
   response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
-    ...(status === 405 ? { allow: 'POST' } : {}) })
+    ...(allow ? { allow } : {}) })
   response.end(JSON.stringify(value))
 }
 
@@ -93,15 +99,34 @@ function dispatch<K extends StudioOp>(op: K, input: unknown, operations: StudioH
   return operations[op](data, signal)
 }
 
-export function registerStudioHttp(ctx: Context, connection: BrowserConnection, ready: () => boolean, operations: StudioHttpOperations): () => void {
+const readOnly = new Set<StudioOp>(['state', 'models', 'configuration', 'timeline', 'message', 'messageStatus', 'feishuMessageStatus',
+  'projectArchive', 'preferences', 'tasks', 'task', 'pending', 'records', 'record', 'selfUpdateStatus'])
+interface StudioHttpRuntime {
+  health(): StudioHealthStatus
+  beginWrite(): () => void
+}
+
+export function registerStudioHttp(ctx: Context, connection: BrowserConnection, ready: () => boolean, operations: StudioHttpOperations,
+  runtime?: StudioHttpRuntime): () => void {
   if (typeof connection.admit !== 'function') throw new Error('Agent Studio needs a DSH Web host with browser authentication')
-  return ctx.webServer.register({ path: STUDIO_API, kind: 'exact', async handler(request, response) {
+  const admit = (request: IncomingMessage, response: ServerResponse): boolean => {
     const admission = connection.admit(request)
-    if ('rejection' in admission) { send(response, admission.rejection, { error: 'Sign in to the local DSH Web host.' }); return }
+    if ('rejection' in admission) { send(response, admission.rejection, { error: 'Sign in to the local DSH Web host.' }); return false }
     if (admission.peer.principal.kind !== 'owner' || admission.peer.id !== connection.browserPeer.id || request.headers[STUDIO_HEADER] !== '1') {
-      send(response, 403, { error: 'A same-origin Studio browser request is required.' }); return
+      send(response, 403, { error: 'A same-origin Studio browser request is required.' }); return false
     }
-    if (request.method !== 'POST') { send(response, 405, { error: 'Expected POST.' }); return }
+    return true
+  }
+  return ctx.webServer.register({ path: '/agent-studio', kind: 'prefix', async handler(request, response) {
+    const path = (request.url ?? STUDIO_API).split('?', 1)[0]
+    if (path !== STUDIO_API && path !== STUDIO_HEALTH) { send(response, 404, { error: 'Studio endpoint not found.' }); return }
+    if (!admit(request, response)) return
+    if (path === STUDIO_HEALTH && runtime) {
+      if (request.method !== 'GET') { send(response, 405, { error: 'Expected GET.' }, 'GET'); return }
+      send(response, 200, runtime.health())
+      return
+    }
+    if (request.method !== 'POST') { send(response, 405, { error: 'Expected POST.' }, 'POST'); return }
     if (!ready()) { send(response, 503, { error: 'Agent Studio is not available.' }); return }
     const abort = new AbortController()
     const closed = () => abort.abort()
@@ -111,7 +136,10 @@ export function registerStudioHttp(ctx: Context, connection: BrowserConnection, 
       abort.signal.throwIfAborted()
       if (!ready()) throw new StudioError('STUDIO_UNAVAILABLE', 'Agent Studio is not available.', 503)
       if (!Object.hasOwn(schemas, op)) throw new StudioError('UNKNOWN_OPERATION', 'Studio operation not found.', 404)
-      send(response, 200, await dispatch(op as StudioOp, input, operations, abort.signal))
+      const operation = op as StudioOp
+      const end = !readOnly.has(operation) ? runtime?.beginWrite() : undefined
+      try { send(response, 200, await dispatch(operation, input, operations, abort.signal)) }
+      finally { end?.() }
     } catch (error) {
       if (abort.signal.aborted) return
       if (error instanceof StudioError) send(response, error.status, { error: error.message, code: error.code })

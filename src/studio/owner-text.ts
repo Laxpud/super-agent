@@ -1,5 +1,5 @@
 /** 解析已经由宿主认证的用户文字。这里不调用模型，也不能替用户补写决定或扩大动作范围。 */
-import { ASSISTANT_CONVERSATION, GUARD_PENDING_CHOICES, GUARD_PENDING_PREFIX, type StudioPending } from './protocol.ts'
+import { ASSISTANT_CONVERSATION, GUARD_PENDING_CHOICES, GUARD_PENDING_PREFIX, SELF_UPDATE_PENDING_ID, type StudioPending } from './protocol.ts'
 
 const end = /[。！!.\s]+$/u
 const key = (value: string): string => value.normalize('NFC').trim().replace(/\s+/gu, ' ').replace(end, '').toLowerCase()
@@ -103,6 +103,7 @@ export type OwnerInput =
   | { kind: 'work-query'; query: NonNullable<ReturnType<typeof readWorkQuery>> }
   | { kind: 'confirmation-status'; target: string }
   | { kind: 'task-stop'; taskId: string }
+  | { kind: 'self-update-decision'; id?: string; approve?: boolean }
   | { kind: 'guard-decision'; action?: GuardTextAction; id?: string }
   | { kind: 'decision'; decision: TextDecision }
   | { kind: 'unblock'; command: NonNullable<ReturnType<typeof readTaskUnblock>> }
@@ -127,6 +128,12 @@ export function classifyOwnerInput(raw: string, conversationId = ASSISTANT_CONVE
   if (direct?.id.startsWith(GUARD_PENDING_PREFIX) || guard?.[2]) {
     const [cancel, clear] = GUARD_PENDING_CHOICES
     return { kind: 'guard-decision', ...(guard && { action: guard[1] === cancel ? cancel : clear, id: guard[2] }) }
+  }
+  const update = /^(批准|拒绝|取消)(?:更新|回滚)\s+[#＃]?(\S+)$/u.exec(key(text))
+  if (update?.[2] && SELF_UPDATE_PENDING_ID.test(update[2])) return { kind: 'self-update-decision', id: update[2], approve: update[1] === '批准' }
+  if (direct && SELF_UPDATE_PENDING_ID.test(direct.id)) {
+    const exact = /^(批准|拒绝|取消)(?:更新|回滚)?$/u.exec(key(text))
+    return { kind: 'self-update-decision', id: direct.id, ...(exact && { approve: exact[1] === '批准' }) }
   }
   const decision = readTextDecision(text)
   if (decision) return { kind: 'decision', decision }

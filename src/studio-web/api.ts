@@ -1,7 +1,9 @@
 /** 浏览器只调用同源 Studio API；会话身份由宿主 Cookie 验证。 */
-import { STUDIO_API, STUDIO_HEADER, STUDIO_TASK_STATUSES, type StudioInput, type StudioOp, type StudioRecordRole, type StudioResult } from '../studio/protocol.ts'
+import { STUDIO_API, STUDIO_HEADER, STUDIO_HEALTH, STUDIO_SELF_UPDATE_PHASES, STUDIO_TASK_STATUSES, type StudioHealthStatus, type StudioInput, type StudioOp, type StudioRecordRole, type StudioResult } from '../studio/protocol.ts'
 import type { en, T } from './locales.ts'
 
+declare const __AGENT_STUDIO_BUILD_ID__: string | undefined
+export const STUDIO_WEB_BUILD_ID = typeof __AGENT_STUDIO_BUILD_ID__ === 'string' ? __AGENT_STUDIO_BUILD_ID__ : 'development'
 export type StudioCall = <K extends StudioOp>(op: K, input: StudioInput<K>, signal?: AbortSignal) => Promise<StudioResult<K>>
 
 type Failure = 'network' | 'timeout' | 'badResponse' | 'requestFailed' | 'unavailable'
@@ -34,6 +36,19 @@ const feishu = (value: unknown) => object(value) && (value.mode === 'disabled' ?
   : value.mode === 'conversation' && binding(value.binding))
 const permission = (value: unknown) => choice(value, ['read-only', 'workspace-write'])
 const revision = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value)
+const buildIdentity = (value: unknown) => object(value) && text(value.version) && text(value.buildId)
+  && (value.artifactFingerprint === '' || revision(value.artifactFingerprint))
+const updatePhase = (value: unknown) => choice(value, STUDIO_SELF_UPDATE_PHASES)
+const updateRecord = (value: unknown) => object(value) && text(value.updateId) && choice(value.kind, ['update', 'rollback'])
+  && updatePhase(value.phase) && whole(value.createdAt) && whole(value.updatedAt) && text(value.logPath)
+  && text(value.baselineBuildId) && text(value.candidateBuildId) && revision(value.baselineFingerprint)
+  && optional(value.candidateFingerprint, revision) && optional(value.expiresAt, whole) && optional(value.failedPhase, updatePhase)
+  && optional(value.projectEpoch, positiveWhole)
+  && [value.projectId, value.rollbackOf, value.pendingId, value.sourceHead].every(field => optional(field, text))
+  && optional(value.sourceFingerprint, revision) && optional(value.exitCode, code => code === null || Number.isSafeInteger(code))
+const health = (value: unknown): value is StudioHealthStatus => object(value) && buildIdentity(value)
+  && boolean(value.ok) && boolean(value.ready) && choice(value.phase, ['ready', 'draining', 'starting']) && positiveWhole(value.pid)
+  && object(value.sqlite) && whole(value.sqlite.version) && boolean(value.sqlite.ok) && feishuState(value.feishu) && boolean(value.configOk)
 const route = (value: unknown) => object(value) && text(value.id) && model(value)
 const defaults = (value: unknown) => object(value) && optional(value.assistant, text) && optional(value.leader, text)
 const configuration = (value: unknown) => object(value) && text(value.stateDir) && text(value.studioCwd) && feishu(value.feishu)
@@ -88,10 +103,14 @@ function readable(op: StudioOp, value: unknown): boolean {
   if (op === 'preferences') return items(value, preference)
   if (!object(value)) return false
   switch (op) {
+    case 'selfUpdateStatus': return boolean(value.enabled) && boolean(value.managedReload) && buildIdentity(value.current)
+      && (value.record === null || updateRecord(value.record))
+    case 'prepareSelfUpdate': case 'rollbackSelfUpdate': return updateRecord(value)
     case 'state': return whole(value.pendingCount) && settings(value.settings) && feishuState(value.feishu)
       && items(value.projects, project) && optional(value.archivedProjects, list => items(list, project))
       && optional(value.hiddenSessionIds, list => items(list, text))
     case 'configuration': return revision(value.revision) && optional(value.profile, text) && typeof value.writable === 'boolean'
+      && optional(value.selfUpdate, registration => object(registration) && registration.registered === true)
       && typeof value.credentialsWritable === 'boolean' && configuration(value.config) && object(value.feishu)
       && feishuState(value.feishu.state) && choice(value.feishu.credential, ['none', 'startup', 'stored', 'missing'])
     case 'saveConfiguration': return revision(value.revision) && optional(value.credentialCleanup, state => state === 'unconfirmed')
@@ -146,6 +165,25 @@ export const callStudio: StudioCall = async (op, input, signal) => {
   }
   if (!readable(op, data)) throw new StudioApiError('badResponse', response.status)
   return data as StudioResult<typeof op>
+}
+
+/** 健康探针返回的是当前进程的只读快照，不会触发 API 的待办同步。 */
+export async function callStudioHealth(signal?: AbortSignal): Promise<StudioHealthStatus> {
+  const timeout = AbortSignal.timeout(5_000)
+  let response: Response | undefined
+  let data: unknown
+  try {
+    response = await fetch(STUDIO_HEALTH, { method: 'GET', credentials: 'same-origin', cache: 'no-store',
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout, headers: { [STUDIO_HEADER]: '1' } })
+    if (!response.ok) throw new StudioApiError('requestFailed', response.status)
+    data = await response.json()
+  } catch (cause) {
+    if (signal?.aborted || cause instanceof StudioApiError) throw cause
+    if (timeout.aborted) throw new StudioApiError('timeout', response?.status ?? 0)
+    throw new StudioApiError(response ? 'badResponse' : 'network', response?.status ?? 0)
+  }
+  if (!health(data)) throw new StudioApiError('badResponse', response.status)
+  return data
 }
 
 const operationErrors = {
