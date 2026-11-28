@@ -1,6 +1,8 @@
 # 定制进展与下一步
 
-[需求基线](<requirements/README.md#需求基线>)不变。普通文字委派、跨入口更正和长作业接续三条主流程已在独立 DSH Web 宿主上运行。下文分别记录模拟验证和实际服务的验收范围。
+> **说明：** 需求文档已于 2026-11-27 重整为[Agent Studio 需求总览](requirements/README.md)（含 [V1 规格与验收](requirements/v1-scope.md)、[终态蓝图与演进路线](requirements/roadmap-and-blueprint.md) 与 [现有代码保留与清理边界](requirements/cleanup-and-reuse.md)）。下文保留重整前对早期实验版本的模拟验证与隔离宿主记录。
+
+普通文字委派、跨入口更正和长作业接续三条主流程已在独立 DSH Web 宿主上运行。下文分别记录模拟验证和实际服务的验收范围。
 
 ## 已完成
 
@@ -103,7 +105,7 @@
 
 ### 下一步
 
-对照[首版验收场景](<requirements/design-and-acceptance.md#行为验收场景>)，下一步分清缺口和试用条件：
+对照新的 [V1 验收清单](requirements/v1-scope.md#8-v1-验收清单) 与 [现有代码保留与清理边界](requirements/cleanup-and-reuse.md)，以下保留重整前记录的旧局限：
 
 - **真实账户停池待现场核对：** 只在正常使用中出现明确的 `ACCOUNT_QUOTA` 时核对停池和无模型状态查询，不主动耗尽额度。[API Key 路线的 `QUOTA`](<managed-worker.md#共享额度停止与恢复>) 不算这项验收。
 - **当前不支持：** 写入动作限于[版本化受管文档](<managed-worker.md#文档写入控制>)，不写普通文件或删除算例结果；外部作业只读观测，不提交、重启或取消，额度恢复也不主动探测。这些边界不算通过了对应动作的验收。
