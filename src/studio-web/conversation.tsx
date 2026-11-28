@@ -2,8 +2,9 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 import { ASSISTANT_CONVERSATION, STUDIO_TEXT_LIMIT, type StudioMessage } from '../studio/protocol.ts'
 import { addressKey, reference, snippet, type Address } from './drafts.ts'
+import { ProjectBar } from './projects.tsx'
 import { createQuery, nextPage, useQuery } from './query.ts'
-import { Button, chatTitle, FailureNotice, PageHeading, Pager, QueryStatus, SourceButton, Time, useStudio, type ChatView } from './ui.tsx'
+import { Button, chatTitle, FailureNotice, PageHeading, Pager, QueryStatus, SourceButton, Time, projectById, useStudio, type ChatView } from './ui.tsx'
 
 /** 引用不改变收件范围；回复才按原消息的话题发送。 */
 function useMessageActions() {
@@ -43,7 +44,9 @@ function QuoteJump({ conversationId, id, text, drafting = false }: {
   </button>
 }
 
-function Message({ message, inTopic = false, focused = false }: { message: StudioMessage; inTopic?: boolean; focused?: boolean }) {
+function Message({ message, inTopic = false, focused = false, readOnly = false }: {
+  message: StudioMessage; inTopic?: boolean; focused?: boolean; readOnly?: boolean
+}) {
   const { t, open } = useStudio()
   const { reply, quote } = useMessageActions()
   const original = useRef<HTMLElement>(null)
@@ -71,8 +74,8 @@ function Message({ message, inTopic = false, focused = false }: { message: Studi
       </details>)}
     </div>}
     <footer className="as-actions">
-      <Button onClick={() => quote(message)}>{t('quote')}</Button>
-      <Button onClick={() => reply(message)}>{t('reply')}</Button>
+      {!readOnly && <><Button onClick={() => quote(message)}>{t('quote')}</Button>
+        <Button onClick={() => reply(message)}>{t('reply')}</Button></>}
       {!inTopic && !message.topicId && message.replyCount > 0 && <Button onClick={() => open({ kind: 'chat',
         conversationId: message.conversationId, topicId: message.id })}>
         {message.replyCount === 1 ? t('openTopicOne') : t('openTopic', { count: message.replyCount })}
@@ -109,14 +112,24 @@ function Composer({ address, refresh }: { address: Address; refresh: () => void 
   </form>
 }
 
-function TopicRoot({ conversationId, topicId }: Required<Address>) {
+function ArchivedComposer() {
+  const { t } = useStudio()
+  const notice = useId()
+  return <div className="as-composer" aria-describedby={notice}>
+    <p id={notice} className="as-muted">{t('archivedChat')}</p>
+    <textarea aria-label={t('composer')} rows={2} disabled />
+    <div className="as-actions as-end"><Button primary disabled>{t('send')}</Button></div>
+  </div>
+}
+
+function TopicRoot({ conversationId, topicId, readOnly }: Required<Address> & { readOnly: boolean }) {
   const { call, t } = useStudio()
   const query = useMemo(() => createQuery(signal => call('message', { conversationId, id: topicId }, signal)), [call, conversationId, topicId])
   const result = useQuery(query)
   return <section className="as-topic-root" aria-label={t('topicRoot')}>
     <p className="as-meta">{t('topicRoot')}</p>
     <QueryStatus query={result} reload={query.reload} />
-    {result.data && <Message message={result.data} inTopic />}
+    {result.data && <Message message={result.data} readOnly={readOnly} inTopic />}
   </section>
 }
 
@@ -135,11 +148,13 @@ export function Conversation({ view }: { view: ChatView }) {
     if (before === undefined && result.data && atBottom.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight
   }, [before, result.data])
   const title = chatTitle(t, state, conversationId)
-  const project = state?.projects.find(item => item.id === conversationId)
+  const project = projectById(state, conversationId)
+  const archived = project?.state === 'archived'
+  const writable = conversationId === ASSISTANT_CONVERSATION || project?.state === 'active'
   return <section className="as-chat">
     <PageHeading title={topicId ? `${title} · ${t('topic')}` : title}
-      detail={topicId ? undefined : conversationId === ASSISTANT_CONVERSATION ? t('assistantHint')
-        : [project?.objective, t('projectHint')].filter(Boolean).join(' ')} />
+      detail={topicId || archived ? undefined : t(conversationId === ASSISTANT_CONVERSATION ? 'assistantHint' : 'projectHint')} />
+    {project && <ProjectBar project={project} refreshTimeline={query.reload} />}
     <Pager previous={cursors.length ? () => open({ ...view, cursors: cursors.slice(0, -1) }, true) : undefined}
       next={next !== undefined ? () => open({ ...view, cursors: [...cursors, next] }, true) : undefined}
       previousLabel={t('newerMessages')} nextLabel={t('olderMessages')} />
@@ -147,12 +162,12 @@ export function Conversation({ view }: { view: ChatView }) {
       const node = event.currentTarget
       atBottom.current = node.scrollHeight - node.scrollTop - node.clientHeight < 64
     }}>
-      {topicId && <TopicRoot conversationId={conversationId} topicId={topicId} />}
+      {topicId && <TopicRoot conversationId={conversationId} topicId={topicId} readOnly={!writable} />}
       <QueryStatus query={result} reload={query.reload} />
-      {result.data && !result.data.items.length && <p className="as-empty">{t(topicId ? 'emptyTopic' : 'emptyChat')}</p>}
-      {result.data?.items.map(message => <Message key={message.id} message={message} inTopic={topicId !== undefined} />)}
+      {result.data && !result.data.items.length && <p className="as-empty">{t(topicId ? 'emptyTopic' : archived ? 'emptyArchivedChat' : 'emptyChat')}</p>}
+      {result.data?.items.map(message => <Message key={message.id} message={message} readOnly={!writable} inTopic={topicId !== undefined} />)}
     </div>
-    {before === undefined && <Composer address={view} refresh={query.reload} />}
+    {archived ? <ArchivedComposer /> : before === undefined && writable && <Composer address={view} refresh={query.reload} />}
   </section>
 }
 
@@ -166,7 +181,7 @@ export function Original({ conversationId, messageId }: { conversationId: string
     <PageHeading title={`${t('original')} · ${chatTitle(t, state, conversationId)}`} detail={t('originalHint')} />
     <QueryStatus query={result} reload={query.reload} />
     {message && <>
-      <Message message={message} focused />
+      <Message message={message} focused readOnly={conversationId !== ASSISTANT_CONVERSATION && projectById(state, conversationId)?.state !== 'active'} />
       <Button onClick={() => open({ kind: 'chat', conversationId, topicId: message.topicId }, true)}>
         {t(message.topicId ? 'topic' : 'openConversation')}
       </Button>

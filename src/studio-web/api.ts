@@ -1,6 +1,6 @@
 /** 浏览器只调用同源 Studio API；会话身份由宿主 Cookie 验证。 */
-import { STUDIO_API, STUDIO_HEADER, type StudioInput, type StudioOp, type StudioRecordRole, type StudioResult } from '../studio/protocol.ts'
-import type { T } from './locales.ts'
+import { STUDIO_API, STUDIO_HEADER, STUDIO_TASK_STATUSES, type StudioInput, type StudioOp, type StudioRecordRole, type StudioResult } from '../studio/protocol.ts'
+import type { en, T } from './locales.ts'
 
 export type StudioCall = <K extends StudioOp>(op: K, input: StudioInput<K>, signal?: AbortSignal) => Promise<StudioResult<K>>
 
@@ -43,10 +43,11 @@ const roles = ['assistant', 'leader', 'worker', 'document-worker', 'draft-worker
 const session = (value: unknown) => object(value) && text(value.id) && text(value.conversationId) && whole(value.createdAt)
   && choice(value.role, roles) && optional(value.readonlyLegacy, boolean)
 const project = (value: unknown) => object(value) && text(value.id) && text(value.name) && text(value.objective)
-  && nullableText(value.workspacePath) && choice(value.state, ['active', 'archived']) && whole(value.managementEpoch)
+  && nullableText(value.workspacePath) && choice(value.state, ['active', 'archived']) && positiveWhole(value.managementEpoch)
+const dateText = (value: unknown) => typeof value === 'string' && Number.isFinite(Date.parse(value))
 const archive = (value: Record<string, unknown>) => [value.projectId, value.decisions, value.progress, value.openIssues].every(text)
-  && nullableText(value.updatedAt) && boolean(value.readonly)
-const preference = (value: unknown) => object(value) && [value.preferenceId, value.key, value.text, value.updatedAt].every(text)
+  && (value.updatedAt === null || dateText(value.updatedAt)) && boolean(value.readonly)
+const preference = (value: unknown) => object(value) && [value.preferenceId, value.key, value.text].every(text) && dateText(value.updatedAt)
   && nullableText(value.projectId) && choice(value.state, ['active', 'forgotten']) && positiveWhole(value.version)
 const forward = (value: unknown) => value === null || (object(value)
   && [value.forwardId, value.projectId, value.projectName, value.projectMessageId].every(text)
@@ -59,12 +60,11 @@ const checkReceipt = (value: unknown) => nullableText(value) || (object(value) &
     && (check.exitCode === null || Number.isSafeInteger(check.exitCode)) && boolean(check.timedOut) && boolean(check.aborted)
     && choice(check.status, ['passed', 'failed']))
   && optional(value.omittedChecks, positiveWhole) && optional(value.omittedChangedFiles, positiveWhole))
-const task = (value: unknown) => object(value) && [value.taskId, value.title, value.requestText].every(text)
-  && [value.projectId, value.sourceMessageId, value.requesterBotId, value.assigneeBotId, value.workspacePath, value.resultSummary].every(nullableText)
-  && [value.projectName, value.sourceSessionId, value.workerSessionId].every(field => optional(field, nullableText))
-  && optional(value.conversationId, text) && checkReceipt(value.checkResult)
-  && permission(value.permission) && whole(value.authorizationVersion) && whole(value.createdAt) && whole(value.updatedAt)
-  && choice(value.status, ['queued', 'running', 'waiting_approval', 'blocked', 'interrupted', 'cancelled', 'delivered'])
+const task = (value: unknown) => object(value) && [value.taskId, value.conversationId, value.title, value.requestText].every(text)
+  && [value.projectId, value.projectName, value.sourceSessionId, value.workerSessionId, value.sourceMessageId,
+    value.requesterBotId, value.assigneeBotId, value.workspacePath, value.resultSummary].every(nullableText)
+  && checkReceipt(value.checkResult) && permission(value.permission) && whole(value.authorizationVersion)
+  && whole(value.createdAt) && whole(value.updatedAt) && choice(value.status, STUDIO_TASK_STATUSES)
   && items(value.artifacts, artifact) && Object.hasOwn(value, 'externalJob') && optional(value.source, source)
 const intake = (value: Record<string, unknown>) => boolean(value.accepted) && nullableText(value.messageId) && forward(value.forward)
   && (value.messageStatus === null || choice(value.messageStatus, ['queued', 'running', 'completed', 'failed', 'interrupted'])) && items(value.tasks, task)
@@ -117,9 +117,13 @@ function readable(op: StudioOp, value: unknown): boolean {
   }
 }
 
+// 建项、换任和重开需验证模型并准备原生 Leader，会和其他长请求一样使用较长的等待上限。
+const longRequests = new Set<StudioOp>(['send', 'answer', 'settings', 'stopTask', 'feishuMessageStatus', 'resubmitFeishuMessage',
+  'createProject', 'replaceProjectLeader', 'reopenProject'])
+
 export const callStudio: StudioCall = async (op, input, signal) => {
   // 请求有上限，避免网络挂起后阻塞轮询，也避免写入未应答时自动重发。
-  const timeout = AbortSignal.timeout(op === 'saveConfiguration' ? 120_000 : op === 'send' || op === 'answer' || op === 'settings' || op === 'stopTask' || op === 'feishuMessageStatus' || op === 'resubmitFeishuMessage' ? 35_000 : 15_000)
+  const timeout = AbortSignal.timeout(op === 'saveConfiguration' ? 120_000 : longRequests.has(op) ? 35_000 : 15_000)
   const bounded = signal ? AbortSignal.any([signal, timeout]) : timeout
   let response: Response | undefined
   let data: unknown
@@ -144,8 +148,25 @@ export const callStudio: StudioCall = async (op, input, signal) => {
   return data as StudioResult<typeof op>
 }
 
-/** 网络和协议故障按界面语言说明；业务拒绝保留宿主返回的具体原因。 */
+const operationErrors = {
+  PREFERENCE_CONFLICT: 'domainError.PREFERENCE_CONFLICT',
+  PROJECT_EPOCH_CONFLICT: 'domainError.PROJECT_EPOCH_CONFLICT',
+  PROJECT_ARCHIVED: 'domainError.PROJECT_ARCHIVED',
+  PROJECT_NOT_ARCHIVED: 'domainError.PROJECT_NOT_ARCHIVED',
+  PROJECT_NOT_FOUND: 'domainError.PROJECT_NOT_FOUND',
+  STUDIO_WORKSPACE_INVALID: 'configError.STUDIO_WORKSPACE_INVALID',
+  MODEL_UNAVAILABLE: 'configError.MODEL_UNAVAILABLE',
+  TASK_NOT_ACTIVE: 'domainError.TASK_NOT_ACTIVE',
+  TASK_NOT_FOUND: 'domainError.TASK_NOT_FOUND',
+  INVALID_INPUT: 'domainError.INVALID_INPUT',
+  STUDIO_UNAVAILABLE: 'unavailable',
+} as const satisfies Record<string, keyof typeof en>
+
+/** 已知操作错误给出本地化说明；未知业务拒绝仍以字面文本显示宿主返回的原因。 */
 export function failureText(t: T, failure: unknown): string {
-  if (failure instanceof StudioApiError) return failure.detail || t(failure.kind, { status: failure.status })
+  if (failure instanceof StudioApiError) {
+    if (failure.code && Object.hasOwn(operationErrors, failure.code)) return t(operationErrors[failure.code as keyof typeof operationErrors])
+    return failure.detail || t(failure.kind, { status: failure.status })
+  }
   return failure instanceof Error ? failure.message : t('badResponse')
 }

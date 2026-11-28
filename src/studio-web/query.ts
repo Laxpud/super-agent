@@ -6,6 +6,7 @@ export interface StudioQuery<T> {
   getSnapshot: () => QuerySnapshot<T>
   subscribe: (listener: () => void) => () => void
   reload: () => void
+  reconcile: (update: (current: T | undefined) => T | undefined) => void
 }
 
 /** 同一个查询共用一个请求；失去最后一个订阅者时停止轮询。 */
@@ -42,6 +43,11 @@ export function createQuery<T>(load: (signal: AbortSignal) => Promise<T>, interv
   }
   const start = () => { if (!request) void run() }
   const visibility = () => { if (!document.hidden) start() }
+  const reload = () => {
+    // 丢弃写入完成前发出的旧快照；合并多个刷新请求，等这一轮结束再读。
+    if (request) refreshQueued = true
+    else start()
+  }
   return {
     getSnapshot: () => snapshot,
     subscribe(listener) {
@@ -62,10 +68,12 @@ export function createQuery<T>(load: (signal: AbortSignal) => Promise<T>, interv
         }
       }
     },
-    reload() {
-      // 丢弃写入完成前发出的旧快照；合并多个刷新请求，等这一轮结束再读。
-      if (request) refreshQueued = true
-      else start()
+    reload,
+    reconcile(update) {
+      // 先排除写入前发出的读请求，再直接呈现写入收据；随后以宿主的新快照为准。
+      reload()
+      const data = update(snapshot.data)
+      if (data !== undefined) publish({ data })
     },
   }
 }

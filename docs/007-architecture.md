@@ -407,9 +407,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/studio/settings-credentials.ts`, `settings-directory.ts` | Keeps Feishu secrets in DSH credentials and prepares a verified database copy or explicitly empty directory after a clean stop |
 | `src/studio-web/index.tsx` | Adds a standalone sidebar entry and main panel, with literal-text tool cards for current Worker tools and historical Draft results |
 | `src/studio-web/workspaces.ts` | Keeps implicit and explicitly bound Studio Sessions out of the browser catalog presentation without changing Host storage |
-| `src/studio-web/studio.tsx`, `conversation.tsx` | Standalone navigation, Assistant and active project conversations, topics, quotes and result provenance |
+| `src/studio-web/studio.tsx`, `conversation.tsx` | Standalone sidebar navigation, Assistant and project conversations (read only once archived), topics, quotes and result provenance |
+| `src/studio-web/tasks.tsx` | Unified task ledger by status scope and conversation, cursor paging, literal Host check receipts, direct stop and links to the read-only source or pending queue |
+| `src/studio-web/projects.tsx` | Project creation, archive navigation, epoch-checked management and Leader changes, and the project archive editor that becomes read only when archived |
+| `src/studio-web/preferences.tsx` | Global and project preferences, explicit creation, version-checked editing and confirmed forgetting |
 | `src/studio-web/records.tsx`, `pending.tsx` | Read-only current and historical Session records, shared confirmation actions and task blocker clearance |
-| `src/studio-web/api.ts`, `drafts.ts`, `query.ts` | Validated same-origin API calls including task operations, independent conversation drafts and cancellable view queries |
+| `src/studio-web/api.ts`, `drafts.ts`, `query.ts` | Validated same-origin operations and localized business errors, independent conversation drafts, and cancellable reads reconciled with mutation receipts |
 | `src/studio-web/settings.tsx` | Conversation-model CAS, shared model catalog and settings navigation that keeps drafts when switching sections |
 | `src/studio-web/configuration.tsx`, `settings-sections.tsx` | Review and read back Host settings, choose Worker defaults by route ID and permission, and confirm data directory changes separately |
 | `src/studio-web/settings-feishu.tsx` | Configures the single optional conversation binding; verifies bot and owner identity and reads back credential and connection states without displaying secrets |
