@@ -534,7 +534,7 @@ export class StudioStore {
   /** Persist each pending item once, including items from conversations whose timeline is not mirrored. */
   addPending(item: StudioPending): StudioPending { return this.write(() => this.addPendingInTx(item)) }
 
-  /** 加入调用方的事务，使任务授权、待办与飞书出箱共享同一个提交点。 */
+  /** 加入调用方的事务，使 Web 待办、会话通知与飞书出箱共享提交点；守卫应在调用前独立提交撤权。 */
   addPendingInTx(item: StudioPending): StudioPending {
     this.requirePendingTransaction()
     requireId(item.id, 'pending item ID')

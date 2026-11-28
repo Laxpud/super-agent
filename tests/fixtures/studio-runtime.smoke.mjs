@@ -167,10 +167,12 @@ try {
       let block
       if (localPlan) {
         const isWorker = local.source?.kind === 'agent-studio'
+        if (isWorker && localPlan.readOnly) assert.ok(!tools.includes('bash') && !tools.includes('pwsh'), 'Read-only Workers expose no shell')
         const steps = isWorker ? localPlan.worker : localPlan.frontend
         const done = options.messages.flatMap(message => message.content).filter(item => item.type === 'tool-call' &&
           item.id.startsWith(`offline-local-${localPlan.id}-${isWorker ? 'worker' : 'front'}-`)).length
         if (done < steps.length) {
+          if (isWorker) await localPlan.beforeStep?.(done)
           const [name, args] = steps[done]
           assert.ok(tools.includes(name), `The native ${isWorker ? 'Worker' : 'frontend'} exposes ${name}`)
           block = { type: 'tool-call', id: `offline-local-${localPlan.id}-${isWorker ? 'worker' : 'front'}-${done}`, name,
@@ -414,10 +416,18 @@ try {
   // 记录 rc.5 原生派发及结构化结果；被拦截的模型调用和随后直接发往旧 Worker 的调用均不得进入工具本体。
   const dispatched = new Set()
   const staleCalls = new Map()
-  ctx.on('tools/execute', (exec, next) => { dispatched.add(exec.callId); return next() })
+  let stoppingCheckStarted = false
+  const localWorkers = new Map()
+  ctx.on('tools/execute', (exec, next) => {
+    dispatched.add(exec.callId)
+    const result = next()
+    if (exec.callId === 'offline-local-stop-worker-2') stoppingCheckStarted = true
+    return result
+  })
   ctx.on('tools/result', (exec, result) => {
     if (!exec.callId.startsWith('offline-local-')) return
     nativeResults.set(exec.callId, result)
+    if (exec.callId === 'offline-local-drift-worker-0') localWorkers.set('drift', exec.agent)
     if (exec.callId.startsWith('offline-local-denied-') && exec.callId.includes('-worker-') && result.error?.info?.code?.startsWith('STUDIO_')) {
       const stale = { type: 'tool-call', id: `stale-${exec.callId}`, name: 'read', arguments: JSON.stringify({ file_path: 'notes.txt' }) }
       staleCalls.set(exec.callId, ctx.tools.execute({ agent: exec.agent, calls: [stale], signal: AbortSignal.timeout(3_000) })
@@ -450,7 +460,7 @@ try {
   const beforeInvestigation = statSync(notesPath, { bigint: true })
   const investigate = `Investigate the read-only workspace ${JSON.stringify(investigation)} and report the exact source location.`
   const conclusion = 'The listed notes.txt contains unique-investigation-marker: alpine-red at notes.txt:2.'
-  plan(investigate, { id: 'investigate', frontend: [['studio_delegate_task', { workspacePath: investigation, permission: 'read-only' }]],
+  plan(investigate, { id: 'investigate', readOnly: true, frontend: [['studio_delegate_task', { workspacePath: investigation, permission: 'read-only' }]],
     worker: [['studio_list_directory', {}], ['read', { file_path: 'notes.txt' }],
       ['grep', { pattern: 'unique-investigation-marker', path: '.' }]], result: conclusion,
     observe(text) { assert.ok(text.includes('unique-investigation-marker: alpine-red') && text.includes('notes.txt')) } })
@@ -473,13 +483,14 @@ try {
   assert.equal(statSync(notesPath, { bigint: true }).mtimeNs, beforeInvestigation.mtimeNs)
   assert.equal(statSync(notesPath, { bigint: true }).ctimeNs, beforeInvestigation.ctimeNs)
   assert.equal((await post('state', {})).projects.length, projectCount)
-  process.stdout.write('OK local read-only Worker listed, read and searched native files; exact source, no writes or automatic project\n')
+  process.stdout.write('OK local read-only Worker listed, read and searched native files; no shell, writes or automatic project\n')
 
   const projectPath = join(fixture, 'project')
   mkdirSync(projectPath)
   writeFileSync(join(projectPath, 'notes.txt'), 'before\n')
   writeFileSync(join(projectPath, 'package.json'), JSON.stringify({ name: 'studio-smoke-local', private: true,
-    scripts: { check: 'node verify.mjs notes.txt after', test: 'node verify.mjs added.txt intentionally-different' } }))
+    scripts: { check: 'node verify.mjs notes.txt after', test: 'node verify.mjs added.txt intentionally-different', lint: 'node slow-check.mjs' } }))
+  writeFileSync(join(projectPath, 'slow-check.mjs'), `import { setTimeout } from 'node:timers/promises'\nawait setTimeout(5_000)\n`)
   writeFileSync(join(projectPath, 'verify.mjs'), `import { readFileSync } from 'node:fs'
 const [file, expected] = process.argv.slice(2)
 const contents = readFileSync(file, 'utf8').trim()
@@ -502,6 +513,8 @@ else console.log('fixture assertion passed')
   plan(modify, { id: 'modify', frontend: [['studio_delegate_task', { permission: 'workspace-write' }]],
     worker: [['edit', { file_path: 'notes.txt', old_string: 'before', new_string: 'after' }],
       ['write', { file_path: 'added.txt', content: 'new evidence\n' }],
+      ['bash', { command: 'pwd', description: 'Inspect the current local directory' }],
+      ['bash', { command: 'ls', description: 'Inspect the local directory entries' }],
       ['bash', { command: 'npm run check', workdir: projectPath, description: 'Run the offline fixture check' }],
       ['bash', { command: 'npm test', workdir: projectPath, description: 'Run the deliberately failing fixture check' }]],
     result: 'Worker claim: all checks passed.' })
@@ -527,7 +540,29 @@ else console.log('fixture assertion passed')
   plan(readLocal, { id: 'readback', frontend: [['studio_read_task', { taskId: modified.taskId }]], capture: true })
   await completed((await invoke('smoke-local-readback', readLocal, project.id)).id, project.id)
   assert.ok(workspaceReadbacks.get('readback')?.includes(modified.resultSummary))
-  process.stdout.write('OK owner-confirmed project edit and write; native exit 0 passed, exit 7 failed; tasks and studio_read_task report failed\n')
+  for (const index of [2, 3]) assert.equal(nativeResults.get(`offline-local-modify-worker-${index}`)?.value.exitCode, 0)
+
+  const stopRequest = 'Save a partial project file, run a check and begin another check before owner stop.'
+  plan(stopRequest, { id: 'stop', frontend: [['studio_delegate_task', { permission: 'workspace-write' }]],
+    worker: [['write', { file_path: 'partial.txt', content: 'observed before stop\n' }],
+      ['bash', { command: 'npm run check', description: 'Run the successful fixture check before stop' }],
+      ['bash', { command: 'npm run lint', description: 'Run the pending fixture check until owner stop' }]],
+    result: 'The stopped Worker must not deliver a model result.' })
+  const stopInput = await invoke('smoke-local-stop', stopRequest, project.id)
+  await allowWrite(project.id, stopRequest, stopInput, projectPath)
+  await completed(stopInput.id, project.id)
+  await until('the stoppable native check to begin dispatch', () => stoppingCheckStarted)
+  const running = await canonicalTask(project.id, stopRequest)
+  assert.equal(running.status, 'running')
+  const stopped = await post('stopTask', { taskId: running.taskId })
+  assert.equal(stopped.status, 'cancelled')
+  assert.deepEqual(stopped.checkResult.changedFiles, [{ path: 'partial.txt', action: 'write' }])
+  assert.deepEqual(stopped.checkResult.checks.map(({ command, exitCode, aborted, status }) => [command, exitCode, aborted, status]),
+    [['npm run check', 0, false, 'passed'], ['npm run lint', null, true, 'failed']])
+  assert.equal(stopped.checkResult.overallCheckStatus, 'failed')
+  assert.equal(readFileSync(join(projectPath, 'partial.txt'), 'utf8'), 'observed before stop\n')
+  assert.deepEqual(await post('task', { taskId: stopped.taskId }), stopped)
+  process.stdout.write('OK confirmed edits and writes; native exits 0/7; inspection ignored; manual stop keeps partial evidence\n')
 
   const outsidePath = join(fixture, 'outside-notes.txt')
   const sentinel = 'outside-fixture-sentinel\n'
@@ -538,7 +573,13 @@ else console.log('fixture assertion passed')
     ['write', 'workspace-write', 'write', { file_path: 'external.txt', content: 'must not be written' }, 'STUDIO_OUTSIDE_WORKSPACE'],
     // 不设置远程；即使守卫回归也不会联系任何服务。原生派发观测另外证明 git 进程未启动。
     ['push', 'workspace-write', 'bash', { command: 'git push', description: 'Attempt the prohibited local smoke command' }, 'STUDIO_HIGH_IMPACT_FORBIDDEN'],
+    ['git-config', 'workspace-write', 'bash', { command: 'git status', description: 'Inspect Git with an unsafe local config' }, 'STUDIO_HIGH_IMPACT_FORBIDDEN'],
+    ['remove', 'workspace-write', 'bash', { command: 'rm notes.txt', description: 'Attempt prohibited shell file deletion' }, 'STUDIO_HIGH_IMPACT_FORBIDDEN'],
   ]) {
+    if (id === 'git-config') {
+      mkdirSync(join(projectPath, '.git'))
+      writeFileSync(join(projectPath, '.git', 'config'), '[core]\n fsmonitor = never-run-fixture-helper\n')
+    }
     const request = `Offline guard scenario ${id}: exercise the requested local operation.`
     plan(request, { id: `denied-${id}`, frontend: [['studio_delegate_task', { permission }]], worker: [[name, args]],
       result: 'The guard smoke must never deliver a Worker result.' })
@@ -570,7 +611,26 @@ else console.log('fixture assertion passed')
     assert.equal(dispatched.has(callId), false)
   }
   assert.equal(readFileSync(outsidePath, 'utf8'), sentinel)
-  process.stdout.write('OK native symlink read/write and git push denied before dispatch; atomic guard todo and immediate stale execution rejection, no replay\n')
+  assert.equal(readFileSync(join(projectPath, 'notes.txt'), 'utf8'), 'after\n')
+
+  const drift = 'Verify that a Worker cannot read with a changed native working directory.'
+  plan(drift, { id: 'drift', readOnly: true, frontend: [['studio_delegate_task', { permission: 'read-only' }]],
+    worker: [['read', { file_path: 'notes.txt' }], ['read', { file_path: 'notes.txt' }]],
+    async beforeStep(index) {
+      if (index === 0) return
+      const agent = localWorkers.get('drift')
+      assert.ok(agent)
+      assert.equal(ctx.workingDirectory.get(agent.session), projectPath)
+      await ctx.workingDirectory.set(agent, investigation)
+      assert.equal(ctx.workingDirectory.get(agent.session), investigation)
+    }, result: 'The second Worker tool call should have been denied.' })
+  const driftInput = await invoke('smoke-local-drift', drift, project.id)
+  await completed(driftInput.id, project.id)
+  const driftCall = 'offline-local-drift-worker-1'
+  const driftDenial = await until('native Session workdir denial', () => nativeResults.get(driftCall))
+  assert.equal(driftDenial.error?.info?.code, 'STUDIO_SANDBOX_MISMATCH')
+  assert.ok(!dispatched.has(driftCall))
+  process.stdout.write('OK native symlink traversal, Git commands, deletion and Session directory drift denied; stale execution rejected without replay\n')
 } catch (error) {
   // 诊断只打印断言和测试阶段，不由运行时转储请求、认证数据或环境。
   console.error(error instanceof Error ? error.stack?.split('\n').slice(0, 9).join('\n') : 'Studio smoke failed')

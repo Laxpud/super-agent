@@ -1,6 +1,7 @@
 import { isAbsolute, relative, sep } from 'node:path'
 import type { ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import type { StudioChangedFile, StudioCheckResult, StudioCommandCheck } from '../studio/protocol.ts'
+import { isWorkerCheckCommand } from './worker-guard.ts'
 import { resolveWorkspaceTarget } from './workspace.ts'
 
 const FILE_LIMIT = 64
@@ -45,24 +46,31 @@ export class WorkerEvidence {
   private readonly changedFiles: StudioChangedFile[] = []
   private readonly checks: StudioCommandCheck[] = []
   private readonly fileKeys = new Set<string>()
+  private readonly pendingChecks = new Map<ObservedTool, { command: string; workdir: string }>()
   private omittedChangedFiles = 0
   private omittedChecks = 0
   private failed = false
 
   constructor(private readonly root: string | null, private readonly protectedRoots: readonly string[]) {}
 
-  /** 候选工作目录在执行前规范化；错误结果可能没有 cwd，不能从模型的错误描述反推它。 */
-  shellWorkdir(exec: ObservedTool): string | undefined {
-    if (this.root === null || (exec.name !== 'bash' && exec.name !== 'pwsh')) return
+  /** 在实际派发时登记待完成的检查；工作目录在执行前规范化，供缺少 cwd 的错误结果和手动停止的收据使用。 */
+  trackCheck(exec: ObservedTool): void {
+    if (this.root === null || exec.name !== 'bash') return
     const args = record(exec.arguments)
-    if (typeof args?.command !== 'string') return
-    try { return resolveWorkspaceTarget(this.root, typeof args.workdir === 'string' ? args.workdir : undefined,
-      { mode: 'dir', protectedRoots: this.protectedRoots, allowMissingDefaultRoot: true }) }
-    catch { return undefined }
+    if (typeof args?.command !== 'string' || !isWorkerCheckCommand(args.command)) return
+    try {
+      const workdir = resolveWorkspaceTarget(this.root, typeof args.workdir === 'string' ? args.workdir : undefined,
+        { mode: 'dir', protectedRoots: this.protectedRoots, allowMissingDefaultRoot: true })
+      this.pendingChecks.set(exec, { command: excerpt(args.command, 512), workdir })
+    } catch { /* 无法确认工作目录时不生成宿主检查证据。 */ }
   }
 
-  observe(exec: ObservedTool, result: Readonly<ToolExecutionResult>, shellWorkdir: string | undefined): void {
+  observe(exec: ObservedTool, result: Readonly<ToolExecutionResult>): void {
     if (this.root === null) return
+    const pending = this.pendingChecks.get(exec)
+    this.pendingChecks.delete(exec)
+    const code = result.isError ? result.error.info?.code : undefined
+    if (code === 'ABORTED_BEFORE_DISPATCH' || code === 'UNKNOWN_TOOL') return
     const value = result.isError ? undefined : record(result.value)
     if (exec.name === 'write' || exec.name === 'edit') {
       if (typeof value?.path !== 'string' || !isAbsolute(value.path) || typeof value.after !== 'string'
@@ -77,14 +85,11 @@ export class WorkerEvidence {
       else this.omittedChangedFiles++
       return
     }
-    if (!shellWorkdir || (exec.name !== 'bash' && exec.name !== 'pwsh')) return
-    const command = record(exec.arguments)?.command
-    if (typeof command !== 'string') return
+    if (!pending) return
     const foreground = value?.kind === 'foreground' ? value : undefined
     const actualCwd = typeof foreground?.cwd === 'string' ? withinWorkspace(this.root, foreground.cwd, this.protectedRoots) : undefined
     const exitCode = typeof foreground?.exitCode === 'number' && Number.isSafeInteger(foreground.exitCode) ? foreground.exitCode : null
     const signal = typeof foreground?.signal === 'string' ? excerpt(foreground.signal, 80) : null
-    const code = result.isError ? result.error.info?.code : undefined
     const timedOut = foreground?.timedOut === true || value?.kind === 'promoted'
       || code === 'TIMEOUT' || code === 'TOOL_TIMEOUT' || (exec.signal.aborted && exec.signal.reason?.name === 'TimeoutError')
     const aborted = foreground?.aborted === true || foreground?.stopped !== undefined || exec.signal.aborted
@@ -103,16 +108,23 @@ export class WorkerEvidence {
     const notes = [output('stdout'), output('stderr'), result.isError ? excerpt(result.error.message, 400) : '',
       sandboxFailed ? 'Native sandbox denied the command or its runner failed.' : '',
       !result.isError && !actualCwd ? 'No confirmed foreground process result.' : ''].filter(Boolean)
-    this.checks.push({ command: excerpt(command, 512), workdir: actualCwd ?? shellWorkdir, exitCode, signal, timedOut, aborted,
+    this.checks.push({ ...pending, workdir: actualCwd ?? pending.workdir, exitCode, signal, timedOut, aborted,
       status: passed ? 'passed' : 'failed', output: excerpt(notes.join('\n'), 1_200) })
   }
 
-  /** 返回快照，使后续到达的工具事件不能改变已经准备提交的收据。 */
-  result(): StudioCheckResult | undefined {
+  /** 停止时把已派发但未回报的检查记为中止，不猜测进程退出状态，也不改写原收集器。 */
+  result(stopped = false): StudioCheckResult | undefined {
     if (this.root === null) return
-    return { version: 1, changedFiles: [...this.changedFiles], checks: [...this.checks],
-      overallCheckStatus: this.failed ? 'failed' : this.checks.length ? 'passed' : 'not_run',
-      ...(this.omittedChecks ? { omittedChecks: this.omittedChecks } : {}),
+    const checks = [...this.checks]
+    let omittedChecks = this.omittedChecks
+    if (stopped) for (const pending of this.pendingChecks.values()) {
+      if (checks.length < CHECK_LIMIT) checks.push({ ...pending, exitCode: null, signal: null, timedOut: false, aborted: true,
+        status: 'failed', output: 'The task was stopped before a process result was observed.' })
+      else omittedChecks++
+    }
+    return { version: 1, changedFiles: [...this.changedFiles], checks,
+      overallCheckStatus: this.failed || (stopped && this.pendingChecks.size > 0) ? 'failed' : checks.length ? 'passed' : 'not_run',
+      ...(omittedChecks ? { omittedChecks } : {}),
       ...(this.omittedChangedFiles ? { omittedChangedFiles: this.omittedChangedFiles } : {}) }
   }
 }

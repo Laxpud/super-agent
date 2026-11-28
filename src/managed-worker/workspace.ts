@@ -1,4 +1,4 @@
-import { lstatSync, readdirSync, readlinkSync, realpathSync, statSync } from 'node:fs'
+import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 
@@ -41,7 +41,12 @@ function assertPath(value: string): void {
 export function protectedHostRoots(stateDir: string, extra: string[] = []): readonly string[] {
   const home = homedir()
   const roots = new Set<string>()
-  for (const input of [...['.ssh', '.aws', '.dsh', '.agents'].map(name => join(home, name)), '/etc/shadow', stateDir, ...extra]) {
+  const configuredHome = process.env.DSH_HOME
+  // 与 DSH 的目录解析一致：空白覆盖视为未设置，常见的用户家目录前缀在宿主侧展开。
+  const dshHome = configuredHome === '~' ? home : configuredHome && /^~[\\/]/u.test(configuredHome)
+    ? join(home, configuredHome.slice(2)) : configuredHome
+  for (const input of [...['.ssh', '.aws', '.dsh', '.agents'].map(name => join(home, name)), '/etc/shadow', stateDir,
+    ...(dshHome?.trim() ? [dshHome] : []), ...extra]) {
     const absolute = resolve(input)
     roots.add(absolute)
     const suffix: string[] = []
@@ -190,6 +195,51 @@ export function resolveWorkspaceTarget(root: string, rawTarget: string | undefin
   // 原生搜索会递归访问目标子目录，不能仅核验搜索起点再让它扫过受保护的子树。
   if (mode === 'search' && stat?.isDirectory()) assertWorkspaceTraversal(physical, protectedRoots)
   return physical
+}
+
+const GIT_CONFIG_LIMIT = 256 * 1024
+// include 可加载未检查的配置；命令型配置键按 Git 的大小写不敏感规则比对。
+const gitCommandKeys = /^(?:fsmonitor|external|sshcommand|textconv|smudge|clean|process|pager|editor|hookspath|command|helper|gpgprogram|program)$/iu
+
+/** 仅检查工作区内的真实 Git 目录和有界常规配置文件；不可确认时不允许启动 Git。 */
+export function workspaceGitConfigSafe(root: string, gitDir: string, protectedRoots: readonly string[]): boolean {
+  try {
+    if (resolveWorkspaceTarget(root, gitDir, { mode: 'dir', protectedRoots }) !== gitDir
+      || !existing(gitDir)?.isDirectory() || existing(join(gitDir, 'commondir')) || existing(join(gitDir, 'config.worktree'))) return false
+    const path = join(gitDir, 'config')
+    const entry = existing(path)
+    if (!entry) return true
+    // 禁止链接和特殊文件；打开后再次校验文件身份，再限长读取，避免跟随链接或无限等待特殊文件。
+    if (!entry.isFile() || entry.nlink !== 1 || entry.size > GIT_CONFIG_LIMIT
+      || resolveWorkspaceTarget(root, path, { mode: 'write', protectedRoots }) !== path) return false
+    const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
+    try {
+      const opened = fstatSync(fd)
+      if (!opened.isFile() || opened.dev !== entry.dev || opened.ino !== entry.ino) return false
+      const bytes = Buffer.alloc(GIT_CONFIG_LIMIT + 1)
+      let size = 0
+      while (size < bytes.length) {
+        const n = readSync(fd, bytes, size, bytes.length - size, null)
+        if (n === 0) break
+        size += n
+      }
+      if (size > GIT_CONFIG_LIMIT) return false
+      const config = new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, size))
+      if (config.includes('\0')) return false
+      return config.split(/\r?\n/u).every(line => {
+        const text = line.trimStart()
+        if (!text || /^[#;]/u.test(text)) return true
+        // 保守拒绝续行和无法识别的语法；Git 的 include、pager 子节和命令型键不能进入派发。
+        if (text.trimEnd().endsWith('\\')) return false
+        if (text.startsWith('[')) {
+          const section = /^\[\s*([a-z][\w-]*)(?:\.[\w.-]+|\s+"(?:[^"\\]|\\.)*")?\s*\](?:\s*[#;].*)?\s*$/iu.exec(text)?.[1]
+          return section !== undefined && !/^(?:include|includeif|pager)$/iu.test(section)
+        }
+        const key = /^([a-z][\w-]*)(?=[\s=;#]|$)/iu.exec(text)?.[1]
+        return key !== undefined && !gitCommandKeys.test(key)
+      })
+    } finally { closeSync(fd) }
+  } catch { return false }
 }
 
 /** 递归操作不能从受保护树的祖先起步；仅检查直接项的目录列表不受此限。 */

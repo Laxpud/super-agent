@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
-import type { ToolDefinition, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import type { ToolDefinition, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { StudioAssistant, WORKER_PRESET } from '../src/managed-worker/assistant.ts'
 import { Config } from '../src/managed-worker/index.ts'
@@ -15,6 +15,7 @@ import { summarizeGuardAction, WorkerEvidence, type ObservedTool } from '../src/
 import { evaluateWorkerToolCall, guardActionFingerprint, workerToolAllowlist, type WorkerGuardInput } from '../src/managed-worker/worker-guard.ts'
 import { canonicalizeWorkspaceRoot, listWorkspaceDirectory, protectedHostRoots, resolveWorkspaceTarget, verifyWorkspaceIdentity,
   type WorkspaceTargetMode } from '../src/managed-worker/workspace.ts'
+import { callStudio } from '../src/studio-web/api.ts'
 import { studioTaskText } from '../src/studio/domain.ts'
 import { ASSISTANT_CONVERSATION, GUARD_PENDING_CHOICES, WORKER_DELEGATE, type StudioWorkerPermission } from '../src/studio/protocol.ts'
 import { StudioService } from '../src/studio/service.ts'
@@ -94,6 +95,26 @@ describe('Studio workspace validation', () => {
     } finally { vi.unstubAllEnvs() }
   })
 
+  it('protects a custom DSH_HOME and a separately provided profile root by lexical and physical path', () => {
+    const f = workspaceFixture()
+    const data = join(f.root, 'custom-dsh-data'), alias = join(f.dir, 'custom-dsh-alias')
+    const profile = join(f.root, 'custom-profile')
+    mkdirSync(data)
+    mkdirSync(profile)
+    symlinkSync(data, alias, 'dir')
+    writeFileSync(join(data, 'credential'), 'fixture data')
+    vi.stubEnv('DSH_HOME', alias)
+    try {
+      const roots = protectedHostRoots(f.stateDir, [profile])
+      for (const path of [data, alias, profile]) expect(() => canonicalizeWorkspaceRoot(path, roots)).toThrow(outsideWorkspace)
+      expect(() => resolveWorkspaceTarget(f.root, 'custom-dsh-data/credential', { mode: 'read', protectedRoots: roots })).toThrow(outsideWorkspace)
+      expect(listWorkspaceDirectory(f.root, undefined, roots)).toEqual([{ name: 'a', kind: 'dir' }])
+      vi.stubEnv('HOME', f.dir)
+      vi.stubEnv('DSH_HOME', '~/workspace/custom-dsh-data')
+      expect(() => canonicalizeWorkspaceRoot(data, protectedHostRoots(f.stateDir))).toThrow(outsideWorkspace)
+    } finally { vi.unstubAllEnvs() }
+  })
+
   it.each(['../workspace-sibling/outside.txt', 'a/../../workspace-sibling/outside.txt', '../workspace/a/note.txt'])
   ('rejects traversal even if normalization can bring it back in scope: %s', path => {
     const f = workspaceFixture()
@@ -159,7 +180,7 @@ describe('Studio Worker tool authority', () => {
     expect(workerToolAllowlist(null, 'read-only')).toEqual([])
     for (const name of [...workerToolAllowlist(f.root, 'workspace-write'), 'pwsh', 'apply_patch', 'job_output', 'subagent']) {
       const verdict = f.call('read-only', name, {}, { execution: { active: true, signal, permission: 'read-only', workspacePath: null } })
-      expect(verdict?.code).toBe('STUDIO_TOOL_FORBIDDEN')
+      expect(verdict?.code).toBe(name === 'bash' || name === 'pwsh' ? 'STUDIO_READ_ONLY_VIOLATION' : 'STUDIO_TOOL_FORBIDDEN')
     }
   })
 
@@ -169,7 +190,7 @@ describe('Studio Worker tool authority', () => {
   ])('rejects an own escalation key, regardless of tool or value (%j)', extra => {
     const f = guardFixture()
     for (const permission of ['read-only', 'workspace-write'] as const) {
-      for (const name of [...workerToolAllowlist(f.root, 'workspace-write'), 'unknown']) {
+      for (const name of [...workerToolAllowlist(f.root, permission), 'unknown']) {
         expect(f.call(permission, name, { ...extra })?.code).toBe('STUDIO_ESCALATION_FORBIDDEN')
       }
     }
@@ -177,14 +198,15 @@ describe('Studio Worker tool authority', () => {
     expect(f.call('read-only', 'read', inherited)).toBeUndefined()
   })
 
-  it('allows native reads, searches and only narrow literal shell commands in read-only', () => {
+  it('allows native reads and searches but never exposes or authorizes read-only shell tools', () => {
     const f = guardFixture()
+    expect(workerToolAllowlist(f.root, 'read-only')).toEqual(['studio_list_directory', 'read', 'read_image', 'glob', 'grep'])
     for (const [name, args] of [
       ['studio_list_directory', {}], ['read', { file_path: 'a/note.txt', offset: 1, limit: 2 }],
       ['glob', { path: 'a', pattern: '**/*.txt' }], ['grep', { pattern: 'fixture', path: 'a', include: '*.txt' }],
     ] as const) expect(f.call('read-only', name, args)).toBeUndefined()
-    for (const command of ['git status', 'ls', 'ls -la -- a', 'wc -l a/note.txt', 'pwd']) {
-      expect(f.shell('read-only', command)).toBeUndefined()
+    for (const name of ['bash', 'pwsh']) for (const args of [null, { command: 'pwd' }, { command: 'git status' }, { sandbox_permissions: 'workspace-write' }]) {
+      expect(f.call('read-only', name, args)).toMatchObject({ code: 'STUDIO_READ_ONLY_VIOLATION', needsOwnerDecision: true })
     }
     expect(f.call('read-only', 'write', { file_path: 'new.txt', content: 'new' })?.code).toBe('STUDIO_READ_ONLY_VIOLATION')
     expect(f.call('read-only', 'edit', { file_path: 'a/note.txt', old_string: 'fixture', new_string: 'changed' })?.code)
@@ -214,9 +236,43 @@ describe('Studio Worker tool authority', () => {
   })
 
   it.each(['git push', 'pnpm publish', 'sudo true', 'curl localhost', 'ssh localhost', 'scripts/agent-studio restart',
-    'rm -rf /', 'rm ../outside', "bash -c 'pwd'", "node -e 'fixture'"])
+    'rm -rf /', 'rm ../outside', 'rm a/note.txt', 'mv a/note.txt a/moved.txt', 'cp a/note.txt a/copied.txt', "bash -c 'pwd'", "node -e 'fixture'"])
   ('blocks high-impact commands even after write authorization: %s', command => {
     expect(guardFixture().shell('workspace-write', command)).toMatchObject({ code: 'STUDIO_HIGH_IMPACT_FORBIDDEN', needsOwnerDecision: true })
+  })
+
+  it.each([
+    '[CoRe]\n FSmOnItOr = fixture-helper', '[diff]\n external = fixture-helper', '[core]\n sshCommand = fixture-helper',
+    '[diff "fixture"]\n textconv = fixture-helper', '[filter "fixture"]\n smudge = fixture-helper',
+    '[filter "fixture"]\n clean = fixture-helper', '[pager]\n status = fixture-helper', '[core]\n editor = fixture-helper',
+    '[core]\n hooksPath = fixture-hooks', '[includeIf "gitdir:fixture"]\n path = other-config', '[core] fsmonitor = fixture-helper',
+  ])('rejects Git commands when the real repository config reads %j', config => {
+    const f = guardFixture()
+    const git = join(f.root, '.git')
+    mkdirSync(git)
+    const path = join(git, 'config')
+    writeFileSync(path, '[core]\n repositoryformatversion = 0\n # fsmonitor is just a comment\n')
+    expect(f.shell('workspace-write', 'git status', { workdir: 'a' })).toBeUndefined()
+    writeFileSync(path, `${config}\n`)
+    for (const command of ['git status', 'git diff', 'git log', 'git show', 'git add -- .']) {
+      expect(f.shell('workspace-write', command, { workdir: 'a' })).toMatchObject({ code: 'STUDIO_HIGH_IMPACT_FORBIDDEN', needsOwnerDecision: true })
+    }
+  })
+
+  it.each(['gitfile', 'gitdir-link', 'config-link'])('blocks Git metadata that redirects to the outside: %s', kind => {
+    const f = guardFixture()
+    const git = join(f.root, '.git')
+    if (kind === 'gitfile') writeFileSync(git, `gitdir: ${f.sibling}\n`)
+    else if (kind === 'gitdir-link') symlinkSync(f.sibling, git, 'dir')
+    else { mkdirSync(git); symlinkSync(f.outside, join(git, 'config')) }
+    expect(f.shell('workspace-write', 'git status')).toMatchObject({ code: 'STUDIO_HIGH_IMPACT_FORBIDDEN', needsOwnerDecision: true })
+  })
+
+  it('returns a sandbox mismatch when the Session directory has drifted despite matching native sandbox settings', () => {
+    const f = guardFixture()
+    const args = { file_path: 'a/note.txt' }
+    expect(f.call('read-only', 'read', args, { sessionDirectoryMatches: true })).toBeUndefined()
+    expect(f.call('read-only', 'read', args, { sessionDirectoryMatches: false })?.code).toBe('STUDIO_SANDBOX_MISMATCH')
   })
 
   it('rejects background jobs, out-of-scope workdirs and symlink targets through the actual guard', () => {
@@ -263,6 +319,10 @@ const failure = (code: string): ToolExecutionResult => ({ isError: true, error: 
 const observed = (name: string, args: object, toolSignal = signal): ObservedTool => ({ name, arguments: args, signal: toolSignal })
 const foreground = (cwd: string, extra: object = {}) => ({ kind: 'foreground', cwd, exitCode: 0, signal: null, timedOut: false,
   aborted: false, stdout: { text: 'fixture output', truncated: false }, ...extra })
+const observe = (evidence: WorkerEvidence, exec: ObservedTool, result: ToolExecutionResult) => {
+  evidence.trackCheck(exec)
+  evidence.observe(exec, result)
+}
 
 describe('Studio host tool evidence', () => {
   it('captures only actual native write/edit results, normalizes paths, and deduplicates equal action/path pairs', () => {
@@ -272,16 +332,16 @@ describe('Studio host tool evidence', () => {
     writeFileSync(file, 'new')
     const create = observed('write', { file_path: file })
     const edit = observed('edit', { file_path: f.file })
-    evidence.observe(create, success({ path: file, before: null, after: 'new' }), undefined)
-    evidence.observe(create, success({ path: `${f.root}/a/../new.txt`, before: 'new', after: 'other' }), undefined)
+    evidence.observe(create, success({ path: file, before: null, after: 'new' }))
+    evidence.observe(create, success({ path: `${f.root}/a/../new.txt`, before: 'new', after: 'other' }))
     writeFileSync(f.file, 'modified')
-    evidence.observe(edit, success({ path: f.file, before: 'fixture line\n', after: 'modified' }), undefined)
+    evidence.observe(edit, success({ path: f.file, before: 'fixture line\n', after: 'modified' }))
     const noOp = join(f.root, 'same.txt')
     writeFileSync(noOp, 'same')
-    evidence.observe(edit, success({ path: noOp, before: 'same', after: 'same' }), undefined)
-    evidence.observe(edit, success({ path: f.outside, before: 'old', after: 'new' }), undefined)
-    evidence.observe(create, success({ path: 'claimed.txt', before: null, after: 'fake' }), undefined)
-    evidence.observe(create, failure('WRITE_FAILED'), undefined)
+    evidence.observe(edit, success({ path: noOp, before: 'same', after: 'same' }))
+    evidence.observe(edit, success({ path: f.outside, before: 'old', after: 'new' }))
+    evidence.observe(create, success({ path: 'claimed.txt', before: null, after: 'fake' }))
+    evidence.observe(create, failure('WRITE_FAILED'))
     expect(evidence.result()).toEqual({ version: 1, changedFiles: [{ path: 'new.txt', action: 'write' }, { path: 'a/note.txt', action: 'edit' }],
       checks: [], overallCheckStatus: 'not_run' })
     expect(new WorkerEvidence(null, f.protectedRoots).result()).toBeUndefined()
@@ -291,10 +351,7 @@ describe('Studio host tool evidence', () => {
     const f = workspaceFixture()
     const evidence = new WorkerEvidence(f.root, f.protectedRoots)
     const run = (command: string, result: ToolExecutionResult, caller = signal) => {
-      const exec = observed('bash', { command, workdir: 'a' }, caller)
-      const workdir = evidence.shellWorkdir(exec)
-      expect(workdir).toBe(join(f.root, 'a'))
-      evidence.observe(exec, result, workdir)
+      observe(evidence, observed('bash', { command, workdir: 'a' }, caller), result)
     }
     run('pnpm check', success(foreground(f.root)))
     expect(evidence.result()?.overallCheckStatus).toBe('passed')
@@ -317,14 +374,28 @@ describe('Studio host tool evidence', () => {
     ])
   })
 
+  it('does not mistake inspection, help or version output for a passed project check', () => {
+    const f = workspaceFixture()
+    const evidence = new WorkerEvidence(f.root, f.protectedRoots)
+    for (const command of ['pwd', 'ls', 'wc -l a/note.txt', 'git status', 'git diff --check', 'git log', 'git show', 'tsc --version', 'vitest --help']) {
+      observe(evidence, observed('bash', { command }), success(foreground(f.root)))
+    }
+    expect(evidence.result()).toMatchObject({ checks: [], overallCheckStatus: 'not_run' })
+    const checks = ['pnpm check', 'pnpm test', 'pnpm typecheck', 'pnpm build', 'pnpm lint', 'npm test', 'npm run build', 'npx vitest run',
+      'npx --no-install tsc', 'vitest run', 'tsc --noEmit']
+    for (const command of checks) observe(evidence, observed('bash', { command }), success(foreground(f.root)))
+    expect(evidence.result()?.checks.map(check => check.command)).toEqual(checks)
+    expect(evidence.result()?.overallCheckStatus).toBe('passed')
+  })
+
   it('keeps an omitted failure in the overall status and redacts tool output before publishing it', () => {
     const f = workspaceFixture()
     const evidence = new WorkerEvidence(f.root, f.protectedRoots)
     const exec = observed('bash', { command: 'pnpm check' })
-    for (let count = 0; count < 32; count++) evidence.observe(exec, success(foreground(f.root,
-      { stderr: { text: '\u001b[31mAPI_KEY=fixture-secret\u001b[0m', truncated: false } })), f.root)
+    for (let count = 0; count < 32; count++) observe(evidence, exec, success(foreground(f.root,
+      { stderr: { text: '\u001b[31mAPI_KEY=fixture-secret\u001b[0m', truncated: false } })))
     const before = evidence.result()!
-    evidence.observe(exec, success(foreground(f.root, { exitCode: 5 })), f.root)
+    observe(evidence, exec, success(foreground(f.root, { exitCode: 5 })))
     expect(before.overallCheckStatus).toBe('passed')
     expect(evidence.result()).toMatchObject({ overallCheckStatus: 'failed', omittedChecks: 1 })
     expect(evidence.result()?.checks).toHaveLength(32)
@@ -349,6 +420,17 @@ function ledgerFixture() {
 }
 
 const denialArgs = { command: 'git push', workdir: '.' }
+function expectExecutionRevoked(f: ReturnType<typeof ledgerFixture>, execution: StudioExecution) {
+  expect(f.domain.executionCurrent(execution)).toBe(false)
+  expect(f.domain.task(execution.taskId)).toMatchObject({ status: 'waiting_approval', authorizationVersion: execution.authorizationVersion + 1 })
+  expect(f.sqlite.prepare('SELECT ended_at, outcome, result_event_seq FROM studio_task_execution WHERE task_id = ?').get(execution.taskId))
+    .toEqual({ ended_at: expect.any(String), outcome: 'waiting_approval', result_event_seq: null })
+  expect(evaluateWorkerToolCall({ name: 'read', arguments: { file_path: f.file },
+    execution: { active: f.domain.executionCurrent(execution), workspacePath: f.root, workspaceIdentity: f.binding, permission: 'read-only', signal },
+    sandbox: { mode: 'read-only', workspaceRoot: f.root }, protectedRoots: f.protectedRoots }))
+    .toMatchObject({ code: 'STUDIO_EXECUTION_INACTIVE', needsOwnerDecision: false })
+  expect(f.domain.finishExecution(execution, { text: 'stale success', eventSeq: 9 }, 'delivered')).toBe(false)
+}
 function recordIntercept(f: ReturnType<typeof ledgerFixture>, execution: StudioExecution, args: unknown = denialArgs) {
   const denial = evaluateWorkerToolCall({ name: 'bash', arguments: args,
     // 模拟已取得的拒绝结果被重新提交；账本必须自行核对执行是否仍然有效。
@@ -362,7 +444,7 @@ describe('Studio evidence and guard decisions in the persistent ledger', () => {
     const f = ledgerFixture()
     const live = f.begin('version-1')
     const evidence = new WorkerEvidence(f.root, f.protectedRoots)
-    evidence.observe(observed('bash', { command: 'pnpm test' }), success(foreground(f.root, { exitCode: 8 })), f.root)
+    observe(evidence, observed('bash', { command: 'pnpm test' }), success(foreground(f.root, { exitCode: 8 })))
     expect(f.domain.finishExecution(live, { text: 'All checks passed (untrusted claim).', eventSeq: 8 }, 'delivered', evidence.result())).toBe(true)
     const legacy = f.register('legacy')
     f.sqlite.prepare('UPDATE studio_task SET check_result = ? WHERE task_id = ?').run('Historical check: unstructured', legacy)
@@ -378,30 +460,52 @@ describe('Studio evidence and guard decisions in the persistent ledger', () => {
     expect(f.domain.task(legacy)?.checkResult).toBe('{"version":2}')
   })
 
-  it('rolls back revocation and pending changes when Feishu outbox insertion fails, then commits them together exactly once', async () => {
+  it.each([
+    [undefined, true], [1, true], [Number.MAX_SAFE_INTEGER, true], [0, false], [-1, false], [1.5, false],
+    [Number.MAX_SAFE_INTEGER + 1, false], ['1', false], [null, false],
+  ])('uses the same positive-safe-integer receipt count contract on Host and Web (%j)', async (count, valid) => {
+    const f = ledgerFixture()
+    const taskId = f.register('count-contract')
+    const pending = f.domain.task(taskId)!
+    try {
+      for (const key of ['omittedChangedFiles', 'omittedChecks']) {
+        const receipt = { version: 1, changedFiles: [], checks: [], overallCheckStatus: 'not_run', ...(count !== undefined && { [key]: count }) }
+        const raw = JSON.stringify(receipt)
+        f.sqlite.prepare('UPDATE studio_task SET check_result = ? WHERE task_id = ?').run(raw, taskId)
+        expect(f.domain.task(taskId)?.checkResult).toEqual(valid ? receipt : raw)
+        // 对浏览器单独注入同一结构化响应，不让宿主的旧文本兼容掩盖协议差异。
+        vi.stubGlobal('fetch', vi.fn(async () => Response.json({ ...pending, checkResult: receipt })))
+        if (valid) await expect(callStudio('task', { taskId })).resolves.toMatchObject({ checkResult: receipt })
+        else await expect(callStudio('task', { taskId })).rejects.toMatchObject({ kind: 'badResponse' })
+      }
+    } finally { vi.unstubAllGlobals() }
+  })
+
+  it('keeps revocation committed even when a Feishu outbox failure rolls back the notification transaction', async () => {
     const f = ledgerFixture()
     const { domain, sqlite, service } = f
     service.feishu.activate(scope, Date.now() - 1)
     const request = await service.operations.send({ conversationId: assistantRoom, requestId: 'original', text: 'Fixture owner request' }, signal)
-    const execution = f.begin('atomic', studioOwnerMessageId(request.id))
+    const execution = f.begin('outbox-failure', studioOwnerMessageId(request.id))
     sqlite.exec(`CREATE TRIGGER fixture_fail_outbox BEFORE INSERT ON agent_studio_feishu_outbox
-      WHEN NEW.kind = 'pending' BEGIN SELECT RAISE(ABORT, 'fixture outbox failure'); END;`)
+      WHEN NEW.kind = 'pending' BEGIN SELECT RAISE(ROLLBACK, 'fixture outbox failure'); END;`)
     expect(() => recordIntercept(f, execution)).toThrow('fixture outbox failure')
-    expect(domain.executionCurrent(execution)).toBe(true)
-    expect(domain.task(execution.taskId)).toMatchObject({ status: 'running', authorizationVersion: execution.authorizationVersion })
-    const proof = () => sqlite.prepare('SELECT ended_at, outcome, result_event_seq FROM studio_task_execution WHERE task_id = ?').get(execution.taskId)
-    expect(proof()).toEqual({ ended_at: null, outcome: null, result_event_seq: null })
+    expectExecutionRevoked(f, execution)
     expect(domain.studio.pending().items).toEqual([])
     expect(domain.studio.messages(assistantRoom, request.id).items).toEqual([])
     expect(sqlite.prepare("SELECT count(*) AS n FROM agent_studio_feishu_outbox WHERE kind = 'pending'").get()?.n).toBe(0)
-    sqlite.exec('DROP TRIGGER fixture_fail_outbox')
+  })
+
+  it('publishes the Web and Feishu notifications together and at most once on successful revocation', async () => {
+    const f = ledgerFixture()
+    const { domain, sqlite, service } = f
+    service.feishu.activate(scope, Date.now() - 1)
+    const request = await service.operations.send({ conversationId: assistantRoom, requestId: 'original', text: 'Fixture owner request' }, signal)
+    const execution = f.begin('notification', studioOwnerMessageId(request.id))
     const { recorded, pendingId } = recordIntercept(f, execution)
     expect(recorded).toBe(true)
     expect(pendingId).toMatch(new RegExp(`^guard-intercept:${execution.taskId}:${execution.authorizationVersion + 1}:[a-f0-9]{20}$`, 'u'))
-    expect(domain.task(execution.taskId)).toMatchObject({ status: 'waiting_approval', authorizationVersion: execution.authorizationVersion + 1 })
-    expect(proof()).toEqual({ ended_at: expect.any(String), outcome: 'waiting_approval', result_event_seq: null })
-    expect(domain.executionCurrent(execution)).toBe(false)
-    expect(domain.finishExecution(execution, { text: 'stale success', eventSeq: 9 }, 'delivered')).toBe(false)
+    expectExecutionRevoked(f, execution)
     expect(recordIntercept(f, execution, { workdir: '.', command: 'git push' })).toEqual({ recorded: false })
     expect(domain.studio.pending().items).toMatchObject([{ id: pendingId, taskId: execution.taskId, messageId: request.id, topicId: request.id,
       options: [...GUARD_PENDING_CHOICES], state: 'pending' }])
@@ -412,7 +516,7 @@ describe('Studio evidence and guard decisions in the persistent ledger', () => {
     expect(domain.studio.pendingItem(pendingId!)?.detail).not.toContain('git push')
   })
 
-  it('caps an execution-version pending bucket even if it is already full in the ledger', () => {
+  it('revokes an execution without adding notifications when its pending bucket is full', () => {
     const f = ledgerFixture()
     const execution = f.begin('rate-limit')
     f.service.feishu.activate(scope, Date.now() - 1)
@@ -420,8 +524,8 @@ describe('Studio evidence and guard decisions in the persistent ledger', () => {
     for (let n = 1; n <= 5; n++) f.domain.studio.addPending({ id: `guard-intercept:${execution.taskId}:${execution.authorizationVersion + 1}:${String(n).padStart(20, '0')}`,
       kind: 'confirmation', taskId: execution.taskId, conversationId: assistantRoom, title: 'Previously stored interception', requester: 'Studio fixture',
       detail: 'Fixture pending bucket', options: [...GUARD_PENDING_CHOICES], acceptsText: false, mobile: 'card', state: 'pending', createdAt: Date.now() })
-    expect(recordIntercept(f, execution)).toEqual({ recorded: false })
-    expect(f.domain.executionCurrent(execution)).toBe(true)
+    expect(recordIntercept(f, execution)).toEqual({ recorded: true })
+    expectExecutionRevoked(f, execution)
     expect(f.domain.studio.pending().items).toHaveLength(5)
     expect(f.sqlite.prepare("SELECT count(*) AS n FROM agent_studio_feishu_outbox WHERE kind = 'pending'").get()?.n).toBe(5)
   })
@@ -482,6 +586,8 @@ function dispatchFixture() {
   const agents = new Map<string, Agent>()
   const executions: Array<{ preset: string; cwd: string }> = []
   const verdicts: Array<{ output?: unknown; error?: unknown }> = []
+  let workerStep: ((agent: Agent) => Promise<void>) | undefined
+  const permissions = new Map<string, StudioWorkerPermission>()
   const ctx = { on: (_name: string, listener: (session: object, event: object) => void) => {
     handlers.add(listener)
     return () => handlers.delete(listener)
@@ -491,11 +597,14 @@ function dispatchFixture() {
       executions.push({ preset: opts.meta.agentPreset, cwd: opts.meta.cwd })
       const agent = native(opts.sessionId, opts.meta.agentPreset.endsWith('assistant') ? 'assistant' : 'worker', {}, opts.signal)
       return { agent, dispose: async () => { agents.delete(agent.id) } }
-    } }, sessionPersistence: { flush: async () => {} }, logger: { warn: noop } } as unknown as Context
+    } }, sessionPersistence: { flush: async () => {} }, logger: { warn: noop },
+    permissionPresets: { set: (session: { id: string }, permission: StudioWorkerPermission) => permissions.set(session.id, permission) },
+    sandboxPolicy: { resolve: ({ session }: { session: { id: string } }) => ({ mode: permissions.get(session.id), workspaceRoot: f.root }) },
+  } as unknown as Context
   const ready = () => true
   const service = new StudioService(ctx, f.domain, config.studioCwd, { assistant: null, leader: null }, ready, signal, () => 'disabled', noop)
   const policy = new WorkerModelPolicy(ctx, config.workerModelRoutes, config.workerModelDefaults)
-  // 派工及批准使用真实服务、原文登记和 SQLite；只省略安装版 smoke 独立覆盖的 Worker 执行本体。
+  // 派工、证据接线和批准使用真实服务及 SQLite；以合成原生事件代替实际 Agent 和模型。
   vi.spyOn(policy, 'pin').mockResolvedValue(model)
   onTestFinished(() => service.sessions.drain())
   const controller = new StudioAssistant(ctx, f.domain, service.sessions, policy, ready, config.studioCwd)
@@ -517,7 +626,11 @@ function dispatchFixture() {
         const turn = session.seq + 1
         push('turn/start', { turn })
         push('user/message', input)
-        if (role === 'worker') { push('turn/end', { turn, reason: { kind: 'completed' } }); return }
+        if (role === 'worker') {
+          if (workerStep) idle = Promise.resolve().then(() => workerStep!(agent)).then(() => push('turn/end', { turn, reason: { kind: 'completed' } }))
+          else push('turn/end', { turn, reason: { kind: 'completed' } })
+          return
+        }
         const callId = `call-${turn}`
         push('tool/call', { callId, name: WORKER_DELEGATE, turn })
         const args = role === 'assistant' ? nextArgs : initial
@@ -537,7 +650,8 @@ function dispatchFixture() {
     const leader = native('bound-leader', 'leader', args)
     return f.domain.projects.create({ name: 'Fixture project', objective: 'Validate approval', workspacePath: f.root, leaderSessionId: leader.id })
   }
-  return { ...f, service, config, project, send, verdicts, executions, setArgs: (args: object) => { nextArgs = args } }
+  return { ...f, service, config, project, send, verdicts, executions, controller,
+    setArgs: (args: object) => { nextArgs = args }, playWorker: (step: (agent: Agent) => Promise<void>) => { workerStep = step } }
 }
 
 describe('studio_delegate_task workspace grants', () => {
@@ -571,6 +685,53 @@ describe('studio_delegate_task workspace grants', () => {
     await vi.waitFor(() => expect(f.verdicts[0]?.output).toMatchObject({ text: expect.stringContaining('registered.') }))
     expect(f.domain.tasks(project.id).items).toMatchObject([{ workspacePath: f.root, permission: 'read-only' }])
     expect(f.domain.studio.pending().items).toEqual([])
+  })
+
+  it('preserves actual file evidence and completed and aborted checks on owner stop without reopening the execution', async () => {
+    const f = dispatchFixture()
+    const project = f.project({ permission: 'workspace-write' })
+    const readyToStop = Promise.withResolvers<() => void>()
+    const release = Promise.withResolvers<void>()
+    onTestFinished(() => release.resolve())
+    f.playWorker(async agent => {
+      try {
+        const dispatch = (name: string, args: object) => {
+          const exec = { ...observed(name, args), agent } as ToolExecution
+          f.controller.observeDispatch(exec)
+          return exec
+        }
+        writeFileSync(f.file, 'edited before manual stop\n')
+        f.controller.observeToolResult(dispatch('edit', { file_path: f.file }), success({ path: f.file, before: 'fixture line\n', after: 'edited before manual stop\n' }))
+        f.controller.observeToolResult(dispatch('bash', { command: 'pnpm check' }), success(foreground(f.root)))
+        f.controller.observeToolResult(dispatch('bash', { command: 'pnpm lint' }), failure('ABORTED'))
+        const pending = dispatch('bash', { command: 'pnpm test' })
+        readyToStop.resolve(() => f.controller.observeToolResult(pending, success(foreground(f.root))))
+        await release.promise
+      } catch (error) { readyToStop.reject(error); throw error }
+    })
+    const request = await f.send('stop-evidence', 'Modify and check the files until stopped.', project.id)
+    const confirmation = await vi.waitFor(() => {
+      const item = f.domain.studio.pending().items.find(item => item.messageId === request.id)
+      expect(item?.state).toBe('pending')
+      return item!
+    })
+    await f.service.operations.answer({ id: confirmation.id, value: '允许本任务写入' }, signal)
+    const late = await readyToStop.promise
+    const live = f.domain.tasks(project.id).items[0]!
+    expect(live.status).toBe('running')
+    const stopped = await f.service.operations.stopTask({ taskId: live.taskId }, signal)
+    release.resolve()
+    late()
+    await f.service.sessions.drain()
+    expect(stopped).toMatchObject({ status: 'cancelled', authorizationVersion: live.authorizationVersion + 1, checkResult: {
+      changedFiles: [{ path: 'a/note.txt', action: 'edit' }], overallCheckStatus: 'failed', checks: [
+        { command: 'pnpm check', status: 'passed', exitCode: 0 }, { command: 'pnpm lint', aborted: true, status: 'failed' },
+        { command: 'pnpm test', aborted: true, status: 'failed', exitCode: null },
+      ],
+    } })
+    expect(f.domain.task(live.taskId)).toEqual(stopped)
+    expect(f.sqlite.prepare('SELECT ended_at, outcome FROM studio_task_execution WHERE task_id = ?').get(live.taskId))
+      .toEqual({ ended_at: expect.any(String), outcome: 'cancelled' })
   })
 
   it('creates no write task before explicit confirmation; rejecting or replaying the approval never starts a Worker', async () => {

@@ -7,7 +7,7 @@ import type {} from '@deepseek-ai/dsh-session-persistence'
 import { ASSISTANT_PRESET, createStudioSession, type OwnerRequest } from '../managed-worker/assistant.ts'
 import { LEADER_PRESET } from '../managed-worker/project.ts'
 import { currentPresetId } from '../infra/preset-names.ts'
-import type { GuardInterceptionSource, ManagedWorkerStore, StudioTaskInput } from '../managed-worker/store.ts'
+import type { GuardInterceptionSource, ManagedWorkerStore, StudioStopEvidence, StudioTaskInput } from '../managed-worker/store.ts'
 import { studioDeliverySummary, studioTaskText } from './domain.ts'
 import { confirmStudioModel, defaultStudioModel } from './models.ts'
 import { StudioError, StudioPendingBroker, type StudioAnswerVia } from './pending.ts'
@@ -76,7 +76,8 @@ export class StudioSessions {
   private readonly lastSession = new Map<string, string>()
   private readonly onEvent: () => void
   private readonly broker: StudioPendingBroker
-  private readonly background = new Map<string, { control: AbortController; done: Promise<void>; origin: GuardInterceptionSource }>()
+  private readonly background = new Map<string, { control: AbortController; done: Promise<void>; origin: GuardInterceptionSource;
+    snapshotForStop?: (taskId: string) => StudioStopEvidence | undefined }>()
 
   constructor(private readonly ctx: Context, private readonly domain: ManagedWorkerStore, private readonly cwd: string,
     private readonly defaults: Pick<StudioSettings, 'assistant' | 'leader'>,
@@ -159,7 +160,8 @@ export class StudioSessions {
   }
 
   /** 登记先于前台释放；后台任务只受本任务控制和 Host 生命周期约束，不借用发起的对话轮次。 */
-  scheduleTask(agent: Agent, fields: StudioTaskInput, run: (id: string, signal: AbortSignal) => Promise<void>) {
+  scheduleTask(agent: Agent, fields: StudioTaskInput, run: (id: string, signal: AbortSignal) => Promise<void>,
+    snapshotForStop?: (taskId: string) => StudioStopEvidence | undefined) {
     const turn = this.turns.get(agent.id)
     const source = { sourceMessageId: fields.sourceMessageId, sourceRequestId: fields.requestId, requestText: fields.requestText }
     const grant = turn?.writeGrant
@@ -201,7 +203,7 @@ export class StudioSessions {
       } catch { /* 保留原账本，不自动重复执行。 */ }
     }).finally(() => this.background.delete(task.taskId))
     this.background.set(task.taskId, { control, done, origin: { conversationId: message.conversationId, messageId: message.id,
-      topicId: message.topicId ?? message.id } })
+      topicId: message.topicId ?? message.id }, ...(snapshotForStop && { snapshotForStop }) })
     this.store.addReply(message.id, `已登记任务 ${task.taskId}。处理结果会回到原对话。`)
     this.wake()
     if (turn.router) { this.releaseForeground(turn.router); this.pumpRouter() }
@@ -212,7 +214,9 @@ export class StudioSessions {
   taskOrigin(taskId: string): GuardInterceptionSource | undefined { return this.background.get(taskId)?.origin }
 
   stopTask(taskId: string): boolean {
-    if (!this.domain.invalidateTask(taskId, 'cancelled')) return false
+    // 在取消原生执行前冻结已经观测的宿主证据；晚到事件不能改写取消后的任务。
+    const evidence = this.background.get(taskId)?.snapshotForStop?.(taskId)
+    if (!this.domain.invalidateTask(taskId, 'cancelled', undefined, evidence)) return false
     this.terminateInvalidated([taskId])
     this.wake()
     return true

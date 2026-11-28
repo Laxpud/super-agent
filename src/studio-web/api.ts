@@ -21,8 +21,8 @@ const whole = (value: unknown) => typeof value === 'number' && Number.isSafeInte
 const choice = (value: unknown, allowed: readonly string[]) => typeof value === 'string' && allowed.includes(value)
 const optional = (value: unknown, check: (value: unknown) => boolean) => value === undefined || check(value)
 const items = (value: unknown, check: (value: unknown) => boolean) => Array.isArray(value) && value.every(check)
-const cursor = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value > 0
-const page = (value: Record<string, unknown>, check: (value: unknown) => boolean) => items(value.items, check) && optional(value.next, cursor)
+const positiveWhole = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+const page = (value: Record<string, unknown>, check: (value: unknown) => boolean) => items(value.items, check) && optional(value.next, positiveWhole)
 const source = (value: unknown) => object(value) && text(value.sessionId) && whole(value.eventSeq)
 const model = (value: unknown) => object(value) && text(value.provider) && text(value.model) && optional(value.reasoningEffort, text)
 const nullableModel = (value: unknown) => value === null || model(value)
@@ -51,7 +51,7 @@ const checkReceipt = (value: unknown) => nullableText(value) || (object(value) &
   && items(value.checks, check => object(check) && [check.command, check.workdir, check.output].every(text) && nullableText(check.signal)
     && (check.exitCode === null || Number.isSafeInteger(check.exitCode)) && boolean(check.timedOut) && boolean(check.aborted)
     && choice(check.status, ['passed', 'failed']))
-  && optional(value.omittedChecks, whole) && optional(value.omittedChangedFiles, whole))
+  && optional(value.omittedChecks, positiveWhole) && optional(value.omittedChangedFiles, positiveWhole))
 const task = (value: unknown) => object(value) && [value.taskId, value.title, value.requestText].every(text)
   && [value.projectId, value.sourceMessageId, value.requesterBotId, value.assigneeBotId, value.workspacePath, value.resultSummary].every(nullableText)
   && checkReceipt(value.checkResult)
@@ -97,7 +97,7 @@ function readable(op: StudioOp, value: unknown): boolean {
     case 'answer': return pending(value)
     case 'records': return page(value, session)
     case 'record': return session(value.record) && items(value.events, event => object(event) && whole(event.seq) && text(event.kind) && text(event.text))
-      && optional(value.next, cursor)
+      && optional(value.next, positiveWhole)
   }
 }
 

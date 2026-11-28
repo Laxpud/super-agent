@@ -89,6 +89,7 @@ const checkSchema = z.object({ version: z.literal(1),
   checks: z.array(z.object({ command: z.string(), workdir: z.string(), exitCode: z.int().nullable(), signal: z.string().nullable(),
     timedOut: z.boolean(), aborted: z.boolean(), status: z.enum(['passed', 'failed']), output: z.string() })),
   overallCheckStatus: z.enum(['passed', 'failed', 'not_run']),
+  // 无省略时完全省去字段；宿主和 Web 都只接受正的安全整数。
   omittedChecks: z.int().positive().exactOptional(), omittedChangedFiles: z.int().positive().exactOptional(),
 }) satisfies z.ZodType<StudioCheckResult>
 

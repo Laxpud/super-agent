@@ -10,7 +10,7 @@ interface CredentialVault {
   modifyRecord(key: string, change: () => Promise<CredentialRecord>): Promise<unknown>
   deleteRecord(key: string): Promise<void>
 }
-interface HostProfile { name: string; dir: string }
+interface HostProfile { name: string; dir: string; home?: string; patchPath?: string }
 const idPattern = /^[a-f0-9-]{36}$/u
 const scope = 'agent-studio-managed-worker'
 // 整个配置档不改名；旧命名空间只读取或清理既有凭据，不再写入。

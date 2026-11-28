@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { lstatSync } from 'node:fs'
 import { dirname, isAbsolute, join, sep } from 'node:path'
 import type { StudioWorkerPermission } from '../studio/protocol.ts'
-import { assertWorkspaceTraversal, resolveWorkspaceTarget, verifyWorkspaceIdentity, WORKSPACE_LIST_LIMIT, WorkspacePathError,
+import { assertWorkspaceTraversal, resolveWorkspaceTarget, verifyWorkspaceIdentity, workspaceGitConfigSafe, WORKSPACE_LIST_LIMIT, WorkspacePathError,
   type WorkspaceIdentity, type WorkspaceTargetMode } from './workspace.ts'
 
 export type WorkerGuardDenyCode =
@@ -32,6 +32,7 @@ export interface WorkerGuardInput {
   parent?: unknown
   protectedRoots: readonly string[]
   sandbox?: WorkerSandboxPolicy
+  sessionDirectoryMatches?: boolean
 }
 
 export const STUDIO_LIST_DIRECTORY = 'studio_list_directory'
@@ -41,7 +42,7 @@ const ALWAYS_FORBIDDEN = new Set(['apply_patch', 'job_output', 'job_kill', 'job_
 
 /** 工具展示与执行共用一份档位清单；没有绑定时不展示任何本地工具。 */
 export function workerToolAllowlist(workspacePath: string | null, permission: StudioWorkerPermission): string[] {
-  return workspacePath === null ? [] : [...READ_TOOLS, ...(permission === 'workspace-write' ? WRITE_TOOLS : []), 'bash']
+  return workspacePath === null ? [] : [...READ_TOOLS, ...(permission === 'workspace-write' ? [...WRITE_TOOLS, 'bash'] : [])]
 }
 
 /** 使用 DSH 实际解析的策略而非预设标签；拒绝工作区之外的显式附加写入授权。 */
@@ -62,30 +63,34 @@ const optional = (value: unknown, test: (value: unknown) => boolean) => value ==
 
 /** 同步核验工具权限、实际沙箱和目标；返回拒绝只记录原因，不提升权限或启动执行。 */
 export function evaluateWorkerToolCall(input: WorkerGuardInput): WorkerGuardDenial | undefined {
-  const args = input.arguments
-  if (args !== null && typeof args === 'object' && (Object.hasOwn(args, 'sandbox_permissions') || Object.hasOwn(args, 'justification'))) {
-    return deny('STUDIO_ESCALATION_FORBIDDEN', 'Managed Workers cannot request sandbox escalation.')
-  }
-  const { execution, name, protectedRoots } = input
+  const { arguments: args, execution, name, protectedRoots } = input
   if (!execution?.active || execution.signal.aborted || input.signal?.aborted) {
     return deny('STUDIO_EXECUTION_INACTIVE', 'No current Studio Worker execution authorizes this call.')
   }
-  if (input.parent !== undefined || ALWAYS_FORBIDDEN.has(name) || execution.workspacePath === null) {
+  const { permission, workspacePath: root } = execution
+  if (permission === 'read-only' && (name === 'bash' || name === 'pwsh')) {
+    return deny('STUDIO_READ_ONLY_VIOLATION', 'Shell tools are not authorized for read-only tasks.', true)
+  }
+  if (args !== null && typeof args === 'object' && (Object.hasOwn(args, 'sandbox_permissions') || Object.hasOwn(args, 'justification'))) {
+    return deny('STUDIO_ESCALATION_FORBIDDEN', 'Managed Workers cannot request sandbox escalation.')
+  }
+  if (input.parent !== undefined || ALWAYS_FORBIDDEN.has(name) || root === null) {
     return deny('STUDIO_TOOL_FORBIDDEN', 'This tool is not available to the current Studio Worker execution.')
   }
-  const { permission, workspacePath: root } = execution
   if (permission === 'read-only' && (name === 'write' || name === 'edit')) {
     return deny('STUDIO_READ_ONLY_VIOLATION', 'The task is authorized for read-only work.', true)
   }
   if (!workerToolAllowlist(root, permission).includes(name)) return deny('STUDIO_TOOL_FORBIDDEN', 'The tool is not on the Worker allowlist.')
-  if (!workerSandboxMatches(input.sandbox, execution)) return deny('STUDIO_SANDBOX_MISMATCH', 'The native sandbox does not match the task authority.')
+  if (!workerSandboxMatches(input.sandbox, execution) || input.sessionDirectoryMatches === false) {
+    return deny('STUDIO_SANDBOX_MISMATCH', 'The native sandbox or Session working directory does not match the task authority.')
+  }
   if (!isRecord(args)) return invalid('Expected an object of named tool arguments.')
   if (!verifyWorkspaceIdentity(root, execution.workspaceIdentity)) {
     return deny('STUDIO_OUTSIDE_WORKSPACE', 'The bound workspace directory changed or is unavailable.', true)
   }
 
   try {
-    if (name === 'bash') return checkShell(args, root, protectedRoots, permission)
+    if (name === 'bash') return checkShell(args, root, protectedRoots)
     if (name === STUDIO_LIST_DIRECTORY || name === 'glob' || name === 'grep') {
       if (!optional(args.path, nonblank)) return invalid('path must be a non-empty string when supplied.')
       if (name === STUDIO_LIST_DIRECTORY) {
@@ -146,26 +151,25 @@ function literalCommand(input: string): string[] | undefined {
 
 const checkScripts = new Set(['check', 'test', 'typecheck', 'build', 'lint'])
 const checkBins = new Set(['vitest', 'tsc', 'eslint', 'prettier'])
-const localUtilities = new Set(['ls', 'pwd', 'wc', 'git'])
+const developmentBins = new Set(['pnpm', 'npm', 'yarn', 'npx', ...checkBins])
 const external = new Set(['sudo', 'su', 'doas', 'pkexec', 'systemctl', 'service', 'dsh', 'tmux', 'curl', 'wget',
   'ssh', 'scp', 'rsync', 'nc', 'ncat', 'socat'])
 const wrappers = new Set(['bash', 'sh', 'zsh', 'dash', 'eval', 'exec', 'env', 'python', 'python3', 'node'])
-const pathMutation = new Set(['rm', 'mv', 'cp', 'mkdir'])
+const highImpactFileCommands = new Set(['rm', 'mv', 'cp'])
 
 type CheckPath = (value: string, mode: WorkspaceTargetMode) => string
 
-function checkShell(args: Record<string, unknown>, root: string, protectedRoots: readonly string[], permission: StudioWorkerPermission): WorkerGuardDenial | undefined {
+function checkShell(args: Record<string, unknown>, root: string, protectedRoots: readonly string[]): WorkerGuardDenial | undefined {
   const { command, workdir, run_in_background, timeoutMs, description } = args
   if (!nonblank(command) || !optional(workdir, nonblank) || !optional(run_in_background, value => typeof value === 'boolean')
     || !optional(timeoutMs, value => positive(value) && value <= 120_000) || !optional(description, nonblank)) return invalid('Invalid bash arguments.')
-  const readOnly = permission === 'read-only'
-  const restricted = (detail: string) => deny(readOnly ? 'STUDIO_READ_ONLY_VIOLATION' : 'STUDIO_HIGH_IMPACT_FORBIDDEN', detail, true)
+  const restricted = (detail: string) => deny('STUDIO_HIGH_IMPACT_FORBIDDEN', detail, true)
   if (run_in_background === true) return restricted('Background shell jobs are not allowed.')
   const argv = literalCommand(command)
   if (!argv) return restricted('Use one literal command: shell operators, expansion, wrappers and unquoted patterns are not supported.')
   const [bin = '', ...rest] = argv
   if (rest.some(arg => /^~|^[\\/]{2}|^[A-Za-z]:[\\/]/u.test(arg))) return restricted('Home expansion and device or UNC paths are not allowed.')
-  if (readOnly && !localUtilities.has(bin)) return restricted('Only ls, pwd, wc and read-only git inspection are allowed for this task.')
+  if (highImpactFileCommands.has(bin)) return restricted('Shell deletion, moving and copying are forbidden. Use write or edit for permitted file changes.')
   if (external.has(bin) || wrappers.has(bin) || /(?:^|\/)scripts\/agent-studio$/u.test(bin)) {
     return restricted('Privilege changes, service control, external commands and shell wrappers are forbidden.')
   }
@@ -189,9 +193,12 @@ function checkShell(args: Record<string, unknown>, root: string, protectedRoots:
       if (paths?.length) { checked(paths, 'read'); return }
       break
     }
-    case 'git':
-      if (checkGit(rest, readOnly, checkPath, cwd, root, protectedRoots)) return
-      return restricted('Only git status, diff, log, show and (for write tasks) add with safe local arguments are allowed.')
+    case 'git': {
+      assertWorkspaceTraversal(root, protectedRoots)
+      if (!checkGitDirectory(cwd, root, protectedRoots)) return restricted('Git repository metadata or config is outside the workspace or unsafe.')
+      if (checkGit(rest, checkPath, cwd)) return
+      return restricted('Only git status, diff, log, show and add with safe local arguments are allowed.')
+    }
     case 'find':
       if (checkFind(rest, checkPath)) return
       break
@@ -201,15 +208,12 @@ function checkShell(args: Record<string, unknown>, root: string, protectedRoots:
     case 'pnpm': case 'npm': case 'yarn': case 'npx': case 'vitest': case 'tsc': case 'eslint': case 'prettier':
       if (checkDevelopmentCommand(bin, rest, checkPath, cwd)) { assertWorkspaceTraversal(root, protectedRoots); return }
       return restricted('Only local check, test, typecheck, build or lint commands are allowed; installs, publishes and arbitrary runners are forbidden.')
-    default: {
-      if (!pathMutation.has(bin)) break
-      const paths = onlyFlags(rest, bin === 'mkdir' ? /^(?:-p|--parents)$/u : bin === 'rm' ? /^(?:-f|--force)$/u : /^(?:-n|--no-clobber)$/u)
-      if (!paths || !paths.length || (bin === 'mv' || bin === 'cp') && paths.length !== 2) break
+    case 'mkdir': {
+      const paths = onlyFlags(rest, /^(?:-p|--parents)$/u)
+      if (!paths?.length) break
       try {
-        if (paths.some(path => path.split(/[\\/]/u).includes('..'))) return restricted('File mutations may not contain parent path segments.')
-        if (bin === 'mkdir') checked(paths, 'create')
-        else if (bin === 'rm') checked(paths, 'write')
-        else { checkPath(paths[0]!, 'write'); checkPath(paths[1]!, 'create') }
+        if (paths.some(path => path.split(/[\\/]/u).includes('..'))) return restricted('Directory creation may not contain parent path segments.')
+        checked(paths, 'create')
       } catch (error) {
         if (error instanceof WorkspacePathError) return restricted(error.message)
         throw error
@@ -242,11 +246,9 @@ function checkDirectEntry(checkPath: CheckPath, path: string, cwd: string, root:
   }
 }
 
-function checkGit(args: string[], readOnly: boolean, checkPath: CheckPath, cwd: string, root: string, protectedRoots: readonly string[]): boolean {
+function checkGit(args: string[], checkPath: CheckPath, cwd: string): boolean {
   const [verb, ...options] = args
-  if (verb !== 'status' && verb !== 'diff' && verb !== 'log' && verb !== 'show' && (verb !== 'add' || readOnly)) return false
-  assertWorkspaceTraversal(root, protectedRoots)
-  if (!checkGitDirectory(cwd, root, protectedRoots)) return false
+  if (verb !== 'status' && verb !== 'diff' && verb !== 'log' && verb !== 'show' && verb !== 'add') return false
   const separator = options.indexOf('--')
   const flags = separator === -1 ? options : options.slice(0, separator)
   const paths = separator === -1 ? [] : options.slice(separator + 1)
@@ -291,7 +293,7 @@ function checkGitDirectory(cwd: string, root: string, protectedRoots: readonly s
     if (pathPresent(dotGit) || bare(dir)) {
       if (!inScope) return false
       const gitDir = pathPresent(dotGit) ? dotGit : dir
-      return resolveWorkspaceTarget(root, gitDir, { mode: 'dir', protectedRoots }) === gitDir
+      return workspaceGitConfigSafe(root, gitDir, protectedRoots)
     }
     if (dirname(dir) === dir) return true
     if (dir === root) inScope = false
@@ -336,23 +338,42 @@ function checkRg(args: string[], checkPath: CheckPath): boolean {
   return true
 }
 
-function checkDevelopmentCommand(bin: string, args: string[], checkPath: CheckPath, cwd: string): boolean {
+function developmentInvocation(bin: string, args: string[]) {
+  if (!developmentBins.has(bin)) return
   let command = bin
   if (bin === 'pnpm' || bin === 'npm' || bin === 'yarn') {
-    if (args[0] === 'run' || args[0] === 'exec' && bin === 'pnpm') args = args.slice(1)
+    const exec = bin === 'pnpm' && args[0] === 'exec'
+    if (args[0] === 'run' || exec) args = args.slice(1)
     command = args[0] ?? ''
     args = args.slice(1)
-    if (checkScripts.has(command)) return args.every(arg => /^(?:--run|--watch=false|--noEmit|--pretty=false)$/u.test(arg))
-    if (bin !== 'pnpm') return false
+    if (!exec && checkScripts.has(command)) return { command, args, script: true }
+    if (bin !== 'pnpm') return
   } else if (bin === 'npx') {
     if (args[0] === '--no-install') args = args.slice(1)
     command = args[0] ?? ''
     args = args.slice(1)
-    if (!checkBins.has(command)) return false
-    // npx 默认可能在线下载安装；裸调用只允许调用工作区内已安装的对应二进制。
-    checkPath(join(cwd, 'node_modules', '.bin', command), 'read')
   }
-  if (!checkBins.has(command)) return false
+  if (checkBins.has(command)) return { command, args, script: false }
+}
+
+/** 只有允许的开发检查才进入结果统计；查看帮助、版本或仅格式化输出不算运行检查。 */
+export function isWorkerCheckCommand(commandLine: string): boolean {
+  const argv = literalCommand(commandLine)
+  if (!argv) return false
+  const [bin = '', ...args] = argv
+  const invocation = developmentInvocation(bin, args)
+  return !!invocation && (invocation.script || (!invocation.args.some(arg => /^(?:--(?:help|version)|-[vh])$/u.test(arg))
+    && (invocation.command !== 'prettier' || invocation.args.includes('--check'))))
+}
+
+function checkDevelopmentCommand(bin: string, rest: string[], checkPath: CheckPath, cwd: string): boolean {
+  const invocation = developmentInvocation(bin, rest)
+  if (!invocation) return false
+  const { command, script } = invocation
+  let { args } = invocation
+  if (script) return args.every(arg => /^(?:--run|--watch=false|--noEmit|--pretty=false)$/u.test(arg))
+  // npx 默认可能在线下载安装；只允许调用工作区内已安装的对应二进制。
+  if (bin === 'npx') checkPath(join(cwd, 'node_modules', '.bin', command), 'read')
   if (command === 'vitest' && args[0] === 'run') args = args.slice(1)
   const paths = onlyFlags(args, /^(?:--(?:run|watch=false|noEmit|pretty=false|check|version|help)|-[vh])$/u)
   if (!paths) return false

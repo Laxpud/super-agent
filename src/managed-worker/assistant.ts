@@ -11,7 +11,7 @@ import { StudioError } from '../studio/pending.ts'
 import type { StudioSessions } from '../studio/sessions.ts'
 import { isStudioMessageContext, newStudioSessionId } from '../studio/source.ts'
 import { leaderDispatchWorkspace } from './project.ts'
-import type { ManagedWorkerStore, StudioExecution } from './store.ts'
+import type { ManagedWorkerStore, StudioExecution, StudioStopEvidence } from './store.ts'
 import { classifyProviderFailure, type WorkerModelPolicy } from './text-worker-model-policy.ts'
 import { WorkerEvidence } from './worker-evidence.ts'
 import { evaluateWorkerToolCall, STUDIO_LIST_DIRECTORY, workerSandboxMatches, type WorkerGuardExecution, type WorkerSandboxPolicy } from './worker-guard.ts'
@@ -96,7 +96,7 @@ export function ownerRequest(agent: Agent, callId: string, toolName: string): Ow
 }
 
 interface WorkerAuthority extends Omit<WorkerGuardExecution, 'active'> { execution: StudioExecution; evidence: WorkerEvidence }
-const observedTools = new Set(['write', 'edit', 'bash', 'pwsh'])
+const observedTools = new Set(['write', 'edit', 'bash'])
 interface WorkerTurn {
   authority: WorkerAuthority
   message: UserMessage
@@ -113,7 +113,7 @@ const receipt: ToolOutputDefinition = { schema: { type: 'object', required: ['te
 export class StudioAssistant {
   readonly #authorities = new Map<string, WorkerAuthority>()
   readonly #workers = new Map<Agent, WorkerTurn>()
-  readonly #toolEvidence = new WeakMap<Readonly<ToolExecution>, { authority: WorkerAuthority; workdir?: string }>()
+  readonly #toolEvidence = new WeakMap<Readonly<ToolExecution>, WorkerAuthority>()
 
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore, private readonly sessions: StudioSessions,
     private readonly models: WorkerModelPolicy, private readonly ready: (agent: Agent, role: StudioRole) => boolean,
@@ -185,7 +185,8 @@ export class StudioAssistant {
             permission, requestText: source.requestText,
             ...(fields.title !== undefined ? { title: fields.title.trim() } : {}),
             ...(leader ? { leader: { sessionId: agent.id, managementEpoch: leader.managementEpoch } } : {}),
-          }, (taskId, signal) => this.runWorker(taskId, role, leader?.managementEpoch ?? null, model, workspace, signal))
+          }, (taskId, signal) => this.runWorker(taskId, role, leader?.managementEpoch ?? null, model, workspace, signal),
+          taskId => this.snapshotForStop(taskId))
           const native = exec as typeof exec & { concludeTurn?(): void }
           native.concludeTurn?.()
           return { text: `Studio task ${task.taskId} ${task.created ? 'registered' : 'already registered'}.` }
@@ -243,8 +244,8 @@ export class StudioAssistant {
       throw new StudioError('STUDIO_EXECUTION_INACTIVE', 'The Worker execution is no longer authorized to dispatch tools.')
     }
     if (!observedTools.has(exec.name)) return
-    const workdir = authority.evidence.shellWorkdir(exec)
-    this.#toolEvidence.set(exec, { authority, ...(workdir !== undefined ? { workdir } : {}) })
+    authority.evidence.trackCheck(exec)
+    this.#toolEvidence.set(exec, authority)
   }
 
   /** 只消费先经过 dispatch 的原生结果，排除守卫拒绝、旧轮次和其他 Session 的事件。 */
@@ -253,12 +254,19 @@ export class StudioAssistant {
     if (!seen) return
     this.#toolEvidence.delete(exec)
     const agent = exec.agent
-    const { execution, evidence } = seen.authority
-    if (!agent || agent.session.id !== execution.sessionId || this.#workers.get(agent)?.authority !== seen.authority
+    const { execution, evidence } = seen
+    if (!agent || agent.session.id !== execution.sessionId || this.#workers.get(agent)?.authority !== seen
       || !this.store.executionCurrent(execution)) return
-    const code = result.isError ? result.error.info?.code : undefined
-    if (code === 'ABORTED_BEFORE_DISPATCH' || code === 'UNKNOWN_TOOL') return
-    evidence.observe(exec, result, seen.workdir)
+    evidence.observe(exec, result)
+  }
+
+  /** 只交出该任务的原生执行快照；账本在停止事务内复核执行及授权版本。 */
+  private snapshotForStop(taskId: string): StudioStopEvidence | undefined {
+    for (const { execution, evidence } of this.#authorities.values()) {
+      if (execution.taskId !== taskId) continue
+      const checkResult = evidence.result(true)
+      return checkResult && { execution, checkResult }
+    }
   }
 
   workerSandbox(agent: Agent): WorkerSandboxPolicy | undefined {
@@ -328,17 +336,21 @@ export class StudioAssistant {
       // 原生取消之前先撤销任务授权；正常完成则等待日志落盘后再公开结果来源。
       const mustFence = !!execution && (!result || signal.aborted)
       const evidence = authority?.evidence.result()
-      if (execution) this.#authorities.delete(execution.sessionId)
-      try { if (execution && mustFence) this.store.finishExecution(execution, undefined, outcome, evidence) }
-      finally {
-        try { if (handle && signal.aborted) handle.agent.cancel({ kind: 'hook', reason: 'Studio task stopped.' }) }
+      try {
+        try { if (execution && mustFence) this.store.finishExecution(execution, undefined, outcome, evidence) }
         finally {
-          try { await handle?.dispose() }
-          catch { result = undefined; outcome = 'session-close-unconfirmed' }
+          try { if (handle && signal.aborted) handle.agent.cancel({ kind: 'hook', reason: 'Studio task stopped.' }) }
+          finally {
+            try { await handle?.dispose() }
+            catch { result = undefined; outcome = 'session-close-unconfirmed' }
+          }
         }
+        if (execution && !mustFence) this.store.finishExecution(execution, signal.aborted ? undefined : result, outcome, evidence)
+        else if (!execution && this.store.task(taskId)?.status === 'queued') this.store.invalidateTask(taskId, 'interrupted')
+      } finally {
+        // 正常退出写入收据前仍可能手动停止；保留快照直到任务账本确认结束。
+        if (execution) this.#authorities.delete(execution.sessionId)
       }
-      if (execution && !mustFence) this.store.finishExecution(execution, signal.aborted ? undefined : result, outcome, evidence)
-      else if (!execution && this.store.task(taskId)?.status === 'queued') this.store.invalidateTask(taskId, 'interrupted')
     }
   }
 

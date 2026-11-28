@@ -304,6 +304,7 @@ export interface StudioTaskInput {
 export interface StudioExecution {
   taskId: string; executionEpoch: number; authorizationVersion: number; sessionId: string; runId: string; managementEpoch: number | null
 }
+export interface StudioStopEvidence { execution: StudioExecution; checkResult: StudioCheckResult }
 export interface GuardInterceptionSource { conversationId: string; messageId?: string; topicId?: string }
 const GUARD_PENDING_LIMIT = 5
 
@@ -325,7 +326,7 @@ export class ManagedWorkerStore {
   readonly recoveredTasks: number
   readonly assistantBotId: string
 
-  constructor(path: string, stateDir?: string) {
+  constructor(path: string, stateDir?: string, hostRoots: readonly string[] = []) {
     if (!path || path === ':memory:') throw new Error('Studio requires a persistent SQLite path')
     const file = resolve(path)
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
@@ -334,7 +335,7 @@ export class ManagedWorkerStore {
     const sidecars = ['-wal', '-shm', '-journal'].map(suffix => dbPath + suffix)
     for (const sidecar of sidecars) privateFile(sidecar, false)
     // 宿主传入专用 stateDir；独立账本调用没有该配置，只保护数据库和伴随文件。
-    this.protectedRoots = protectedHostRoots(stateDir ?? dbPath, sidecars)
+    this.protectedRoots = protectedHostRoots(stateDir ?? dbPath, [...sidecars, ...hostRoots])
     this.#db = new DatabaseSync(dbPath)
     const db = this.#db
     try {
@@ -530,33 +531,36 @@ export class ManagedWorkerStore {
     })
   }
 
-  /** 守卫撤销授权、结束已拦截执行并写入两端待办。任一步不成立时不会留半条记录。 */
+  /** 先原子撤权并结束执行；通知事务失败或达到待办上限时，已经提交的撤权不会回滚。 */
   recordGuardInterception(execution: StudioExecution, denial: WorkerGuardDenial, fingerprint: string, actionSummary: string,
     source?: GuardInterceptionSource, checkResult?: StudioCheckResult): { recorded: boolean; pendingId?: string } {
     if (denial.needsOwnerDecision !== true) return { recorded: false }
-    return this.write(() => {
-      if (!this.executionCurrent(execution)) return { recorded: false }
-      const task = this.task(execution.taskId)!, db = this.#db
-      const version = execution.authorizationVersion + 1
-      const prefix = `${GUARD_PENDING_PREFIX}${execution.taskId}:${version}:`
-      const shortHash = createHash('sha256').update(JSON.stringify([execution.executionEpoch, denial.code, fingerprint])).digest('hex').slice(0, 20)
-      const id = `${prefix}${shortHash}`
-      const count = db.prepare(`SELECT count(*) AS count FROM agent_studio_pending WHERE task_id = ? AND substr(id, 1, ?) = ?`)
-        .get(task.taskId, prefix.length, prefix)?.count
-      if (this.studio.pendingItem(id) || Number(count) >= GUARD_PENDING_LIMIT) return { recorded: false }
-
-      const at = studioNow()
+    const db = this.#db, version = execution.authorizationVersion + 1
+    const revoked = this.write(() => {
+      if (!this.executionCurrent(execution)) return false
+      const task = this.task(execution.taskId)!, at = studioNow()
       const changed = db.prepare(`UPDATE studio_task SET status = 'waiting_approval', authorization_version = ?, updated_at = ?,
         result_summary = coalesce(?, result_summary), check_result = coalesce(?, check_result)
         WHERE task_id = ? AND status = 'running' AND authorization_version = ?`)
         .run(version, at, checkResult ? studioDeliverySummary(task, checkResult) : null, checkResult ? JSON.stringify(checkResult) : null,
           task.taskId, execution.authorizationVersion)
-      if (!changed.changes) return { recorded: false }
+      if (!changed.changes) return false
       const ended = db.prepare(`UPDATE studio_task_execution SET ended_at = ?, outcome = 'waiting_approval'
         WHERE task_id = ? AND execution_epoch = ? AND ended_at IS NULL AND session_id = ? AND run_id = ?`)
         .run(at, task.taskId, execution.executionEpoch, execution.sessionId, execution.runId)
       if (ended.changes !== 1) throw new Error('Studio guard interception lost its execution')
-
+      return true
+    })
+    if (!revoked) return { recorded: false }
+    const pendingId = this.write(() => {
+      const task = this.task(execution.taskId)
+      if (task?.status !== 'waiting_approval' || task.authorizationVersion !== version) return
+      const prefix = `${GUARD_PENDING_PREFIX}${execution.taskId}:${version}:`
+      const shortHash = createHash('sha256').update(JSON.stringify([execution.executionEpoch, denial.code, fingerprint])).digest('hex').slice(0, 20)
+      const id = `${prefix}${shortHash}`
+      const count = db.prepare(`SELECT count(*) AS count FROM agent_studio_pending WHERE task_id = ? AND substr(id, 1, ?) = ?`)
+        .get(task.taskId, prefix.length, prefix)?.count
+      if (this.studio.pendingItem(id) || Number(count) >= GUARD_PENDING_LIMIT) return
       const conversationId = task.projectId ?? ASSISTANT_CONVERSATION
       const savedMessageId = task.sourceMessageId?.startsWith(STUDIO_OWNER_PREFIX) ? task.sourceMessageId.slice(STUDIO_OWNER_PREFIX.length) : undefined
       const requestedMessageId = source?.conversationId === conversationId ? source.messageId : undefined
@@ -567,9 +571,10 @@ export class ManagedWorkerStore {
         ...(user?.role === 'user' && (!source?.topicId || source.topicId === topicId) && { messageId: user.id, ...(topicId && { topicId }) }),
         requester: 'Agent Studio', title: `Worker 操作已拦截（${denial.code}）`,
         detail: `原因：${denial.reason}\n动作：${actionSummary.slice(0, 240).toWellFormed()}\n旧执行已撤权。解除等待不会重放该动作；如需继续，请另发合规范围的新请求。`,
-        options: [...GUARD_PENDING_CHOICES], acceptsText: false, mobile: 'card', state: 'pending', createdAt: Date.parse(at) })
-      return { recorded: true, pendingId: id }
+        options: [...GUARD_PENDING_CHOICES], acceptsText: false, mobile: 'card', state: 'pending', createdAt: Date.now() })
+      return id
     })
+    return { recorded: true, ...(pendingId && { pendingId }) }
   }
 
   /** Web 和飞书共用同一条决定；只能终止等待，不能启动执行或恢复旧授权。 */
@@ -604,14 +609,17 @@ export class ManagedWorkerStore {
     })
   }
 
-  /** 停止或解除阻塞先作废旧授权与执行，再由调用方通知底层 Agent；解除不自动重派。 */
-  invalidateTask(taskId: string, status: Extract<StudioTaskStatus, 'cancelled' | 'interrupted'>, expectedVersion?: number): boolean {
+  /** 停止时只接受同一现役执行的宿主快照，与撤权一起落盘；解除阻塞不自动重派。 */
+  invalidateTask(taskId: string, status: Extract<StudioTaskStatus, 'cancelled' | 'interrupted'>, expectedVersion?: number,
+    stopEvidence?: StudioStopEvidence): boolean {
     return this.write(() => {
       const at = studioNow(), db = this.#db
-      const changed = db.prepare(`UPDATE studio_task SET status = ?, authorization_version = authorization_version + 1, updated_at = ?
+      const evidence = stopEvidence?.execution.taskId === taskId && this.executionCurrent(stopEvidence.execution) ? stopEvidence.checkResult : undefined
+      const changed = db.prepare(`UPDATE studio_task SET status = ?, authorization_version = authorization_version + 1, updated_at = ?,
+        check_result = coalesce(?, check_result)
         WHERE task_id = ? AND status IN ('queued', 'running', 'waiting_approval', 'blocked')
         AND (? IS NULL OR (authorization_version = ? AND status = 'blocked'))`)
-        .run(status, at, taskId, expectedVersion ?? null, expectedVersion ?? null)
+        .run(status, at, evidence ? JSON.stringify(evidence) : null, taskId, expectedVersion ?? null, expectedVersion ?? null)
       if (!changed.changes) return false
       db.prepare('UPDATE studio_task_execution SET ended_at = ?, outcome = ? WHERE task_id = ? AND ended_at IS NULL').run(at, status, taskId)
       this.studio.expireGuardInterceptionsInTx(taskId)

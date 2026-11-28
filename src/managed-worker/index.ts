@@ -90,6 +90,9 @@ const presets: Record<StudioRole, string> = { assistant: ASSISTANT_PRESET, leade
 const roleForPreset = (preset: string | null) => (Object.keys(presets) as StudioRole[]).find(role => presets[role] === preset)
 const studioTools = new Set([WORKER_DELEGATE, WORKER_READ, LIST_PROJECTS, PROPOSE_PROJECT, STUDIO_LIST_DIRECTORY])
 const denied = 'Studio tool denied: INVALID_EXECUTION'
+const revokedWorker = { code: 'STUDIO_EXECUTION_INACTIVE', reason: 'Studio tool denied (STUDIO_EXECUTION_INACTIVE): Worker authorization was revoked.',
+  needsOwnerDecision: false } as const
+const workerGuardResult = (refusal: { code: string; reason: string }) => ({ reason: refusal.reason, info: { name: 'StudioToolDenied', code: refusal.code } })
 
 /** 仅适配仓库较旧声明缺少的运行时入口；使用前统一校验，绝不把未接入的身份服务当成降级路径。 */
 type ManagedHost = Context & {
@@ -155,14 +158,18 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
     stopping.abort()
     ctx.logger.error('Agent Studio lost its state directory lock: %s', String(error))
   } })
+  const profile = credentials.profile
+  const hostRoots = [profile?.home, profile?.dir, profile?.patchPath].filter((path): path is string => typeof path === 'string' && isAbsolute(path))
   let store: ManagedWorkerStore
-  try { store = new ManagedWorkerStore(join(stateDir, STUDIO_DB), stateDir) }
+  try { store = new ManagedWorkerStore(join(stateDir, STUDIO_DB), stateDir, hostRoots) }
   catch (error) { unlock(); throw error }
 
   let channel: StudioFeishuConversation | undefined
   let channelRun: Promise<void> | undefined
   let studio: StudioService | undefined
   const scopes = new Map<Agent, StudioScope>()
+  // 每个执行创建新的原生 Agent 对象。按对象同步吊销可覆盖同批派发，且不会让已销毁的执行长期留在内存。
+  const revokedExecutions = new WeakSet<Agent>()
   ctx.effect(() => async () => {
     const held = available
     available = false
@@ -190,12 +197,20 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
     if (record?.readonlyLegacy || (record && record.role !== role)) return false
     return role === 'leader' ? !!store.projects.currentLeader(agent.id) : role === 'worker' ? record?.role === 'worker' : true
   }
+  const sessionDirectoryMatches = (agent: Agent, workspacePath: string | null): boolean => {
+    if (workspacePath === null) return true
+    try {
+      const directories = (ctx as unknown as { get(name: string): unknown }).get('workingDirectory') as
+        { get?(session: Agent['session']): string } | undefined
+      return typeof directories?.get !== 'function' || directories.get(agent.session) === workspacePath
+    } catch { return false }
+  }
   const ready = (agent: Agent, role: StudioRole): boolean => {
-    if (!roleReady(agent, role)) return false
+    if (revokedExecutions.has(agent) || !roleReady(agent, role)) return false
     const sandbox = assistant.workerSandbox(agent)
     if (role !== 'worker') return sandbox?.mode === 'read-only'
     const authority = assistant.workerAuthority(agent)
-    return !!authority && workerSandboxMatches(sandbox, authority)
+    return !!authority && workerSandboxMatches(sandbox, authority) && sessionDirectoryMatches(agent, authority.workspacePath)
       && (authority.workspacePath === null || verifyWorkspaceIdentity(authority.workspacePath, authority.workspaceIdentity))
   }
 
@@ -248,21 +263,24 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
   }
 
   function workerRefusal(agent: Agent, exec: Readonly<ToolExecution>) {
+    if (revokedExecutions.has(agent)) return revokedWorker
     const execution = roleReady(agent, 'worker') ? assistant.workerExecution(agent) : undefined
     const refusal = evaluateWorkerToolCall({ name: exec.name, arguments: exec.arguments, parent: exec.parent, signal: exec.signal,
-      execution, sandbox: assistant.workerSandbox(agent), protectedRoots: store.protectedRoots })
+      execution, sandbox: assistant.workerSandbox(agent), protectedRoots: store.protectedRoots,
+      sessionDirectoryMatches: !execution || sessionDirectoryMatches(agent, execution.workspacePath) })
     if (refusal?.needsOwnerDecision && execution?.active) {
+      // 先吊销当前 Agent，再安排取消；之后的数据库、通知或取消失败都不能重新开放工具。
+      revokedExecutions.add(agent)
+      queueMicrotask(() => {
+        try { if (current(agent)) agent.cancel({ kind: 'hook', reason: 'Studio Worker authorization ended after a guard interception.' }) }
+        catch { ctx.logger.warn('Studio could not cancel the intercepted Worker') }
+        finally { wake() }
+      })
       try {
-        const { recorded } = store.recordGuardInterception(execution.execution, refusal,
+        store.recordGuardInterception(execution.execution, refusal,
           guardActionFingerprint(exec.name, exec.arguments, refusal.code), summarizeGuardAction(exec.name),
           sessions.taskOrigin(execution.execution.taskId), execution.evidence.result())
-        if (recorded) queueMicrotask(() => {
-          // SQLite 已提交撤权，取消本身不再是安全边界；即使底层取消失败，旧工具也不会获得授权。
-          try { if (current(agent)) agent.cancel({ kind: 'hook', reason: 'Studio Worker authorization ended after a guard interception.' }) }
-          catch { ctx.logger.warn('Studio could not cancel the intercepted Worker') }
-          finally { wake() }
-        })
-      } catch { ctx.logger.warn('Studio could not persist the Worker guard interception') }
+      } catch { ctx.logger.warn('Studio could not persist the full Worker guard interception') }
     }
     return refusal
   }
@@ -274,13 +292,14 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
   ctx.effect(() => guards.guard(exec => {
     const { agent } = exec
     if (!agent) return studioTools.has(exec.name) ? denied : undefined
+    if (revokedExecutions.has(agent)) return workerGuardResult(revokedWorker)
     try {
       const record = store.studioSession(agent.id)
       const role = record?.role === 'worker' ? 'worker' : scopes.get(agent)?.role ?? inferred(agent)
       if (!role && !record && !isStudioInternalSession(agent.id)) return undefined
       if (role === 'worker') {
         const refusal = workerRefusal(agent, exec)
-        return refusal ? { reason: refusal.reason, info: { name: 'StudioToolDenied', code: refusal.code } } : undefined
+        return refusal ? workerGuardResult(refusal) : undefined
       }
       if (!role || exec.parent !== undefined || !ready(agent, role) || !sessions.canAsk(agent)) return denied
       if (exec.name === WORKER_READ || (role === 'assistant' && exec.name === LIST_PROJECTS)) return undefined
@@ -295,6 +314,7 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
   }
   toolEvents.on('tools/execute', async (exec, next) => {
     const { agent } = exec
+    if (agent && revokedExecutions.has(agent)) throw new StudioError(revokedWorker.code, revokedWorker.reason)
     if (agent && (scopes.get(agent)?.role === 'worker' || inferred(agent) === 'worker' || assistant.workerAuthority(agent))) {
       const refusal = workerRefusal(agent, exec)
       if (refusal) throw new StudioError(refusal.code, refusal.reason)

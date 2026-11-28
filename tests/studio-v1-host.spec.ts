@@ -319,9 +319,11 @@ it('keeps an unbound Worker read-only and denies local tools even with a workspa
   const { agent, recorded, verdicts } = await reachedWorker.promise
   expect(recorded).toEqual({ permission: 'read-only', status: 'running', session_id: agent.id })
   expect(host.permissionPresets.set).toHaveBeenCalledWith(agent.session, 'read-only')
-  // 否决来自 Worker 工具策略，而不是 Session 未登记或授权已失效。
-  expect(verdicts).toEqual(tools.map(() => expect.objectContaining({ reason: expect.any(String),
-    info: { name: 'StudioToolDenied', code: 'STUDIO_TOOL_FORBIDDEN' } })))
+  // 未绑定时本地文件工具不可用；首次只读 shell 违规撤权，同批后续调用立即按无效执行拒绝。
+  expect(verdicts).toEqual(['STUDIO_TOOL_FORBIDDEN', 'STUDIO_TOOL_FORBIDDEN', 'STUDIO_READ_ONLY_VIOLATION',
+    'STUDIO_EXECUTION_INACTIVE', 'STUDIO_EXECUTION_INACTIVE', 'STUDIO_EXECUTION_INACTIVE'].map(code => expect.objectContaining({
+    reason: expect.any(String), info: { name: 'StudioToolDenied', code },
+  })))
   const outside = { id: 'ordinary-session', session: { preset: 'standard' } } as unknown as Agent
   expect(guard!({ agent: outside, name: 'bash' } as ToolExecution)).toBeUndefined()
 })
