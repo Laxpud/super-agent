@@ -6,8 +6,8 @@ import type { en } from './locales.ts'
 import { configurationEn as settingsErrorKeys } from './settings-locales.ts'
 import { Button, useStudio } from './ui.tsx'
 
-export const SETTINGS_SECTIONS = ['models', 'workers', 'feishu', 'advanced'] as const
-export type SettingsSection = typeof SETTINGS_SECTIONS[number]
+export const CONFIGURATION_SECTIONS = ['models', 'workers', 'feishu', 'advanced'] as const
+export type SettingsSection = typeof CONFIGURATION_SECTIONS[number] | 'updates'
 export type ModelCatalog = StudioModelOption[]
 export const blankModel: StudioModel = { provider: '', model: '' }
 

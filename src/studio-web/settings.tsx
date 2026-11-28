@@ -3,8 +3,9 @@ import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { FeishuState, StudioModel, StudioSettings } from '../studio/protocol.ts'
 import { HostSettings } from './configuration.tsx'
 import { createQuery, useQuery, type QuerySnapshot } from './query.ts'
-import { SETTINGS_SECTIONS, type ModelCatalog, type SettingsSection } from './settings-fields.tsx'
+import { CONFIGURATION_SECTIONS, type ModelCatalog, type SettingsSection } from './settings-fields.tsx'
 import { Button, FailureNotice, PageHeading, QueryStatus, useStudio } from './ui.tsx'
+import { Updates } from './updates.tsx'
 
 const MODEL_ROLES = ['assistant', 'leader'] as const
 type ModelRole = typeof MODEL_ROLES[number]
@@ -150,19 +151,28 @@ export function Settings({ section = 'models', dirtyChange, busyChange }: {
   const [hostDirty, setHostDirty] = useState(false)
   const [modelBusy, setModelBusy] = useState(false)
   const [hostBusy, setHostBusy] = useState(false)
+  const [updatesBusy, setUpdatesBusy] = useState(false)
+  const [visitedUpdates, setVisitedUpdates] = useState(false)
+  // 更新页首次打开才读状态；切到其他设置分类时保留在途回执与轮询。
+  useEffect(() => { if (section === 'updates') setVisitedUpdates(true) }, [section])
   useEffect(() => { dirtyChange(modelDirty || hostDirty) }, [dirtyChange, modelDirty, hostDirty])
-  useEffect(() => { busyChange(modelBusy || hostBusy) }, [busyChange, modelBusy, hostBusy])
+  useEffect(() => { busyChange(modelBusy || hostBusy || updatesBusy) }, [busyChange, modelBusy, hostBusy, updatesBusy])
   const select = (target: SettingsSection) => { if (target !== section) open({ kind: 'settings', section: target }, true) }
   return <section className="as-detail as-settings">
     <PageHeading title={t('settings')}>
       {(modelDirty || hostDirty) && <span className="as-pill" data-tone="warn">{t('settingsDirty')}</span>}
     </PageHeading>
-    <nav className="as-settings-nav" aria-label={t('settingsNavigation')}>
-      {SETTINGS_SECTIONS.map(key => <Button key={key} aria-current={section === key ? 'page' : undefined}
-        onClick={() => select(key)}>{t(`section.${key}`)}</Button>)}
+    <nav className="as-settings-navigation" aria-label={t('settingsNavigation')}>
+      <div className="as-settings-nav" role="group" aria-label={t('settingsConfigurationSections')}>
+        {CONFIGURATION_SECTIONS.map(key => <Button key={key} aria-current={section === key ? 'page' : undefined}
+          onClick={() => select(key)}>{t(`section.${key}`)}</Button>)}
+      </div>
+      <div className="as-settings-update-nav">
+        <Button aria-current={section === 'updates' ? 'page' : undefined} onClick={() => select('updates')}>{t('section.updates')}</Button>
+      </div>
     </nav>
     <div className="as-config-view" hidden={section !== 'models'}>
-      <DialogueModels models={models} reload={catalog.reload} locked={hostBusy} dirtyChange={setModelDirty} busyChange={setModelBusy} />
+      <DialogueModels models={models} reload={catalog.reload} locked={hostBusy || updatesBusy} dirtyChange={setModelDirty} busyChange={setModelBusy} />
       <section className="as-card as-fields">
         <div className="as-meta"><h3>{t('feishuConnection')}</h3>
           {state && <span className="as-pill" data-tone={feishuTone(state.feishu)}>{t(`feishu.${state.feishu}`)}</span>}</div>
@@ -171,6 +181,9 @@ export function Settings({ section = 'models', dirtyChange, busyChange }: {
       </section>
     </div>
     <HostSettings section={section} select={select} models={models} reloadOptions={catalog.reload} dirtyChange={setHostDirty} busyChange={setHostBusy}
-      modelsBusy={modelBusy} modelsDirty={modelDirty} />
+      modelsBusy={modelBusy || updatesBusy} modelsDirty={modelDirty} />
+    {(visitedUpdates || section === 'updates') && <div className="as-config-view" hidden={section !== 'updates'}>
+      <Updates locked={modelBusy || hostBusy} busyChange={setUpdatesBusy} />
+    </div>}
   </section>
 }

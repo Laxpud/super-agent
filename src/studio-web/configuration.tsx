@@ -137,7 +137,7 @@ export function HostSettings({ section, select, models, reloadOptions, dirtyChan
   }
 
   if (section === 'models' && !snapshot) return null
-  return <div hidden={section === 'models'} className="as-config-view">
+  return <div hidden={section === 'models' || section === 'updates'} className="as-config-view">
     <QueryStatus query={result} reload={query.reload} />
     {snapshot && value && <>
       {!snapshot.writable && <p className="as-warning" role="status">{t('readOnlyConfiguration')}</p>}

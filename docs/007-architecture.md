@@ -427,6 +427,7 @@ Preparation returns before the check finishes. It hashes tracked and unignored w
 | `src/studio-web/settings.tsx` | Conversation-model CAS, shared model catalog and settings navigation that keeps drafts when switching sections |
 | `src/studio-web/configuration.tsx`, `settings-sections.tsx` | Review and read back Host settings, choose Worker defaults by route ID and permission, and confirm data directory changes separately |
 | `src/studio-web/settings-feishu.tsx` | Configures the single optional conversation binding; verifies bot and owner identity and reads back credential and connection states without displaying secrets |
+| `src/studio-web/updates.tsx` | Compares the running Host and browser builds, stages updates and rollbacks for explicit shared confirmation, and follows status and health across a reload without replaying writes; displays only relative log references |
 | `src/studio-web/settings-fields.tsx`, `settings-locales.ts` | Accessible settings fields, confirmation dialogs and bilingual configuration feedback |
 | `src/studio-web/ui.tsx`, `locales.ts`, `styles.ts` | Shared Studio view controls, bilingual strings and Host theme tokens |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
