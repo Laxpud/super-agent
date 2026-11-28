@@ -1,6 +1,6 @@
 /** 只读投影不授予 Bot、会话或任务执行权限。 */
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
-import { ASSISTANT_CONVERSATION, STUDIO_PAGE_SIZE, STUDIO_TEXT_LIMIT, type StudioArtifact, type StudioPage, type StudioPending,
+import { ASSISTANT_CONVERSATION, isStudioInternalSession, STUDIO_PAGE_SIZE, STUDIO_TEXT_LIMIT, type StudioArtifact, type StudioPage, type StudioPending,
   type StudioProjectSummary, type StudioRecordRole, type StudioSessionRecord, type StudioTaskSummary } from './protocol.ts'
 
 const at = (value: unknown) => typeof value === 'string' ? Date.parse(value) || 0 : 0
@@ -33,9 +33,15 @@ export function studioProject(db: DatabaseSync, id: string): StudioProjectRoute 
     ...(row.readonly_legacy === 1 ? { readonlyLegacy: true } : {}) }
 }
 
+/** Workspace 已用同一规则隐藏保留格式的 ID；轮询只补充不符合该格式的受管 Session。 */
 export function studioHiddenIds(db: DatabaseSync): string[] {
-  return db.prepare('SELECT session_id AS id FROM studio_session UNION SELECT id FROM agent_studio_session ORDER BY id').all()
-    .map(row => String(row.id))
+  const hidden: string[] = []
+  const sessions = db.prepare('SELECT session_id AS id FROM studio_session UNION SELECT id FROM agent_studio_session ORDER BY id')
+  for (const row of sessions.iterate()) {
+    const id = String(row.id)
+    if (!isStudioInternalSession(id)) hidden.push(id)
+  }
+  return hidden
 }
 
 export function studioRecordRole(value: unknown): StudioRecordRole {
@@ -104,6 +110,13 @@ export function studioTasks(db: DatabaseSync, room?: string, before?: number): S
   return page(db.prepare(`${TASK_SELECT} WHERE (? = 0 OR t.project_id IS ?) AND (? IS NULL OR t.rowid < ?)
     ORDER BY t.rowid DESC LIMIT ${STUDIO_PAGE_SIZE + 1}`)
     .all(Number(room !== undefined), room === ASSISTANT_CONVERSATION ? null : room ?? null, before ?? null, before ?? null), taskRow)
+}
+
+/** 直接读取全部在途任务的摘要所需字段，不受历史任务列表分页的影响。 */
+export function studioActiveTasks(db: DatabaseSync): Array<Pick<StudioTaskSummary, 'taskId' | 'title' | 'status'>> {
+  return db.prepare(`SELECT task_id, title, status FROM studio_task
+    WHERE status IN ('queued', 'running', 'waiting_approval', 'blocked') ORDER BY rowid DESC`).all()
+    .map(row => ({ taskId: String(row.task_id), title: String(row.title), status: row.status as StudioTaskSummary['status'] }))
 }
 
 /** 这里只读取已经交付的当前任务输出，不读取旧工作表，也不把内部日志当成结果转发。 */

@@ -204,6 +204,15 @@ describe('Studio V1 SQLite ledger', () => {
   })
 })
 
+function legacyRecordReader(store: ManagedWorkerStore, cwd: string) {
+  const flush = vi.fn(), open = vi.fn()
+  const host = { on: () => () => {}, sessionPersistence: { flush, open } } as unknown as Context
+  const signal = new AbortController().signal
+  const service = new StudioService(host, store, cwd, { assistant: null, leader: null }, () => true, signal, () => 'disabled', () => {})
+  onTestFinished(() => service.sessions.drain())
+  return { flush, open, record: (sessionId: string) => service.operations.record({ sessionId }, signal) }
+}
+
 describe('Studio V0 to V1 migration', () => {
   it('preserves published state, snapshots legacy Sessions and never projects a protected result', async () => {
     const f = fixture(), db = f.sql()
@@ -292,6 +301,94 @@ describe('Studio V0 to V1 migration', () => {
     const reopened = f.open()
     expect(reopened.recoveredTasks).toBe(0)
     expect(snapshot()).toEqual(once)
+  })
+
+  it.each([
+    { table: 'studio_draft_preference', room: assistant, tasks: ['plain-draft', 'private-draft', 'live-draft'],
+      sessions: ['session-plain-draft', 'session-private-draft', 'session-live-draft', 'old-private-revision'], otherTask: 'plain-work' },
+    { table: 'studio_project_work_fact', room: 'old-project', tasks: ['plain-work', 'private-fact', 'private-use', 'live-work'],
+      sessions: ['session-plain-work', 'session-private-fact', 'session-private-use', 'session-live-work', 'session-released'], otherTask: 'plain-draft' },
+    { table: 'studio_project_work_result_use', room: 'old-project', tasks: ['plain-work', 'private-fact', 'private-use', 'live-work'],
+      sessions: ['session-plain-work', 'session-private-fact', 'session-private-use', 'session-live-work', 'session-released'], otherTask: 'plain-draft' },
+  ])('fails closed on results and native logs when V0 lacks $table', async ({ table, room, tasks, sessions, otherTask }) => {
+    const f = fixture(), db = f.sql()
+    seedV0(db)
+    db.exec(`DROP TABLE ${table}`)
+    const store = f.open(), reader = legacyRecordReader(store, f.dir)
+    for (const id of tasks) {
+      expect(store.task(id)).toBeUndefined()
+      expect(store.studioArtifacts(room, `source-${id}`)).toEqual([])
+      expect(db.prepare('SELECT * FROM studio_task_execution WHERE task_id = ?').all(id)).toEqual([])
+    }
+    const migrated = db.prepare('SELECT role, readonly_legacy FROM studio_session WHERE session_id = ?')
+    for (const id of sessions) {
+      expect(migrated.get(id)).toEqual({ role: 'legacy-protected', readonly_legacy: 1 })
+      expect(store.studioHiddenIds()).toContain(id)
+      await expect(reader.record(id)).rejects.toMatchObject({ code: 'SESSION_NOT_FOUND', status: 404 })
+    }
+    expect(reader.flush).not.toHaveBeenCalled()
+    expect(reader.open).not.toHaveBeenCalled()
+    expect(store.task(otherTask)?.status).toBe('delivered')
+  })
+
+  it('archives residual V0 rows with a missing parent and validates all live V1 tables', () => {
+    const f = fixture(), db = f.sql()
+    seedV0(db)
+    db.exec('PRAGMA foreign_keys=OFF; DROP TABLE studio_project_binding; PRAGMA foreign_keys=ON')
+    const violation = () => db.prepare('PRAGMA foreign_key_check(studio_project_work)').all()
+    expect(violation()).toContainEqual(expect.objectContaining({ table: 'studio_project_work', parent: 'studio_project_binding' }))
+    const clean = fixture()
+    clean.open()
+    const tables = clean.sql().prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name <> 'sqlite_sequence'").all()
+    const store = f.open()
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 1 })
+    for (const { name } of tables) expect(db.prepare(`PRAGMA foreign_key_check(${String(name)})`).all()).toEqual([])
+    expect(violation()).not.toHaveLength(0)
+    expect(db.prepare("SELECT work_id FROM studio_project_work WHERE work_id = 'plain-work'").get()).toEqual({ work_id: 'plain-work' })
+    // SQLite 会先因缺父表拒绝准备写入语句；关闭测试连接的外键以独立验证旧表的封存触发器。
+    db.exec('PRAGMA foreign_keys=OFF')
+    expect(() => db.exec('DELETE FROM studio_project_work')).toThrow('Legacy Studio snapshot is read-only')
+    expect(store.task('plain-draft')).toMatchObject({ status: 'delivered' })
+  })
+
+  it('rejects a foreign-key violation in the retained, live V1 conversation ledger', () => {
+    const f = fixture(), db = f.sql()
+    seedV0(db)
+    db.exec(`PRAGMA foreign_keys=OFF;
+      UPDATE agent_studio_message SET reply_to = 'missing-message' WHERE id = 'published-answer';
+      PRAGMA foreign_keys=ON`)
+    expect(() => f.open()).toThrow('Studio V1 migration failed foreign key validation: agent_studio_message')
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 0 })
+    expect(db.prepare("SELECT name FROM sqlite_schema WHERE name = 'studio_task'").get()).toBeUndefined()
+  })
+
+  it.each([
+    ['evidence quote', "UPDATE studio_advice SET evidence_quote = 'Private evidence'"],
+    ['work reference', "UPDATE studio_advice SET role = 'leader', requester_session_id = 'old-leader-2', requester_bot_id = 'leader-bot', project_id = 'old-project', management_epoch = 2, work_id = 'plain-work'"],
+    ['missing advice table', 'PRAGMA foreign_keys=OFF; DROP TABLE studio_advice; PRAGMA foreign_keys=ON'],
+  ])('protects legacy Advisor Sessions with %s even if indexed for record reads', async (kind, update) => {
+    const f = fixture(), db = f.sql()
+    seedV0(db)
+    // 旧快照可能额外保留独立运行索引；用 advice_id 关联到 V0 的真实建议表。
+    db.exec(`CREATE TABLE studio_advisor_run (
+      session_id TEXT PRIMARY KEY, advice_id TEXT NOT NULL REFERENCES studio_advice(advice_id), requester_session_id TEXT NOT NULL
+    ) STRICT;
+    INSERT INTO studio_advisor_run VALUES ('old-advisor-run', 'advice', 'old-assistant');
+    INSERT INTO agent_studio_session (id, conversation_id, role, created_at)
+      VALUES ('old-advisor-run', '${assistant}', 'advisor', ${cutover});
+    ${update}`)
+    const store = f.open(), reader = legacyRecordReader(store, f.dir)
+    const sessions = kind === 'missing advice table' ? ['old-advisor-run'] : ['old-advisor-run', 'old-advisor']
+    for (const id of sessions) {
+      expect(db.prepare('SELECT role, readonly_legacy FROM studio_session WHERE session_id = ?').get(id))
+        .toEqual({ role: 'legacy-protected', readonly_legacy: 1 })
+      expect(store.studioHiddenIds()).toContain(id)
+      await expect(reader.record(id)).rejects.toMatchObject({ code: 'SESSION_NOT_FOUND', status: 404 })
+    }
+    expect(store.isProtectedLog('old-assistant')).toBe(false)
+    expect(store.isProtectedLog('old-leader-2')).toBe(false)
+    expect(reader.flush).not.toHaveBeenCalled()
+    expect(reader.open).not.toHaveBeenCalled()
   })
 
   it('rejects a future user_version without changing its schema or data', () => {

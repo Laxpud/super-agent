@@ -132,6 +132,40 @@ describe('Studio V1 configuration', () => {
   })
 })
 
+it.each(['', ' \t\n'])('boots with legacy blank studioCwd %j but still rejects invalid nonblank paths', async studioCwd => {
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), 'studio-v1-legacy-cwd-'))
+  const effects: Array<() => void | Promise<void>> = []
+  onTestFinished(async () => {
+    try { for (const dispose of effects.reverse()) await dispose() }
+    finally {
+      if (realpathSync(dir) !== dir) throw new Error('Refusing to clean up a different fixture path')
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+  const browserPeer = { principal: { kind: 'owner' } }
+  const register = vi.fn(disposer)
+  const host = { root: {}, fiber: {}, get: noop, on: disposer,
+    agents: { create: vi.fn(), resume: vi.fn(), withoutInitiator: vi.fn(), list: () => [] },
+    agentPresets: { mount: vi.fn(), presetForSession: vi.fn() },
+    connection: { allowsRemoteAuthorities: false, browserPeer, admit: () => ({ peer: browserPeer }) },
+    commands: { register: disposer }, tools: { guard: disposer }, sandboxPolicy: { resolve: () => ({ mode: 'read-only' }) },
+    permissionPresets: { resolve: () => ({ sandbox: 'read-only' }), current: () => 'read-only', set: vi.fn() },
+    sessionPersistence: { flush: vi.fn(), open: vi.fn() }, llm: modelCatalog(),
+    webServer: { host: '127.0.0.1', getOrigin: () => 'http://127.0.0.1:8080', register },
+    effect(start: () => () => void | Promise<void>) { effects.push(start()) }, logger: { info: noop, warn: noop, error: noop },
+  } as unknown as Context
+  for (const invalid of ['.', join(dir, 'missing')]) {
+    await expect(apply(host, Config({ stateDir: dir, studioCwd: invalid }))).rejects.toMatchObject({ code: 'STUDIO_WORKSPACE_INVALID' })
+  }
+  expect(register).not.toHaveBeenCalled()
+  const config = Config({ stateDir: dir, studioCwd })
+  expect(config.studioCwd).toBe(process.cwd())
+  await apply(host, config)
+  expect(register).toHaveBeenCalledOnce()
+  using db = new DatabaseSync(join(dir, STUDIO_DB), { readOnly: true })
+  expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 1 })
+})
+
 describe('Studio V1 Worker models', () => {
   it('resolves explicit, role default and fallback models in order without mutating the routes', () => {
     const ctx = { llm: modelCatalog() } as unknown as Context

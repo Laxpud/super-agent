@@ -511,8 +511,9 @@ export class StudioSessions {
 
   /** Read only a registered Studio Session. No use of agents.resume(), attach, or workspace navigation. */
   async record(id: string, from: number, signal: AbortSignal) {
-    const record = this.store.session(id) ?? this.domain.studioSession(id)
-    if (!record || this.domain.isProtectedLog(id)) throw new StudioError('SESSION_NOT_FOUND', 'Studio Session record is not available.', 404)
+    // 即使会话另有已发布的索引，旧草稿、项目或 Advisor 的保护标记也必须先于原生日志读取。
+    const record = this.domain.isProtectedLog(id) ? undefined : this.store.session(id) ?? this.domain.studioSession(id)
+    if (!record) throw new StudioError('SESSION_NOT_FOUND', 'Studio Session record is not available.', 404)
     signal.throwIfAborted()
     await this.ctx.sessionPersistence.flush()
     try {

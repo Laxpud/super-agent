@@ -7,6 +7,7 @@ import { ManagedWorkerStore } from '../src/managed-worker/store.ts'
 import { StudioPendingBroker } from '../src/studio/pending.ts'
 import { ASSISTANT_CONVERSATION } from '../src/studio/protocol.ts'
 import { StudioService } from '../src/studio/service.ts'
+import { newStudioSessionId } from '../src/studio/source.ts'
 
 const assistant = ASSISTANT_CONVERSATION
 const scope = 'verified-fixture-inbox'
@@ -151,6 +152,39 @@ describe('Studio owner conversation and Feishu port', () => {
     expect(f.enqueue).not.toHaveBeenCalled()
     expect((await f.api.state({}, f.signal)).pendingCount).toBe(0)
     expect(() => f.api.answer({ id: item!.id, value: 'Try the same stale block again.' }, f.signal)).toThrow('no longer waiting')
+  })
+
+  it('reports older running and blocked tasks when newer terminal rows fill the first page', async () => {
+    const f = fixture()
+    const register = (key: string, title: string) => f.domain.registerTask({ projectId: null, requesterBotId: f.domain.assistantBotId,
+      workspacePath: null, permission: 'read-only', sourceMessageId: `source-${key}`, requestId: `request-${key}`, requestText: title, title }).taskId
+    const running = register('running', 'Research in progress')
+    expect(f.domain.beginExecution(running, newStudioSessionId(), null, { provider: 'fixture', model: 'worker' })).toBeDefined()
+    const blocked = register('blocked', 'Wait for source')
+    expect(f.domain.markTaskBlocked(blocked, 1, 'Source not available')).toBe(true)
+    for (let index = 0; index < 45; index++) {
+      const id = register(`terminal-${index}`, `Finished task ${index}`)
+      expect(f.domain.invalidateTask(id, 'cancelled')).toBe(true)
+    }
+    const first = await f.api.tasks({}, f.signal)
+    expect(first.items).toHaveLength(40)
+    expect(first.items.every(task => task.status === 'cancelled')).toBe(true)
+    const query = await f.send('list-active', '现在正在处理什么任务？')
+    expect(query.status).toBe('completed')
+    expect((await f.timeline()).items.filter(item => item.replyTo === query.id).map(item => item.text)).toEqual([
+      `Assistant 当前正在处理：\n- Wait for source · blocked（${blocked}）\n- Research in progress · running（${running}）`,
+    ])
+    expect(f.enqueue).not.toHaveBeenCalled()
+  })
+
+  it('sends only explicit Workspace exclusions while keeping implicit Sessions registered', async () => {
+    const f = fixture()
+    const implicit = newStudioSessionId(), adopted = 'older-managed-session', similar = 'agent-studio-not-a-studio-id'
+    f.domain.registerSession(implicit, 'assistant', f.domain.assistantBotId, null)
+    f.domain.registerSession(adopted, 'assistant', f.domain.assistantBotId, null)
+    for (const id of [implicit, adopted, similar]) f.store.registerSession({ id, conversationId: assistant, role: 'assistant', createdAt: 1 })
+    expect((await f.api.state({}, f.signal)).hiddenSessionIds).toEqual([similar, adopted])
+    expect((await f.api.records({}, f.signal)).items.map(record => record.id)).toContain(implicit)
   })
 
   it('lists pending work from the private chat without waking a native Session', async () => {

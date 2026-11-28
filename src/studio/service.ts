@@ -53,7 +53,7 @@ export class StudioService {
       return
     }
     if (message.conversationId === ASSISTANT_CONVERSATION && asksForActiveWork.test(text)) {
-      const active = this.domain.tasks().items.filter(task => ['queued', 'running', 'waiting_approval', 'blocked'].includes(task.status))
+      const active = this.domain.studioActiveTasks()
         .map(task => `${task.title} · ${task.status}（${task.taskId}）`).concat(this.sessions.activeWork())
       this.reply(message.id, active.length ? `Assistant 当前正在处理：\n${active.map(item => `- ${item}`).join('\n')}`
         : 'Assistant 当前没有在处理的请求。')

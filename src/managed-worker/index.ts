@@ -66,8 +66,10 @@ const hostFields = s.object({
 /** 旧模型配置仅作只读兼容。忽略已退役的飞书收件箱，使旧配置档仍能启动并由设置页清理旧键，不会沿用旧绑定。 */
 export const Config: s<Record<string, unknown>, StudioHostConfig> = s.transform(hostFields, (value): StudioHostConfig => {
   if (!value.stateDir) throw new Error('Agent Studio stateDir is required')
+  // 旧设置允许留空；非空路径保留原值，由宿主按绝对路径和现存目录校验。
+  const studioCwd = value.studioCwd?.trim() ? value.studioCwd : process.cwd()
   return {
-    stateDir: value.stateDir, studioCwd: value.studioCwd ?? process.cwd(), defaultWorkerPermission: value.defaultWorkerPermission ?? 'read-only',
+    stateDir: value.stateDir, studioCwd, defaultWorkerPermission: value.defaultWorkerPermission ?? 'read-only',
     ...migrateWorkerModels(value.workerModelRoutes ?? undefined, value.workerModelDefaults ?? undefined, value.textWorkerRoutes ?? undefined, value.textWorkerDefaults ?? undefined),
     ...(value.assistantModel ? { assistantModel: value.assistantModel } : {}),
     ...(value.leaderModel ? { leaderModel: value.leaderModel } : {}),

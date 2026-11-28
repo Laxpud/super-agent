@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto'
 import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { backup, DatabaseSync, type SQLOutputValue } from 'node:sqlite'
-import { studioArtifacts, studioBlockingItems, studioHiddenIds, studioPendingRecord, studioProject, studioProjects, studioSession, studioTask, studioTasks } from '../studio/domain.ts'
+import { studioActiveTasks, studioArtifacts, studioBlockingItems, studioHiddenIds, studioPendingRecord, studioProject, studioProjects, studioSession,
+  studioTask, studioTasks } from '../studio/domain.ts'
 import { ASSISTANT_CONVERSATION, type StudioRecordRole, type StudioRole, type StudioTaskStatus, type StudioWorkerPermission } from '../studio/protocol.ts'
 import { STUDIO_SCHEMA, StudioStore } from '../studio/store.ts'
 import { MemoryStore } from './memory-store.ts'
@@ -61,6 +62,13 @@ const SCHEMA = `
   ) STRICT;
 `
 
+const V1_TABLES = [
+  'studio_bot', 'studio_project', 'studio_project_leader', 'studio_session', 'studio_task', 'studio_task_execution',
+  'studio_project_archive', 'studio_preference', 'studio_host_run',
+  'agent_studio_assistant', 'agent_studio_settings', 'agent_studio_message', 'agent_studio_parallel_turn', 'agent_studio_route_control',
+  'agent_studio_session', 'agent_studio_pending', 'agent_studio_feishu_binding', 'agent_studio_feishu_outbox',
+] as const
+
 const MIGRATED_AT = new Date(0).toISOString()
 export const studioNow = () => new Date().toISOString()
 type Row = Record<string, SQLOutputValue>
@@ -111,11 +119,11 @@ function migrateV1(db: DatabaseSync): void {
     projectIds.add(id)
   }
   const register = db.prepare(`INSERT INTO studio_session VALUES (?, ?, ?, ?, 1, ?) ON CONFLICT(session_id) DO UPDATE SET
+    role = CASE WHEN excluded.role = 'legacy-protected' THEN excluded.role ELSE studio_session.role END,
     created_at = CASE WHEN studio_session.created_at = ? THEN excluded.created_at ELSE studio_session.created_at END`)
   const addSession = (id: string | null, role: StudioRecordRole | 'legacy-protected', bot: string | null, project: string | null, time: unknown) => {
     if (!id) return
     register.run(id, bot, project === ASSISTANT_CONVERSATION ? null : project, role, timestamp(time), MIGRATED_AT)
-    if (role === 'legacy-protected') db.prepare("UPDATE studio_session SET role = 'legacy-protected' WHERE session_id = ?").run(id)
   }
   const byLeader = new Map<string, { project: string; bot: string }>()
   for (const row of bindings) {
@@ -131,10 +139,16 @@ function migrateV1(db: DatabaseSync): void {
     const bot = string(row, 'bot_id', 'assistant_bot_id')
     addSession(string(row, 'session_id', 'assistant_session_id'), 'assistant', bot && ensureBot(bot, 'assistant', timestamp(row.created_at)), null, row.created_at)
   }
-  const protectedDrafts = new Set(rows('studio_draft_preference').map(row => string(row, 'task_id')))
-  const protectedWork = new Set(['studio_project_work_fact', 'studio_project_work_result_use', 'studio_project_document']
+  const draftProtection = 'studio_draft_preference'
+  const workProtection = ['studio_project_work_fact', 'studio_project_work_result_use']
+  const protectedDrafts = new Set(rows(draftProtection).map(row => string(row, 'task_id')))
+  const protectedWork = new Set([...workProtection, 'studio_project_document']
     .flatMap(table => rows(table).map(row => string(row, 'work_id', 'task_id'))))
-  const protectedSessions = new Set<string>()
+  // 缺失保护索引的导出库不能证明结果可公开；只有索引存在且查不到对应关系时才允许迁入。
+  const missingDraftProtection = !old.has(draftProtection)
+  const missingWorkProtection = workProtection.some(table => !old.has(table))
+  const isProtectedDraft = (id: string | null) => missingDraftProtection || protectedDrafts.has(id)
+  const isProtectedWork = (id: string | null) => missingWorkProtection || protectedWork.has(id)
   const dispatches = rows('studio_project_dispatch')
   const byWork = new Map<string, Row[]>()
   for (const row of dispatches) {
@@ -154,11 +168,10 @@ function migrateV1(db: DatabaseSync): void {
       const configuredProject = leader?.project ?? string(row, 'project_id')
       const project = configuredProject && projectIds.has(configuredProject) ? configuredProject : null
       const executions = draft ? [row] : byWork.get(id) ?? []
-      const protectedResult = (draft ? protectedDrafts : protectedWork).has(id)
+      const protectedResult = draft ? isProtectedDraft(id) : isProtectedWork(id)
       for (const exec of executions) {
-        const session = string(exec, 'worker_session_id', 'session_id')
-        if (protectedResult && session) protectedSessions.add(session)
-        addSession(session, protectedResult ? 'legacy-protected' : 'draft-worker', string(exec, 'worker_bot_id'), project, exec.created_at)
+        addSession(string(exec, 'worker_session_id', 'session_id'), protectedResult ? 'legacy-protected' : 'draft-worker',
+          string(exec, 'worker_bot_id'), project, exec.created_at)
       }
       // 受保护的工作连请求和执行坐标也不进入任务视图，避免通过新结果入口重新取回旧证据。
       if (protectedResult || (!draft && !project) || db.prepare('SELECT 1 FROM studio_task WHERE task_id = ?').get(id)) continue
@@ -196,6 +209,13 @@ function migrateV1(db: DatabaseSync): void {
       }
     }
   }
+  const adviceTable = 'studio_advice'
+  const advice = rows(adviceTable)
+  const hasAdvisorEvidence = (row: Row) => string(row, 'evidence_quote', 'work_id') !== null
+  const protectedAdviceIds = new Set(advice.filter(hasAdvisorEvidence).flatMap(row => {
+    const id = string(row, 'advice_id', 'id')
+    return id ? [id] : []
+  }))
   const sessionColumns: ReadonlyArray<[string, StudioRecordRole, ...string[]]> = [
     ['managed_session_binding', 'document-worker', 'session_id', 'worker_session_id'],
     ['studio_assistant_binding', 'assistant', 'session_id', 'assistant_session_id'],
@@ -207,24 +227,26 @@ function migrateV1(db: DatabaseSync): void {
     ['studio_study_step', 'study-worker', 'worker_session_id', 'session_id'], ['studio_feishu_draft', 'draft-worker', 'worker_session_id', 'session_id'],
     ['studio_advisor_run', 'advisor', 'advisor_session_id', 'worker_session_id', 'session_id'],
     ['studio_advisor_run', 'legacy', 'owner_session_id', 'requester_session_id'],
-    ['studio_advice', 'advisor', 'advisor_session_id', 'session_id'], ['studio_advice', 'legacy', 'requester_session_id'],
+    [adviceTable, 'advisor', 'advisor_session_id', 'session_id'], [adviceTable, 'legacy', 'requester_session_id'],
     ['agent_studio_revision', 'draft-worker', 'worker_session_id', 'session_id'], ['agent_studio_revision', 'legacy', 'owner_session_id'],
     ['agent_studio_assistant', 'assistant', 'session_id'], ['agent_studio_parallel_turn', 'assistant', 'session_id'],
     ['agent_studio_session', 'legacy', 'id', 'session_id'], ['agent_studio_message', 'legacy', 'run_session_id', 'source_session_id'],
   ]
   for (const [table, fallback, ...columns] of sessionColumns) {
-    for (const row of rows(table)) {
+    for (const row of table === adviceTable ? advice : rows(table)) {
       const project = string(row, 'project_id', 'conversation_id')
-      const role = table === 'agent_studio_session' ? String(row.role ?? fallback) as StudioRecordRole : fallback
+      const workId = string(row, 'work_id', 'task_id')
+      // 保护的是承载证据的执行 Session，不是同一行记录的请求者或 Leader。
+      const protectedLog = (fallback === 'advisor' && (table === adviceTable ? hasAdvisorEvidence(row)
+        : !old.has(adviceTable) || protectedAdviceIds.has(string(row, 'advice_id') ?? '')))
+        || (table === 'agent_studio_revision' && fallback === 'draft-worker'
+          && ((row.work_type === 'draft' && isProtectedDraft(workId)) || (row.work_type === 'work' && isProtectedWork(workId))))
+        || (table === 'studio_project_dispatch' && fallback === 'draft-worker' && isProtectedWork(workId))
+        || (table === 'studio_draft_task' && fallback === 'draft-worker' && isProtectedDraft(workId))
+      const role = protectedLog ? 'legacy-protected' : table === 'agent_studio_session' ? String(row.role ?? fallback) as StudioRecordRole : fallback
       for (const column of columns) addSession(string(row, column), role, string(row, 'bot_id'), project, row.created_at ?? row.bound_at)
-      if (table === 'agent_studio_revision' && ((row.work_type === 'draft' && protectedDrafts.has(string(row, 'work_id')))
-        || (row.work_type === 'work' && protectedWork.has(string(row, 'work_id'))))) {
-        const session = string(row, 'worker_session_id')
-        if (session) protectedSessions.add(session)
-      }
     }
   }
-  for (const id of protectedSessions) addSession(id, 'legacy-protected', null, null, undefined)
   const revisionByKey = new Map<string, Row>()
   for (const row of rows('studio_memory_revision')) {
     const key = string(row, 'key', 'pref_key')
@@ -253,7 +275,10 @@ function migrateV1(db: DatabaseSync): void {
         BEGIN SELECT RAISE(ABORT, 'Legacy Studio snapshot is read-only'); END`)
     }
   }
-  if (db.prepare('PRAGMA foreign_key_check').get()) throw new Error('Studio V1 migration failed foreign key validation')
+  // 旧快照可能缺少父表；只校验 V1 继续读写的表，且在标记迁移成功前检查完整的现役图。
+  for (const table of V1_TABLES) {
+    if (db.prepare(`PRAGMA foreign_key_check(${quote(table)})`).get()) throw new Error(`Studio V1 migration failed foreign key validation: ${table}`)
+  }
   db.exec('PRAGMA user_version=1')
 }
 
@@ -402,6 +427,7 @@ export class ManagedWorkerStore {
   studioPendingRecord(id: string) { return studioPendingRecord(this.#db, id) }
   task(taskId: string) { return studioTask(this.#db, taskId) }
   tasks(room?: string, before?: number) { return studioTasks(this.#db, room, before) }
+  studioActiveTasks() { return studioActiveTasks(this.#db) }
   taskFromMessage(room: string, requestId: string, sourceMessageId: string) {
     const project = room === ASSISTANT_CONVERSATION ? null : room
     const row = this.#db.prepare('SELECT task_id FROM studio_task WHERE project_id IS ? AND request_key = ? AND source_message_id = ?')
