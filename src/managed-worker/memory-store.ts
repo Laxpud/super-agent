@@ -28,6 +28,16 @@ export class MemoryStore {
       .all(projectId, Number(includeForgotten)).map(decode)
   }
 
+  /** 按更新时间合并适用范围；另计总数，让提示词明确报告预算之外（含读取上限）的省略数量。 */
+  forPrompt(projectId: string | null, limit: number): { items: StudioPreference[]; total: number } {
+    this.access.assertActive()
+    const filter = "WHERE state = 'active' AND (project_id IS NULL OR project_id = ?)"
+    const total = Number(this.db.prepare(`SELECT count(*) AS total FROM studio_preference ${filter}`).get(projectId)?.total)
+    const items = this.db.prepare(`SELECT * FROM studio_preference ${filter} ORDER BY updated_at DESC, rowid DESC LIMIT ?`)
+      .all(projectId, limit).map(decode)
+    return { items, total }
+  }
+
   save(prefKey: string, text: string, projectId: string | null = null): StudioPreference {
     validate(prefKey, text)
     return this.access.write(() => {

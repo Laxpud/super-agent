@@ -74,6 +74,38 @@ function visible(content: readonly { type: string; text?: string }[]): string {
 
 function pendingOwner(agent: Agent): boolean { return !!(agent.inbox.nextTurn.length || agent.inbox.nextStep.length) }
 
+/** 从原文找所有活跃项目坐标。较长名称只消除同一处的短名称，不消除正文中另一次独立指名。 */
+function namedProjects(text: string, projects: readonly Pick<StudioProjectRoute, 'id' | 'name'>[]): Set<string> {
+  const hits: { start: number; end: number; id: string }[] = []
+  const word = String.raw`[\p{Script=Latin}\p{N}\p{M}_]`
+  const wordStart = new RegExp(`^${word}`, 'u'), wordEnd = new RegExp(`${word}$`, 'u')
+  for (const { id, name } of projects) {
+    for (const [kind, alias] of [['id', id], ['name', name]] as const) {
+      if (!alias) continue
+      const escaped = alias.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+      // 拉丁字母和数字要求词边界；汉字项目名可紧贴中文正文。ID 也不能是较长连字符标识的一部分。
+      const boundary = kind === 'id' ? String.raw`[\p{Script=Latin}\p{N}\p{M}_-]` : word
+      const before = kind === 'id' || wordStart.test(alias) ? `(?<!${boundary})` : ''
+      const after = kind === 'id' || wordEnd.test(alias) ? `(?!${boundary})` : ''
+      for (const match of text.matchAll(new RegExp(`${before}(?=${escaped}${after})`, 'giu'))) {
+        hits.push({ id, start: match.index, end: match.index + alias.length })
+      }
+    }
+  }
+  hits.sort((a, b) => a.start - b.start || b.end - a.end)
+  const names = new Set<string>()
+  let outer: typeof hits[number] | undefined
+  for (const hit of hits) {
+    if (outer && hit.end <= outer.end) {
+      if (hit.start === outer.start && hit.end === outer.end) names.add(hit.id)
+    } else {
+      outer = hit
+      names.add(hit.id)
+    }
+  }
+  return names
+}
+
 /** Keep independent native delivery queues by conversation and capture the result of each exact turn. */
 export class StudioSessions {
   private readonly native: NativeSessions
@@ -272,16 +304,32 @@ export class StudioSessions {
     if (!this.stopping.aborted && this.domain.notifyForwardTask(taskId, skipFeishu)) this.wake()
   }
 
-  /** 只把当前已验证的所有者消息登记给项目现任 Leader，旧项目按正常的 Leader 接任规则先补建原生 Session。 */
+  private requireNamedProject(projectId: string, requestText: string): StudioProjectRoute {
+    const project = this.requireActiveProject(projectId)
+    const active = this.domain.studioProjects()
+    const named = namedProjects(requestText, active)
+    if (named.size > 1) {
+      const candidates = active.filter(item => named.has(item.id)).map(item => `${item.name} (${item.id})`).join(', ')
+      throw new StudioError('PROJECT_TARGET_AMBIGUOUS', `The owner request names multiple active projects: ${candidates}. Ask the owner which project to use before forwarding.`, 409)
+    }
+    if (!named.has(projectId)) {
+      throw new StudioError('PROJECT_TARGET_NOT_NAMED', 'Do not forward to a project unless its exact name or ID is explicitly stated in the current owner request.', 409)
+    }
+    return project
+  }
+
+  /** 已认证原文须唯一指名目标项目；等待 Leader 就绪后，在登记前复核该授权与项目清单。 */
   async forwardProject(agent: Agent, source: OwnerRequest, projectId: string, signal: AbortSignal): Promise<StudioForwardSummary> {
     const turn = this.turns.get(agent.id)
     if (!turn || turn.message.conversationId !== ASSISTANT_CONVERSATION || turn.scheduled || turn.confirmationAsked
       || !this.matchesOwnerRequest(agent, source)) throw new StudioError('TASK_SOURCE_STALE', 'The owner request no longer permits forwarding.', 409)
-    const project = await this.ensureProjectLeader(projectId, signal)
+    const requireNamed = () => this.requireNamedProject(projectId, turn.message.text)
+    const project = await this.ensureProjectLeader(projectId, signal, requireNamed)
     signal.throwIfAborted()
     if (turn.scheduled || turn.confirmationAsked || !this.matchesOwnerRequest(agent, source)) {
       throw new StudioError('TASK_SOURCE_STALE', 'The owner request no longer permits forwarding.', 409)
     }
+    requireNamed()
     const registered = this.store.registerForward(turn.message.id, projectId, project.managementEpoch, project.leaderSessionId)
     turn.scheduled = true
     if (registered.created) this.enqueue(registered.message)
@@ -636,14 +684,16 @@ export class StudioSessions {
   /** A thread tied to a known item cannot create a new task by accidentally going through the ordinary registration tool. */
   isExistingTaskReply(agent: Agent): boolean { return this.turns.get(agent.id)?.related !== undefined }
 
+  private requireActiveProject(projectId: string): StudioProjectRoute {
+    const project = this.domain.studioProject(projectId)
+    if (!project) throw new StudioError('PROJECT_NOT_FOUND', 'This Studio project does not exist.', 404)
+    if (project.state !== 'active') throw new StudioError('PROJECT_ARCHIVED', 'This project is archived. Reopen it before sending new work.', 409)
+    return project
+  }
+
   /** 迁移只读 Leader 不恢复现役授权；按 CAS 为首次新输入准备可用的现任 Leader。 */
-  async ensureProjectLeader(projectId: string, signal: AbortSignal): Promise<StudioProjectRoute & { leaderSessionId: string }> {
-    const requireActive = () => {
-      const project = this.domain.studioProject(projectId)
-      if (!project) throw new StudioError('PROJECT_NOT_FOUND', 'This Studio project does not exist.', 404)
-      if (project.state !== 'active') throw new StudioError('PROJECT_ARCHIVED', 'This project is archived. Reopen it before sending new work.', 409)
-      return project
-    }
+  async ensureProjectLeader(projectId: string, signal: AbortSignal, requireActive = () => this.requireActiveProject(projectId)):
+    Promise<StudioProjectRoute & { leaderSessionId: string }> {
     let project = requireActive()
     if (project.readonlyLegacy || !project.leaderSessionId) {
       const prior = project

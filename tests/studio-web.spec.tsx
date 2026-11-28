@@ -437,6 +437,45 @@ it('renders all seven task badges, filters the ledger and opens evidence and sou
   expect(app.requests.some(request => request.op === 'send')).toBe(false)
 })
 
+it('renders task owners and executors and merges each selected historical task poll into page two', async () => {
+  vi.useFakeTimers()
+  vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
+  const unassigned: StudioTaskSummary = { taskId: 'latest', projectId: null, projectName: null, conversationId: 'assistant', sourceSessionId: 'assistant-session',
+    workerSessionId: null, sourceMessageId: 'source', requesterBotId: 'bot-assistant', assigneeBotId: null, workspacePath: null, permission: 'read-only',
+    authorizationVersion: 1, status: 'queued', title: 'Latest Assistant work', requestText: 'First page',
+    resultSummary: null, checkResult: null, artifacts: [], externalJob: null, createdAt: at, updatedAt: at }
+  const historical: StudioTaskSummary = { ...unassigned, taskId: 'historical', projectId: 'project-a', projectName: 'Project A',
+    conversationId: 'project-a', sourceSessionId: 'leader-session', status: 'running', title: 'Historical project work', requestText: 'Second page' }
+  let detail = historical
+  const app = server(({ op, input }) => {
+    if (op === 'tasks') return input.before === 20 ? { items: [historical] } : { items: [unassigned], next: 20 }
+    if (op === 'task') return input.taskId === unassigned.taskId ? unassigned : detail
+  })
+  const panel = await render(slots().main)
+  await click(en.tasks, panel)
+  const row = (title: string) => Array.from(panel.querySelectorAll<HTMLButtonElement>('.as-task-row')).find(item => item.querySelector('strong')?.textContent === title)!
+  const fact = (label: string) => Array.from(panel.querySelectorAll('.as-task-detail dt')).find(el => el.textContent === label)?.nextElementSibling?.textContent
+  await click(row(unassigned.title))
+  expect(fact(en.taskOwner)).toBe(en.assistant)
+  expect(fact(en.taskExecutor)).toBe(en.taskExecutorUnassigned)
+  await click(en.closeDetails, node('.as-task-detail', panel))
+  await click(en.loadMoreTasks, panel)
+  await click(row(historical.title))
+  expect(fact(en.taskOwner)).toBe(en.taskProjectLeader)
+  expect(fact(en.taskExecutor)).toBe(en.taskExecutorUnassigned)
+  expect(node('.as-pill', row(historical.title)).textContent).toBe(en['taskStatus.running'])
+  detail = { ...historical, status: 'delivered', authorizationVersion: 2, updatedAt: at + 4_000, workerSessionId: 'historical-worker' }
+  await act(async () => { await vi.advanceTimersByTimeAsync(4_000) })
+  expect(app.requests.filter(request => request.op === 'task' && request.input.taskId === historical.taskId)).toHaveLength(2)
+  expect(app.requests.filter(request => request.op === 'tasks' && request.input.before === 20)).toHaveLength(1)
+  expect(fact(en.taskState)).toBe(en['taskStatus.delivered'])
+  expect(fact(en.taskExecutor)).toBe(`${en.taskWorker} historical-worker`)
+  expect(node('.as-pill', row(historical.title)).textContent).toBe(en['taskStatus.delivered'])
+  await click(en.closeDetails, node('.as-task-detail', panel))
+  expect(node('.as-pill', row(historical.title)).textContent).toBe(en['taskStatus.delivered'])
+  expect(Object.keys(zh).sort()).toEqual(Object.keys(en).sort())
+})
+
 it('creates and edits an active project, sends an explicit null workspace and saves only edited archive fields', async () => {
   let current: StudioProjectSummary = { id: 'created', name: 'Phase Three', objective: 'Test workflow', workspacePath: '/work/phase3', state: 'active', managementEpoch: 1 }
   const archive: StudioProjectArchive = { projectId: current.id, decisions: 'Keep evidence', progress: '', openIssues: '', updatedAt: null, readonly: false }

@@ -48,6 +48,8 @@ export type StudioRecordRole = StudioRole | 'document-worker' | 'draft-worker' |
 export type StudioWorkerPermission = 'read-only' | 'workspace-write'
 export const STUDIO_TASK_STATUSES = ['queued', 'running', 'waiting_approval', 'blocked', 'interrupted', 'cancelled', 'delivered'] as const
 export type StudioTaskStatus = typeof STUDIO_TASK_STATUSES[number]
+export const STUDIO_ACTIVE_TASK_STATUSES = ['queued', 'running', 'waiting_approval', 'blocked'] as const satisfies readonly StudioTaskStatus[]
+export const isStudioTaskActive = (status: StudioTaskStatus): boolean => (STUDIO_ACTIVE_TASK_STATUSES as readonly StudioTaskStatus[]).includes(status)
 export type StudioTaskScope = 'all' | 'active' | 'terminal'
 export interface StudioChangedFile { path: string; action: 'write' | 'edit' }
 export interface StudioCommandCheck {
@@ -71,10 +73,12 @@ export interface StudioCheckResult {
 }
 export interface StudioTaskSummary {
   taskId: string
+  /** 项目任务由项目 Leader 负责；未立项任务由 Assistant 负责。 */
   projectId: string | null
   projectName: string | null
   conversationId: string
   sourceSessionId: string | null
+  /** 实际分配的 Worker Session；未分配时为 null，不用请求方 Session 代替。 */
   workerSessionId: string | null
   sourceMessageId: string | null
   requesterBotId: string | null

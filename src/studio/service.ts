@@ -8,8 +8,7 @@ import type { ProjectChange } from '../managed-worker/project-store.ts'
 import { verifyWorkspaceIdentity, WorkspacePathError } from '../managed-worker/workspace.ts'
 import { confirmStudioModel, studioModelOptions } from './models.ts'
 import { StudioError } from './pending.ts'
-import { asksForActiveWork, asksForPending, asksForProjects, confirmationStatusQuery, namesConfirmation, readTextDecision, readRouteControl, readTaskUnblock, readWorkQuery,
-  refersToThisConfirmation } from './owner-text.ts'
+import { classifyOwnerInput, namesConfirmation, refersToThisConfirmation, type OwnerInput, type TextDecision } from './owner-text.ts'
 import { ASSISTANT_CONVERSATION, GUARD_PENDING_CHOICES, GUARD_PENDING_PREFIX, GUARD_PENDING_TEXT_HINT, STUDIO_TEXT_LIMIT,
   type FeishuState, type StudioFeishuMessageStatus, type StudioForwardSummary, type StudioMessage, type StudioMessageStatus, type StudioPending,
   type StudioPreference, type StudioProjectArchive, type StudioProjectCoordinate, type StudioProjectCreate, type StudioProjectSummary, type StudioSend, type StudioSettings } from './protocol.ts'
@@ -69,41 +68,41 @@ export class StudioService {
   }
 
   /** 两个可信入口共用这一分流。先处理读查询、确认与定向控制，不等任何模型轮次。 */
-  private ownerInput(message: StudioMessage, direct?: StudioPending): void {
-    const text = message.text.trim()
-    if (asksForPending.test(text)) { this.publishPendingSummary(message.id); return }
-    if (message.conversationId === ASSISTANT_CONVERSATION && asksForProjects.test(text)) {
+  private ownerInput(message: StudioMessage, direct?: StudioPending, input = classifyOwnerInput(message.text, message.conversationId, direct)): void {
+    if (input.kind === 'feishu-check') { this.reply(message.id, '此指令仅用于飞书私聊绑定验证。'); return }
+    if (input.kind === 'pending') { this.publishPendingSummary(message.id); return }
+    if (input.kind === 'projects') {
       const projects = this.domain.studioProjects()
       this.reply(message.id, projects.length === 0 ? '目前没有登记的项目。'
         : [`目前有 ${projects.length} 个项目：`, ...projects.slice(0, 50).map(item => `- ${item.name}（${item.id}）`),
           ...(projects.length > 50 ? ['这里只列出前 50 项。'] : [])].join('\n'))
       return
     }
-    if (message.conversationId === ASSISTANT_CONVERSATION && asksForActiveWork.test(text)) {
+    if (input.kind === 'active-work') {
       const active = this.domain.studioActiveTasks()
         .map(task => `${task.title} · ${task.status}（${task.taskId}）`).concat(this.sessions.activeWork())
       this.reply(message.id, active.length ? `Assistant 当前正在处理：\n${active.map(item => `- ${item}`).join('\n')}`
         : 'Assistant 当前没有在处理的请求。')
       return
     }
-    const workQuery = readWorkQuery(text)
-    if (workQuery) { this.ownerWorkQuery(message, workQuery); return }
-    const query = confirmationStatusQuery(text)
-    if (query) { this.publishDecisions(message.id, query.target, direct); return }
-    // 精确任务 ID 的停止优先于回复卡片解释；它绝不选择当前对话中的其他执行。
-    const exactStop = readRouteControl(text)
-    if (exactStop?.kind === 'stop' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(exactStop.target.replace(/^[#＃]/u, ''))) {
-      const task = this.domain.task(exactStop.target.replace(/^[#＃]/u, ''))
+    if (input.kind === 'work-query') { this.ownerWorkQuery(message, input.query); return }
+    if (input.kind === 'confirmation-status') { this.publishDecisions(message.id, input.target, direct); return }
+    if (input.kind === 'task-stop') {
+      const task = this.domain.task(input.taskId)
       if (!task || (message.conversationId !== ASSISTANT_CONVERSATION && message.conversationId !== task.projectId)) {
         this.reply(message.id, '没有找到对应的任务。未停止任何工作。')
       } else if (this.sessions.stopTask(task.taskId)) this.reply(message.id, `已停止任务 ${task.taskId}，其他任务不受影响。`)
       else this.reply(message.id, '该任务不再运行，没有改变任何工作。')
       return
     }
-    const decision = this.guardTextDecision(message, direct) ?? this.textDecision(message, direct)
-    if (decision !== undefined) { this.reply(message.id, decision); return }
-    const unblocking = readTaskUnblock(text)
-    if (unblocking) {
+    if (input.kind === 'guard-decision') { this.reply(message.id, this.guardTextDecision(message, input, direct)); return }
+    if (input.kind === 'confirmation-ack') { this.reply(message.id, '仍待确认：这条文字没有批准事项。请明确说「批准」或「拒绝」。'); return }
+    if (input.kind === 'decision') {
+      const result = this.textDecision(message, input.decision, direct)
+      if (result !== undefined) { this.reply(message.id, result); return }
+    }
+    if (input.kind === 'unblock') {
+      const unblocking = input.command
       this.refreshBlockers()
       const item = this.store.openBlockers().find(item => item.taskId === unblocking.taskId)
       if (!item || message.createdAt < item.createdAt) { this.reply(message.id, '找不到对应的当前阻塞。未改变任何任务。'); return }
@@ -116,8 +115,8 @@ export class StudioService {
       }
       return
     }
-    const control = exactStop
-    if (control) {
+    if (input.kind === 'route-control') {
+      const control = input.command
       const related = this.sessions.relatedWork(message)
       const target = control.target.replace(/^[#＃]/u, '')
       const task = target ? this.domain.task(target) : related && this.domain.task(related.taskId)
@@ -162,7 +161,7 @@ export class StudioService {
       ...status.tasks.map(task => `任务 ${task.taskId} · ${studioTaskStatusLabel[task.status]} · ${task.title}`)].join('\n')
   }
 
-  private ownerWorkQuery(message: StudioMessage, query: NonNullable<ReturnType<typeof readWorkQuery>>): void {
+  private ownerWorkQuery(message: StudioMessage, query: Extract<OwnerInput, { kind: 'work-query' }>['query']): void {
     const { kind, id } = query
     if (kind === 'tasks') {
       const room = message.conversationId === ASSISTANT_CONVERSATION ? undefined : message.conversationId
@@ -210,15 +209,22 @@ export class StudioService {
     const cutover = this.store.feishuCutover(lookup.scope)
     if (cutover === undefined) throw new StudioError('FEISHU_LOOKUP_UNAVAILABLE', 'No verified Feishu private chat binding is active.', 503)
     const received = () => this.store.feishuInput(lookup.scope, messageId)
+    const known = (message: StudioMessage) => {
+      if (resubmit) {
+        const item = message.replyTo ? this.store.pendingItem(message.replyTo) : undefined
+        this.assertRecoverableFeishu(classifyOwnerInput(message.text, message.conversationId, item), item)
+      }
+      return { feishuMessageId: messageId, ...this.intake(message) }
+    }
     const prior = received()
-    if (prior) return { feishuMessageId: messageId, ...this.intake(prior) }
+    if (prior) return known(prior)
     const source = await lookup.verifiedMessage(messageId, cutover, signal)
     signal.throwIfAborted()
     if (lookup !== this.feishuLookup || this.store.feishuCutover(lookup.scope) !== cutover || source.scope !== lookup.scope || source.id !== messageId) {
       throw new StudioError('FEISHU_BINDING_CHANGED', 'The Feishu binding changed. No message was submitted.', 409)
     }
-    // 长连接或并行补交可能已登记同一消息；先读当前状态，再复用正式入站路径及幂等键。
-    if (resubmit && !received()) await this.receiveFeishu(source, signal, true)
+    // 长连接或并行补交可能已登记同一消息；控制类即使已登记也不可补交。
+    if (resubmit) await this.receiveFeishu(source, signal, true)
     return { feishuMessageId: messageId, ...this.intake(received()) }
   }
 
@@ -244,21 +250,15 @@ export class StudioService {
   }
 
   /** 守卫待办没有「批准」语义。只接受原卡片下的明确动作，或动作加确切待办 ID。 */
-  private guardTextDecision(message: StudioMessage, direct?: StudioPending): string | undefined {
+  private guardTextDecision(message: StudioMessage, { action, id }: Extract<OwnerInput, { kind: 'guard-decision' }>, direct?: StudioPending): string {
     const anchor = direct?.id.startsWith(GUARD_PENDING_PREFIX) ? direct : undefined
-    const text = message.text.trim().replace(/[。！!]+$/u, '')
-    const options = /^(取消任务|仅解除等待(?:（不重放被拒动作）)?)(?:\s+[#＃]?(guard-intercept:[^\s]+))?$/u.exec(text)
-    if (!options) return anchor ? GUARD_PENDING_TEXT_HINT : undefined
-    const [, action, id] = options
-    if (!anchor && !id) return undefined
+    if (!action) return GUARD_PENDING_TEXT_HINT
     if (anchor && id && anchor.id !== id) return '回复对象与指定的拦截事项不一致，未改变任何任务。'
     const item = anchor ?? (id && this.store.pendingItem(id))
     if (!item || message.createdAt < item.createdAt) return '没有找到对应的当前拦截事项，未改变任何任务。'
-    const [cancel, clear] = GUARD_PENDING_CHOICES
-    const selected = action === cancel ? cancel : clear
     try {
-      this.sessions.answer(item.id, selected, message.channel === 'feishu' ? 'feishu' : 'gui', 'text')
-      return selected === cancel ? `已取消任务 ${item.taskId}，原执行不会重启。`
+      this.sessions.answer(item.id, action, message.channel === 'feishu' ? 'feishu' : 'gui', 'text')
+      return action === GUARD_PENDING_CHOICES[0] ? `已取消任务 ${item.taskId}，原执行不会重启。`
         : `已解除任务 ${item.taskId} 的等待，不重放被拒动作。如需继续，请另发合规范围的新请求。`
     } catch (error) {
       if (error instanceof StudioError) return '该拦截事项已经处理或失效，未改变任何任务。'
@@ -267,12 +267,7 @@ export class StudioService {
   }
 
   /** 只能用认证用户的原文确定决定与对象。不能把其他文字、模型解释或旧答复当成当前授权。 */
-  private textDecision(message: StudioMessage, direct?: StudioPending): string | undefined {
-    const parsed = readTextDecision(message.text)
-    if (!parsed) {
-      return direct?.kind === 'confirmation' && /^(?:好|好的|可以|ok)[。！!\s]*$/iu.test(message.text.trim())
-        ? '仍待确认：这条文字没有批准事项。请明确说「批准」或「拒绝」。' : undefined
-    }
+  private textDecision(message: StudioMessage, parsed: TextDecision, direct?: StudioPending): string | undefined {
     const anchor = direct?.kind === 'confirmation' ? direct : undefined
     const mentionsAnchor = anchor && (refersToThisConfirmation(parsed.target) || namesConfirmation(parsed.target, anchor,
       anchor.conversationId === ASSISTANT_CONVERSATION ? undefined : this.domain.studioProject(anchor.conversationId)?.name))
@@ -474,6 +469,12 @@ export class StudioService {
     catch (error) { if (error instanceof StudioError) return false; throw error }
   }
 
+  private assertRecoverableFeishu(input: OwnerInput, item?: StudioPending): void {
+    if (item || input.kind !== 'conversation') {
+      throw new StudioError('FEISHU_RECOVERY_CONTROL_UNSUPPORTED', 'Manual submission is only for task or conversation messages. Send a new control or confirmation instead.', 409)
+    }
+  }
+
   private receiveFeishu(input: StudioFeishuInput, signal: AbortSignal, recovered = false): Promise<void> {
     signal.throwIfAborted()
     // A callback must point to the exact bound conversation/card; old-history replies are never new assignments.
@@ -481,11 +482,11 @@ export class StudioService {
     const card = input.parentId ?? input.rootId
     const item = card ? this.store.feishuQuestion(input.scope, card) : undefined
     const conversationId = ASSISTANT_CONVERSATION
+    const classified = classifyOwnerInput(input.text, conversationId, item)
+    if (recovered) this.assertRecoverableFeishu(classified, item)
+    if (classified.kind === 'feishu-check') return Promise.resolve()
     const parent = anchors.map(id => this.store.feishuMessage(input.scope, id)).find(value => value !== undefined)
       ?? (input.threadId ? this.store.feishuThread(input.scope, input.threadId) : undefined)
-    if (recovered && (item || readRouteControl(input.text) || readWorkQuery(input.text) || readTaskUnblock(input.text) || readTextDecision(input.text))) {
-      throw new StudioError('FEISHU_RECOVERY_CONTROL_UNSUPPORTED', 'Manual submission is only for task or conversation messages. Send a new control or confirmation instead.', 409)
-    }
     if (item?.kind === 'question' && item.conversationId !== conversationId) {
       // 兼容既有的问题卡片；项目消息不加入 Assistant 的时间线。
       if (item.mobile === 'topic' && item.state === 'pending') {
@@ -514,7 +515,7 @@ export class StudioService {
       }
       if (!accepted) this.store.addReply(message.id, '这项问题已处理或失效。')
       this.store.finishMessage(message.id, 'completed')
-    } else this.ownerInput(message, item)
+    } else this.ownerInput(message, item, classified)
     this.wake()
     return Promise.resolve()
   }

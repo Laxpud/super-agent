@@ -1,13 +1,14 @@
 /** 任务账本以对话和生命周期筛选；宿主收据与原请求和交付正文分开展示。 */
-import { useCallback, useEffect, useMemo, useRef } from 'react'
-import { ASSISTANT_CONVERSATION, type StudioCheckResult, type StudioPage, type StudioTaskScope, type StudioTaskSummary } from '../studio/protocol.ts'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ASSISTANT_CONVERSATION, isStudioTaskActive, type StudioCheckResult, type StudioPage, type StudioTaskScope, type StudioTaskSummary } from '../studio/protocol.ts'
 import { StudioApiError } from './api.ts'
 import { snippet } from './drafts.ts'
 import { createQuery, nextPage, useQuery, type StudioQuery } from './query.ts'
 import { Button, FailureNotice, PageHeading, QueryStatus, Time, projectById, useAction, useStudio, type TasksView } from './ui.tsx'
 
 const scopes = ['all', 'active', 'terminal'] as const satisfies readonly StudioTaskScope[]
-const isActive = (status: StudioTaskSummary['status']) => status === 'queued' || status === 'running' || status === 'waiting_approval' || status === 'blocked'
+type TaskListItem = Pick<StudioTaskSummary, 'taskId' | 'title' | 'status' | 'requestText' | 'projectId' | 'projectName' | 'permission' | 'updatedAt' | 'workspacePath' | 'authorizationVersion'>
+const inScope = (task: TaskListItem, scope: StudioTaskScope): boolean => scope === 'all' || isStudioTaskActive(task.status) === (scope === 'active')
 
 function TaskStatus({ status }: { status: StudioTaskSummary['status'] }) {
   const { t } = useStudio()
@@ -16,12 +17,12 @@ function TaskStatus({ status }: { status: StudioTaskSummary['status'] }) {
   return <span className="as-pill" data-tone={tone}><span className="as-dot" aria-hidden="true" />{t(`taskStatus.${status}`)}</span>
 }
 
-function ProjectName({ task }: { task: StudioTaskSummary }) {
+function ProjectName({ task }: { task: TaskListItem }) {
   const { t, state } = useStudio()
   return task.projectId ? task.projectName ?? projectById(state, task.projectId)?.name ?? task.projectId : t('unassignedProject')
 }
 
-function TaskRow({ task, selected, choose }: { task: StudioTaskSummary; selected: boolean; choose: () => void }) {
+function TaskRow({ task, selected, choose }: { task: TaskListItem; selected: boolean; choose: () => void }) {
   const { t } = useStudio()
   return <button className="as-record-row as-task-row" type="button" aria-pressed={selected} onClick={choose}>
     <span className="as-task-row-title"><strong>{task.title || t('task', { id: task.taskId })}</strong><TaskStatus status={task.status} /></span>
@@ -68,8 +69,8 @@ function CheckReceipt({ value }: { value: StudioTaskSummary['checkResult'] }) {
   </section>
 }
 
-function TaskDetail({ taskId, close, stopped, refresh }: {
-  taskId: string; close: () => void; stopped: (task: StudioTaskSummary) => void; refresh: () => void
+function TaskDetail({ taskId, close, updated, stopped, refresh }: {
+  taskId: string; close: () => void; updated: (task: StudioTaskSummary) => void; stopped: (task: StudioTaskSummary) => void; refresh: () => void
 }) {
   const { t, call, open } = useStudio()
   const query = useMemo(() => createQuery(async signal => {
@@ -82,12 +83,13 @@ function TaskDetail({ taskId, close, stopped, refresh }: {
   const heading = useRef<HTMLHeadingElement>(null)
   useEffect(() => { heading.current?.focus() }, [])
   const task = result.data
+  useEffect(() => { if (task) updated(task) }, [task, updated])
   const sourceId = task?.workerSessionId || task?.sourceSessionId
   const focusSeq = task?.source?.sessionId === sourceId ? task?.source?.eventSeq : undefined
   const stop = () => action.run(async () => {
     try {
       const receipt = await call('stopTask', { taskId })
-      if (receipt.taskId !== taskId || isActive(receipt.status)) throw new StudioApiError('badResponse', 200)
+      if (receipt.taskId !== taskId || isStudioTaskActive(receipt.status)) throw new StudioApiError('badResponse', 200)
       query.reconcile(() => receipt)
       stopped(receipt)
     } catch (error) {
@@ -106,6 +108,9 @@ function TaskDetail({ taskId, close, stopped, refresh }: {
       <dl className="as-facts">
         <div><dt>{t('taskId')}</dt><dd><code>{task.taskId}</code></dd></div>
         <div><dt>{t('owningProject')}</dt><dd><ProjectName task={task} /></dd></div>
+        <div><dt>{t('taskOwner')}</dt><dd>{t(task.projectId ? 'taskProjectLeader' : 'assistant')}</dd></div>
+        <div><dt>{t('taskExecutor')}</dt><dd>{task.workerSessionId
+          ? <>{t('taskWorker')} <code>{task.workerSessionId}</code></> : t('taskExecutorUnassigned')}</dd></div>
         <div><dt>{t('projectWorkspace')}</dt><dd><code>{task.workspacePath ?? t('noWorkspace')}</code></dd></div>
         <div><dt>{t('taskPermission')}</dt><dd>{t(`permission.${task.permission}`)} <code>{task.permission}</code></dd></div>
         <div><dt>{t('authorizationVersion')}</dt><dd>{task.authorizationVersion}</dd></div>
@@ -114,7 +119,7 @@ function TaskDetail({ taskId, close, stopped, refresh }: {
       </dl>
       <div className="as-actions">
         {sourceId && <Button onClick={() => open({ kind: 'record', sessionId: sourceId, focusSeq })}>{t('source')}</Button>}
-        {isActive(task.status) && <Button disabled={action.busy} onClick={() => void stop()}>{t(action.busy ? 'stoppingTask' : 'stopTask')}</Button>}
+        {isStudioTaskActive(task.status) && <Button disabled={action.busy} onClick={() => void stop()}>{t(action.busy ? 'stoppingTask' : 'stopTask')}</Button>}
         {(task.status === 'waiting_approval' || task.status === 'blocked') && <Button onClick={() => open({ kind: 'pending' })}>{t('pending')}</Button>}
       </div>
       <section className="as-fields as-task-section"><h4>{t('originalRequest')}</h4><p className="as-message-text">{task.requestText}</p></section>
@@ -130,15 +135,20 @@ type TaskListQuery = StudioQuery<StudioPage<StudioTaskSummary>>
 type LoadTasks = (before: number | undefined, signal: AbortSignal) => Promise<StudioPage<StudioTaskSummary>>
 
 /** 返回时恢复已打开的页数。以相邻页的新游标为准，避免新任务挤占第一页后在两页间漏掉记录。 */
-function TaskPage({ view, load, pages, cursors = [], seen = new Set<string>() }: {
-  view: TasksView; load: LoadTasks; pages: Set<TaskListQuery>; cursors?: number[]; seen?: ReadonlySet<string>
+function TaskPage({ view, load, pages, refreshed, cursors = [], seen = new Set<string>() }: {
+  view: TasksView; load: LoadTasks; pages: Set<TaskListQuery>; refreshed: ReadonlyMap<string, TaskListItem>; cursors?: number[]; seen?: ReadonlySet<string>
 }) {
   const { t, open } = useStudio()
   const before = cursors.at(-1)
   const query = useMemo(() => createQuery(signal => load(before, signal), before === undefined ? 4000 : undefined), [load, before])
   const result = useQuery(query)
   useEffect(() => { pages.add(query); return () => { pages.delete(query) } }, [pages, query])
-  const items = result.data?.items.filter(task => !seen.has(task.taskId)) ?? []
+  // 单任务轮询覆盖历史页的快照，但不能覆盖带有更新任务版本或时间的列表数据。
+  const items = result.data?.items.map(task => {
+    const latest = refreshed.get(task.taskId)
+    return latest && (latest.authorizationVersion > task.authorizationVersion
+      || (latest.authorizationVersion === task.authorizationVersion && latest.updatedAt >= task.updatedAt)) ? latest : task
+  }).filter(task => !seen.has(task.taskId) && inScope(task, view.scope ?? 'all')) ?? []
   const next = nextPage(cursors, result.data?.next)
   const pageCount = view.pageCount ?? 1
   return <>
@@ -149,7 +159,7 @@ function TaskPage({ view, load, pages, cursors = [], seen = new Set<string>() }:
         choose={() => open({ ...view, taskId: view.taskId === task.taskId ? undefined : task.taskId }, true)} /></li>)}
     </ul>}
     {next !== undefined && (cursors.length + 1 < pageCount
-      ? <TaskPage view={view} load={load} pages={pages} cursors={[...cursors, next]} seen={new Set([...seen, ...items.map(task => task.taskId)])} />
+      ? <TaskPage view={view} load={load} pages={pages} refreshed={refreshed} cursors={[...cursors, next]} seen={new Set([...seen, ...items.map(task => task.taskId)])} />
       : <div className="as-actions"><Button onClick={() => open({ ...view, pageCount: pageCount + 1 }, true)}>{t('loadMoreTasks')}</Button></div>)}
   </>
 }
@@ -159,12 +169,12 @@ export function Tasks({ view }: { view: TasksView }) {
   const { conversationId, scope = 'all' } = view
   const load = useCallback<LoadTasks>((before, signal) => call('tasks', { scope, conversationId, before }, signal), [call, scope, conversationId])
   const pages = useMemo(() => new Set<TaskListQuery>(), [load])
+  const [refreshed, setRefreshed] = useState(() => new Map<string, TaskListItem>())
+  const updated = useCallback(({ taskId, title, status, requestText, projectId, projectName, permission, updatedAt, workspacePath, authorizationVersion }: StudioTaskSummary) => {
+    setRefreshed(current => new Map(current).set(taskId, { taskId, title, status, requestText, projectId, projectName, permission, updatedAt, workspacePath, authorizationVersion }))
+  }, [])
   const refresh = () => { for (const query of pages) query.reload(); reloadState() }
-  const stopped = (task: StudioTaskSummary) => {
-    for (const query of pages) query.reconcile(page => page && { ...page,
-      items: page.items.flatMap(item => item.taskId === task.taskId ? scope === 'active' ? [] : [task] : [item]) })
-    reloadState()
-  }
+  const stopped = (task: StudioTaskSummary) => { updated(task); refresh() }
   const projects = [...(state?.projects ?? []), ...(state?.archivedProjects ?? [])]
   const list = useRef<HTMLDivElement>(null)
   const scopeFilter = useRef<HTMLSelectElement>(null)
@@ -189,8 +199,8 @@ export function Tasks({ view }: { view: TasksView }) {
       </label>
     </div>
     <div className="as-tasks-layout" data-selected={!!view.taskId || undefined}>
-      <div ref={list} className="as-task-list"><TaskPage view={view} load={load} pages={pages} /></div>
-      {view.taskId && <TaskDetail key={view.taskId} taskId={view.taskId} refresh={refresh} stopped={stopped}
+      <div ref={list} className="as-task-list"><TaskPage view={view} load={load} pages={pages} refreshed={refreshed} /></div>
+      {view.taskId && <TaskDetail key={view.taskId} taskId={view.taskId} refresh={refresh} updated={updated} stopped={stopped}
         close={() => {
           const target = list.current?.querySelector<HTMLButtonElement>('[aria-pressed="true"]') ?? scopeFilter.current
           open({ ...view, taskId: undefined }, true)

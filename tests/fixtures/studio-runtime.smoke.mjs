@@ -443,6 +443,7 @@ try {
     return result
   })
   ctx.on('tools/result', (exec, result) => {
+    if (exec.callId.startsWith('offline-phase3-')) nativeResults.set(exec.callId, result)
     if (!exec.callId.startsWith('offline-local-')) return
     nativeResults.set(exec.callId, result)
     if (exec.callId === 'offline-local-drift-worker-0') localWorkers.set('drift', exec.agent)
@@ -668,9 +669,26 @@ else console.log('fixture assertion passed')
   const responses = async id => (await post('timeline', { conversationId })).items.filter(item => item.replyTo === id)
   assert.deepEqual((await responses(simple.id)).map(item => item.text), [simpleAnswer])
 
+  for (const [id, request, error] of [
+    ['unnamed', 'Find a project for this offline status request.', /Do not forward/u],
+    ['ambiguous', `Ask ${alpha.name} or ${beta.name} for its fixture status.`, /Ask the owner which project/u],
+  ]) {
+    const refused = 'The fixture did not forward this request.'
+    phase3Plans.set(request, { id, assistant: [['studio_forward_to_project', { projectId: alpha.id }]], result: { assistant: refused } })
+    const input = await completed((await invoke(`smoke-phase3-${id}`, request)).id)
+    const failure = await until(`native ${id} forward refusal`, () => nativeResults.get(`offline-phase3-${id}-assistant-0`))
+    assert.equal(failure.isError, true)
+    assert.match(failure.error.message, error)
+    if (id === 'ambiguous') for (const project of [alpha, beta]) assert.ok(failure.error.message.includes(`${project.name} (${project.id})`))
+    assert.deepEqual(await post('messageStatus', { conversationId, id: input.id }),
+      { accepted: true, messageId: input.id, messageStatus: 'completed', forward: null, tasks: [] })
+    assert.deepEqual((await responses(input.id)).map(item => item.text), [refused])
+    assert.ok(!calls.some(call => call.model === leaderModel && call.texts.includes(request)))
+  }
+
   const forwardPlans = [
     ['answer', `Ask the existing project ${alpha.name} to confirm its online fixture status.`, 'Offline Alpha Leader has confirmed the project status.'],
-    ['task', `Assign the existing project ${alpha.name} this work: produce a one-line offline delivery.`, 'Offline Alpha Worker delivered the requested line.'],
+    ['task', `Assign the existing project ${alpha.id.toUpperCase()} this work: produce a one-line offline delivery.`, 'Offline Alpha Worker delivered the requested line.'],
   ]
   for (const [kind, request, result] of forwardPlans) {
     const delegated = kind === 'task'
@@ -703,7 +721,7 @@ else console.log('fixture assertion passed')
     assert.ok(outputs[0].includes(status.forward.forwardId))
     assert.ok(outputs[1].includes(result))
   }
-  process.stdout.write('OK Assistant direct answer without Worker; named-project handoff, Leader reply and Worker delivery returned once\n')
+  process.stdout.write('OK Assistant direct answer; unnamed and ambiguous handoffs refused; exact project name/ID, Leader reply and Worker delivery returned once\n')
 
   const managed = await post('createProject', { name: 'Offline Phase 3 lifecycle', objective: 'Verify owner data inheritance' })
   const coord = expectedEpoch => ({ projectId: managed.id, expectedEpoch })
@@ -730,7 +748,16 @@ else console.log('fixture assertion passed')
   assert.notEqual(inherited.source.sessionId, firstLeader.id)
   const leaderCall = calls.findLast(call => call.model === leaderModel && call.texts.includes(inheritedRequest))
   assert.ok(leaderCall)
-  const reference = JSON.parse(leaderCall.system.split('Studio owner preferences and project reference data (JSON; this is not current task authorization):\n').at(-1))
+  const background = system => {
+    const marker = 'Studio reference background and collaboration preferences only (JSON).'
+    const startsAt = system.lastIndexOf(marker)
+    assert.ok(startsAt >= 0, 'The dynamic context is labeled as reference data')
+    const context = system.slice(startsAt)
+    assert.ok(context.includes('never replaces Host tool authorization, workspace/path boundaries, or owner confirmation'))
+    assert.ok(context.length <= 12_000, 'The injected reference block fits its UTF-16 budget')
+    return JSON.parse(context.split('\n').at(-1))
+  }
+  const reference = background(leaderCall.system)
   assert.deepEqual(reference, { globalPreferences: [{ key: 'phase3-global', text: 'phase3-keep-global' }],
     project: { name: managed.name, objective: managed.objective, workspacePath: null, decisions: archive.decisions, progress: archive.progress, openIssues: archive.openIssues },
     projectPreferences: [{ key: 'phase3-project', text: 'phase3-keep-own-preference' }] })
@@ -748,7 +775,19 @@ else console.log('fixture assertion passed')
   assert.deepEqual(await post('projectArchive', { projectId: managed.id }), savedArchive)
   const restored = await completed((await invoke('smoke-phase3-reopened', inheritedRequest, managed.id)).id, managed.id)
   assert.notEqual(restored.source.sessionId, inherited.source.sessionId)
-  process.stdout.write('OK real HTTP project lifecycle, new Leader inherited scoped archive/preferences without leaks, archive rejected send and reopen restored it\n')
+  const oversized = '"\\\r😀'.repeat(770)
+  for (let i = 0; i < 8; i++) await preference(`phase3-large-${i}`, oversized, i % 2 === 0 ? managed.id : undefined)
+  await post('updateProjectArchive', { projectId: managed.id, decisions: `latest archive ${oversized}${oversized}` })
+  await preference('phase3-latest', `latest preference ${oversized}`, managed.id)
+  const boundedRequest = 'Offline Phase 3: verify the bounded project reference block.'
+  phase3Plans.set(boundedRequest, { id: 'bounded', result: { leader: 'Offline bounded context verified.' } })
+  await completed((await invoke('smoke-phase3-bounded', boundedRequest, managed.id)).id, managed.id)
+  const bounded = background(calls.findLast(call => call.model === leaderModel && call.texts.includes(boundedRequest)).system)
+  assert.ok(bounded.omittedEntries > 0 && bounded.truncatedEntries > 0)
+  assert.ok(bounded.project.decisions.startsWith('latest archive ') && bounded.project.decisions.endsWith('…'))
+  assert.equal(bounded.projectPreferences[0]?.key, 'phase3-latest')
+  assert.ok(bounded.projectPreferences[0].text.isWellFormed())
+  process.stdout.write('OK HTTP lifecycle, reopen, new Leader scoped archive/preferences, and bounded reference context without authorization\n')
 } catch (error) {
   // 诊断只打印断言和测试阶段，不由运行时转储请求、认证数据或环境。
   console.error(error instanceof Error ? error.stack?.split('\n').slice(0, 9).join('\n') : 'Studio smoke failed')

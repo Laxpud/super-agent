@@ -2,12 +2,11 @@
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { StudioFeishuSdk } from './feishu-sdk.ts'
+import { FEISHU_CHECK_COMMAND, isFeishuCheck } from './owner-text.ts'
 import { StudioError } from './pending.ts'
 import { sameBinding, type FeishuBinding, type FeishuCheck, type FeishuCheckResult } from './settings-protocol.ts'
 
 const LIFETIME_MS = 120_000
-const CHECK_PREFIX = '/studio-feishu-check '
-const checkMessage = /^\/studio-feishu-check [0-9a-f-]{36}$/u
 const source = z.object({ schema: z.literal('2.0'), event_type: z.literal('im.message.receive_v1'), app_id: z.string(),
   sender: z.object({ sender_type: z.literal('user'), sender_id: z.object({ open_id: z.string().max(256).regex(/^ou_[a-zA-Z0-9]+$/u) }) }),
   message: z.object({ message_type: z.literal('text'), chat_type: z.literal('p2p'), chat_id: z.string().max(256).regex(/^oc_[a-zA-Z0-9]+$/u),
@@ -39,7 +38,7 @@ export class StudioFeishuSetup {
     if (this.#current) this.#end(this.#current, 'cancelled')
     if (this.#listening) throw new StudioError('FEISHU_CHECK_CLOSING', 'The previous verification connection is closing. Try again in a moment.', 409)
     const id = randomUUID()
-    const phrase = `${CHECK_PREFIX}${randomUUID()}`
+    const phrase = `${FEISHU_CHECK_COMMAND} ${randomUUID()}`
     const startedAt = Date.now()
     const expiresAt = startedAt + LIFETIME_MS
     const entry: Check = { id, phrase, revision: expected.revision, startedAt, expiresAt, expected, secret,
@@ -107,7 +106,7 @@ export class StudioFeishuSetup {
     const event = result.data
     let text: string
     try { text = body.parse(JSON.parse(event.message.content)).text.trim() } catch { return false }
-    if (!checkMessage.test(text)) return false
+    if (!isFeishuCheck(text)) return false
     const entry = this.#current
     if (!entry || entry.result.state !== 'waiting' || entry.stop.signal.aborted || entry.expiresAt <= Date.now()
       || text !== entry.phrase || !entry.botOpenId || entry.expected.appId !== event.app_id

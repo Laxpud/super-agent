@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -16,6 +16,7 @@ import { StudioFeishuConversation } from '../src/studio/feishu.ts'
 import type { StudioFeishuSdk } from '../src/studio/feishu-sdk.ts'
 import { ASSISTANT_CONVERSATION as assistant, FORWARD_PROJECT, WORKER_DELEGATE, type StudioInput, type StudioOp } from '../src/studio/protocol.ts'
 import { StudioService } from '../src/studio/service.ts'
+import { confirmStudioDirectory, STUDIO_DB, StudioDirectorySwitch } from '../src/studio/settings-directory.ts'
 import { studioOwnerMessageId } from '../src/studio/source.ts'
 
 const route = { provider: 'phase3-fixture', model: 'offline' }
@@ -231,7 +232,111 @@ describe('Studio Phase 3 SQLite migration', () => {
   })
 })
 
+describe('Studio Phase 3 directory copy', () => {
+  it.each([
+    { label: 'a dangling V2 foreign key', sql: "INSERT INTO studio_project_forward_notice VALUES ('missing-forward', 'fixture')",
+      error: /foreign key validation: studio_project_forward_notice/u },
+    { label: 'an unsupported schema version', sql: 'PRAGMA user_version=1', error: /database copy user_version: 1/u },
+    { label: 'only a dangling legacy foreign key', sql: 'CREATE TABLE legacy_parent (id TEXT PRIMARY KEY);'
+      + 'CREATE TABLE legacy_child (id TEXT REFERENCES legacy_parent(id)); INSERT INTO legacy_child VALUES (\'missing\')' },
+  ])('validates the actual backup before publishing its marker: $label', async ({ sql, error }) => {
+    const { dir, cleanup } = directory()
+    onTestFinished(cleanup)
+    const from = join(dir, 'old'), target = join(dir, 'new')
+    const path = join(from, STUDIO_DB)
+    const store = new ManagedWorkerStore(path)
+    try {
+      store.finishRun()
+      {
+        using original = new DatabaseSync(path, { enableForeignKeyConstraints: false })
+        original.exec(sql)
+        expect(original.prepare('PRAGMA quick_check').all()).toEqual([{ quick_check: 'ok' }])
+      }
+      const change = new StudioDirectorySwitch(from, target, 'copy')
+      if (error) {
+        await expect(change.prepare(store)).rejects.toThrow(error)
+        expect(existsSync(join(target, STUDIO_DB))).toBe(true)
+        expect(existsSync(join(target, '.studio-directory'))).toBe(false)
+        expect(() => confirmStudioDirectory(target, change.token)).toThrow()
+      } else {
+        await change.prepare(store)
+        expect(() => confirmStudioDirectory(target, change.token)).not.toThrow()
+      }
+    } finally { store.close() }
+  })
+})
+
 describe('Studio Phase 3 owner flows', () => {
+  it('rejects an unnamed or ambiguous authenticated project target and accepts a unique complete name or ID', async () => {
+    const f = fixture(), short = await f.project('A'), long = await f.project('A Pro'), chinese = await f.project('审计项目')
+    const rejected = [
+      { text: '请检查 Atlas 的进展。', target: short.id, code: 'PROJECT_TARGET_NOT_NAMED', message: /Do not forward/u },
+      { text: '请 A Pro 汇报。', target: short.id, code: 'PROJECT_TARGET_NOT_NAMED', message: /exact name or ID/u },
+      { text: '请 A 或者审计项目给出进展。', target: short.id, code: 'PROJECT_TARGET_AMBIGUOUS', message: /Ask the owner/u },
+      { text: '请 A Pro 汇报，并检查 A 的进展。', target: long.id, code: 'PROJECT_TARGET_AMBIGUOUS', message: /Ask the owner/u },
+    ]
+    for (const { text, target, code, message } of rejected) {
+      f.drive('assistant', text, async turn => {
+        const attempt = turn.tool(FORWARD_PROJECT, { projectId: target })
+        await expect(attempt).rejects.toMatchObject({ code, status: 409, message: expect.stringMatching(message) })
+        if (code === 'PROJECT_TARGET_AMBIGUOUS') {
+          const other = text.includes(chinese.name) ? chinese : long
+          await expect(attempt).rejects.toMatchObject({ message: expect.stringContaining(`${short.name} (${short.id})`) })
+          await expect(attempt).rejects.toMatchObject({ message: expect.stringContaining(`${other.name} (${other.id})`) })
+        }
+        turn.say('No project was forwarded')
+      })
+      const request = await f.send(text)
+      await f.wait(async () => (await f.status(request.id)).messageStatus === 'completed')
+      expect((await f.status(request.id)).forward).toBeNull()
+      expect(f.readSql('SELECT forward_id FROM studio_project_forward')).toEqual([])
+      expect(f.turn('leader', text)).toBeUndefined()
+    }
+    for (const [text, projectId] of [[`Please send to a pRO and report back.`, long.id], ['请审计项目给出进展。', chinese.id],
+      [`请${short.id.toUpperCase()}给出进展。`, short.id]] as const) {
+      f.drive('assistant', text, async turn => { await turn.tool(FORWARD_PROJECT, { projectId }) })
+      const request = await f.send(text)
+      await f.wait(async () => (await f.status(request.id)).forward?.status === 'delivered')
+      expect((await f.status(request.id)).forward?.projectId).toBe(projectId)
+    }
+  })
+
+  it.each(['before binding', 'previous binding', 'current binding'] as const)('keeps Web forwards in their own binding generation (%s)', async origin => {
+    const f = fixture(), project = await f.project('Delivery Project')
+    const scope = 'current-binding'
+    if (origin !== 'before binding') f.service.feishu.activate(origin === 'current binding' ? scope : 'prior-binding', Date.now() - 1)
+    const text = '请 Delivery Project 交付一句摘要。', result = '仅向原入口交付的项目结果'
+    const release = Promise.withResolvers<void>()
+    f.signal.addEventListener('abort', () => release.resolve(), { once: true })
+    f.drive('assistant', text, async turn => { await turn.tool(FORWARD_PROJECT, { projectId: project.id }) })
+    f.drive('leader', text, async turn => { await turn.tool(WORKER_DELEGATE, {}) })
+    f.drive('worker', text, async turn => { await release.promise; turn.say(result) })
+    const request = await f.send(text)
+    await f.wait(async () => (await f.currentTask(request.id))?.status === 'running')
+    expect(f.readSql("SELECT message_id FROM agent_studio_feishu_outbox WHERE kind = 'message' AND parent_message_id IS NULL"))
+      .toEqual(origin === 'before binding' ? [] : [{ message_id: request.id }])
+    if (origin !== 'current binding') f.service.feishu.activate(scope, Date.now())
+    release.resolve()
+    await f.wait(async () => (await f.status(request.id)).forward?.status === 'delivered')
+    const replies = await f.replies(request.id)
+    expect(replies).toHaveLength(2)
+    expect(replies[1]?.text).toContain(result)
+    if (origin === 'current binding') {
+      const echo = f.service.feishu.next(scope)!
+      expect(echo).toMatchObject({ channel: 'gui', text })
+      f.service.feishu.finish(echo.id, 'om_web_original')
+      for (const [index, reply] of replies.entries()) {
+        const out = f.service.feishu.next(scope)!
+        expect(out).toMatchObject({ parentId: 'om_web_original', text: reply.text })
+        f.service.feishu.finish(out.id, `om_web_reply_${index}`)
+      }
+    } else {
+      const generation = origin === 'before binding' ? 1 : 2
+      expect(f.readSql(`SELECT id FROM agent_studio_feishu_outbox WHERE generation = ${generation}`)).toEqual([])
+    }
+    expect(f.service.feishu.next(scope)).toBeUndefined()
+  })
+
   it.each(['gui', 'feishu'] as const)('verifies tool text and target, deduplicates input and returns only the final Leader reply to %s', async channel => {
     const f = fixture(), project = await f.project(), archived = await f.project('Archived target')
     const scope = 'leader-reply-fixture', remote = 'om_direct_leader'
@@ -464,6 +569,95 @@ describe('Studio Phase 3 owner flows', () => {
     await f.wait(async () => (await f.replies(source.id))[0]?.text.includes(taskId))
     expect(f.turn('assistant', query)).toBeUndefined()
     expect(lookup.mock.calls.map(([id]) => id).filter(id => id === good)).toHaveLength(3)
+  })
+
+  it('never records, executes or queues reserved Feishu messages or control text through manual submission', async () => {
+    const f = fixture()
+    const request = f.domain.registerTask({ projectId: null, requestId: 'guard-fixture', sourceMessageId: 'original-guard-message',
+      requestText: 'Original guarded work', requesterBotId: f.domain.assistantBotId, workspacePath: null, permission: 'read-only' })
+    const execution = f.domain.beginExecution(request.taskId, 'guarded-worker', null, route)!
+    const guard = f.domain.recordGuardInterception(execution, { code: 'STUDIO_READ_ONLY_VIOLATION', reason: 'Fixture denial', needsOwnerDecision: true }, 'fixture', 'Write')
+    expect(guard.pendingId).toMatch(/^guard-intercept:/u)
+    const guardText = `仅解除等待 ${guard.pendingId}`
+    const cases = new Map(Object.entries({
+      om_check: '/studio-feishu-check 11111111-1111-4111-8111-111111111111', om_clear: guardText,
+      om_cancel: `取消任务 ${guard.pendingId}`, om_approve: `批准 ${request.taskId}`, om_decline: '拒绝这项',
+      om_lookup: '查询受理 om_other', om_recent: '最近任务', om_status: `查询任务 ${request.taskId}`,
+      om_stop: `停止任务 ${request.taskId}`, om_submit: '补交消息 om_other', om_pending: '待我处理',
+      om_decisions: '查询确认结果', om_projects: '列出项目', om_active: '正在处理什么任务',
+      om_unblock: `解除阻塞 ${request.taskId}: fixed`,
+    }))
+    const sourceTimeMs = Date.now() + 1
+    const sdk = { botOpenId: async () => binding.botOpenId, getMessage: async (messageId: string) => ({
+      message_id: messageId, chat_id: binding.chatId, create_time: String(sourceTimeMs),
+      msg_type: 'text', body: { content: JSON.stringify({ text: cases.get(messageId) }) },
+      sender: { id_type: 'open_id', id: binding.ownerOpenId, sender_type: 'user' },
+    }) } as unknown as StudioFeishuSdk
+    const transport = new StudioFeishuConversation(sdk, binding, f.service.feishu, () => true, noop)
+    f.service.bindFeishuLookup(transport)
+    f.service.feishu.activate(transport.scope, cutover)
+    const task = f.domain.task(request.taskId), pending = f.domain.studio.pendingItem(guard.pendingId!)
+    const executions = f.readSql('SELECT * FROM studio_task_execution')
+    for (const [messageId, text] of cases) {
+      await expect(f.call('resubmitFeishuMessage', { messageId })).rejects.toMatchObject(expectError('FEISHU_RECOVERY_CONTROL_UNSUPPORTED', 409))
+      expect(f.turn('assistant', text)).toBeUndefined()
+    }
+    expect(f.domain.task(request.taskId)).toEqual(expect.objectContaining({ ...task, status: 'waiting_approval' }))
+    expect(f.domain.studio.pendingItem(guard.pendingId!)).toEqual(expect.objectContaining({ ...pending, state: 'pending' }))
+    expect(f.readSql('SELECT id FROM agent_studio_message')).toEqual([])
+    expect(f.readSql('SELECT * FROM studio_task_execution')).toEqual(executions)
+    expect(f.service.sessions.busy).toBe(false)
+    await f.service.feishu.receive({ id: 'om_check', text: cases.get('om_check')!, scope: transport.scope, sourceTimeMs }, f.signal)
+    expect(f.domain.studio.feishuInput(transport.scope, 'om_check')).toBeUndefined()
+    await f.service.feishu.receive({ id: 'om_clear', text: guardText, scope: transport.scope, sourceTimeMs }, f.signal)
+    expect(f.domain.task(request.taskId)?.status).toBe('interrupted')
+    expect(f.domain.studio.pendingItem(guard.pendingId!)).toMatchObject({ state: 'resolved', answeredBy: 'feishu' })
+    expect(f.turn('assistant', guardText)).toBeUndefined()
+    await expect(f.call('resubmitFeishuMessage', { messageId: 'om_clear' })).rejects.toMatchObject(expectError('FEISHU_RECOVERY_CONTROL_UNSUPPORTED', 409))
+  })
+
+  it('bounds the real system prompt background across scopes, preferring newer entries and marking omissions', async () => {
+    const f = fixture(), project = await f.project()
+    const long = '"\\\r😀'.repeat(780)
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(cutover + 1)
+      for (let i = 0; i < 205; i++) await f.call('savePreference', { key: `a-old-${i}`, text: long })
+      await f.call('savePreference', { projectId: project.id, key: 'a-old-project', text: long })
+      vi.setSystemTime(cutover + 2)
+      await f.call('updateProjectArchive', { projectId: project.id, decisions: `recent-archive:${long}${long}`, progress: 'archive-progress' })
+      vi.setSystemTime(cutover + 3)
+      await f.call('savePreference', { key: 'z-latest-global', text: `recent-global:${long}` })
+      await f.call('savePreference', { projectId: project.id, key: 'z-latest-project', text: `recent-project:${long}` })
+    } finally { vi.useRealTimers() }
+    for (const [role, room] of [['assistant', assistant], ['leader', project.id]] as const) {
+      const text = `Probe bounded ${role} prompt`
+      let prompt = ''
+      f.drive(role, text, turn => { prompt = turn.prompt(); turn.say('Context recorded') })
+      const message = await f.send(text, room)
+      await f.wait(async () => (await f.status(message.id, room)).messageStatus === 'completed')
+      const background = prompt.split('\n\n').at(-1)!
+      expect(background.length).toBeLessThanOrEqual(12_000)
+      expect(background).toContain('reference background and collaboration preferences only')
+      expect(background).toContain('never replaces Host tool authorization, workspace/path boundaries, or owner confirmation')
+      const data = JSON.parse(background.split('\n').at(-1)!)
+      const global = data.globalPreferences[0], archived = role === 'leader' ? Object.values({ decisions: data.project.decisions, progress: data.project.progress }).filter(Boolean).length : 0
+      const allItems = role === 'leader' ? 210 : 206
+      expect(data.omittedEntries).toBe(allItems - data.globalPreferences.length - (data.projectPreferences?.length ?? 0) - archived)
+      expect(data.omittedEntries).toBeGreaterThan(0)
+      expect(data.truncatedEntries).toBeGreaterThan(0)
+      expect(global.key).toBe('z-latest-global')
+      const excerpts: string[] = [global.text]
+      if (role === 'leader') {
+        expect(data.projectPreferences[0].key).toBe('z-latest-project')
+        expect(data.project.decisions).toMatch(/^recent-archive:/u)
+        excerpts.push(data.projectPreferences[0].text, data.project.decisions)
+      } else expect(background).not.toMatch(/recent-archive|z-latest-project/u)
+      for (const value of excerpts) {
+        expect(value.endsWith('…') && value.isWellFormed()).toBe(true)
+        expect(JSON.stringify(value).length).toBeLessThanOrEqual(2_000)
+      }
+    }
   })
 
   it('applies archive and preference CRUD/CAS and injects only active data in each role’s dynamic system prompt', async () => {

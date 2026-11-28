@@ -1,5 +1,5 @@
 /** 解析已经由宿主认证的用户文字。这里不调用模型，也不能替用户补写决定或扩大动作范围。 */
-import type { StudioPending } from './protocol.ts'
+import { ASSISTANT_CONVERSATION, GUARD_PENDING_CHOICES, GUARD_PENDING_PREFIX, type StudioPending } from './protocol.ts'
 
 const end = /[。！!.\s]+$/u
 const key = (value: string): string => value.normalize('NFC').trim().replace(/\s+/gu, ' ').replace(end, '').toLowerCase()
@@ -89,4 +89,49 @@ export function readWorkQuery(raw: string): { kind: 'intake' | 'tasks' | 'task' 
   const task = /^(?:查询任务|任务状态|task status)\s+([\w-]{1,256})$/iu.exec(input)
   if (task?.[1]) return { kind: 'task', id: task[1] }
   if (/^(?:最近任务|查询近期任务|查看近期任务|recent tasks)$/iu.test(input)) return { kind: 'tasks' }
+}
+
+export const FEISHU_CHECK_COMMAND = '/studio-feishu-check'
+export function isFeishuCheck(raw: string): boolean {
+  const text = raw.trim()
+  return text === FEISHU_CHECK_COMMAND || (text.startsWith(FEISHU_CHECK_COMMAND) && /\s/u.test(text.charAt(FEISHU_CHECK_COMMAND.length)))
+}
+
+type GuardTextAction = typeof GUARD_PENDING_CHOICES[number]
+export type OwnerInput =
+  | { kind: 'feishu-check' | 'pending' | 'projects' | 'active-work' | 'confirmation-ack' | 'conversation' }
+  | { kind: 'work-query'; query: NonNullable<ReturnType<typeof readWorkQuery>> }
+  | { kind: 'confirmation-status'; target: string }
+  | { kind: 'task-stop'; taskId: string }
+  | { kind: 'guard-decision'; action?: GuardTextAction; id?: string }
+  | { kind: 'decision'; decision: TextDecision }
+  | { kind: 'unblock'; command: NonNullable<ReturnType<typeof readTaskUnblock>> }
+  | { kind: 'route-control'; command: TextRouteControl }
+
+/** 分类只读原文和已知卡片，不查找待办、不改变授权。实时消息按优先序处理；补交可拒绝所有潜在控制。 */
+export function classifyOwnerInput(raw: string, conversationId = ASSISTANT_CONVERSATION, direct?: Pick<StudioPending, 'id' | 'kind'>): OwnerInput {
+  const text = raw.trim()
+  if (isFeishuCheck(text)) return { kind: 'feishu-check' }
+  if (asksForPending.test(text)) return { kind: 'pending' }
+  if (conversationId === ASSISTANT_CONVERSATION && asksForProjects.test(text)) return { kind: 'projects' }
+  if (conversationId === ASSISTANT_CONVERSATION && asksForActiveWork.test(text)) return { kind: 'active-work' }
+  const work = readWorkQuery(text)
+  if (work) return { kind: 'work-query', query: work }
+  const status = confirmationStatusQuery(text)
+  if (status) return { kind: 'confirmation-status', target: status.target }
+  // 精确任务 ID 的停止优先于卡片决定；它绝不选择对话中的其他执行。
+  const route = readRouteControl(text)
+  const taskId = route?.target.replace(/^[#＃]/u, '')
+  if (route?.kind === 'stop' && taskId && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(taskId)) return { kind: 'task-stop', taskId }
+  const guard = /^(取消任务|仅解除等待(?:（不重放被拒动作）)?)(?:\s+[#＃]?(guard-intercept:[^\s]+))?$/u.exec(text.replace(/[。！!]+$/u, ''))
+  if (direct?.id.startsWith(GUARD_PENDING_PREFIX) || guard?.[2]) {
+    const [cancel, clear] = GUARD_PENDING_CHOICES
+    return { kind: 'guard-decision', ...(guard && { action: guard[1] === cancel ? cancel : clear, id: guard[2] }) }
+  }
+  const decision = readTextDecision(text)
+  if (decision) return { kind: 'decision', decision }
+  if (direct?.kind === 'confirmation' && /^(?:好|好的|可以|ok)[。！!\s]*$/iu.test(text)) return { kind: 'confirmation-ack' }
+  const unblocking = readTaskUnblock(text)
+  if (unblocking) return { kind: 'unblock', command: unblocking }
+  return route ? { kind: 'route-control', command: route } : { kind: 'conversation' }
 }

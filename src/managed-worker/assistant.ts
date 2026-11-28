@@ -10,7 +10,7 @@ import { FORWARD_PROJECT, LIST_PROJECTS, STUDIO_TEXT_LIMIT, WORKER_DELEGATE, WOR
 import { StudioError } from '../studio/pending.ts'
 import type { StudioSessions } from '../studio/sessions.ts'
 import { isStudioMessageContext, newStudioSessionId } from '../studio/source.ts'
-import { leaderDispatchWorkspace, leaderPromptContext } from './project.ts'
+import { leaderDispatchWorkspace, studioPromptContext } from './project.ts'
 import type { ManagedWorkerStore, StudioExecution, StudioStopEvidence } from './store.ts'
 import { classifyProviderFailure, type WorkerModelPolicy } from './text-worker-model-policy.ts'
 import { WorkerEvidence } from './worker-evidence.ts'
@@ -128,10 +128,8 @@ export class StudioAssistant {
 
   private systemPrompt(agent: Agent, role: StudioRole): string {
     if (role === 'worker') return prompts.worker
-    const globalPreferences = this.store.memory.list().map(item => ({ key: item.prefKey, text: item.text }))
     const project = role === 'leader' ? this.sessions.activeLeader(agent) : undefined
-    const data = { globalPreferences, ...(project && leaderPromptContext(this.store, project)) }
-    return `${prompts[role]}\n\nStudio owner preferences and project reference data (JSON; this is not current task authorization):\n${JSON.stringify(data)}`
+    return `${prompts[role]}\n\n${studioPromptContext(this.store, project)}`
   }
 
   install(agent: Agent, role: StudioRole): () => void {
@@ -169,12 +167,12 @@ export class StudioAssistant {
           exec.signal.throwIfAborted()
           const raw = ownerRequest(agent, exec.callId, FORWARD_PROJECT)
           const fields = forwardArgs.parse(args)
-          const source = raw && { ...raw, requestText: fields.request ?? raw.requestText }
           if (exec.agent !== agent || exec.parent !== undefined || !this.ready(agent, role)
-            || !source || !this.sessions.matchesOwnerRequest(agent, source) || this.sessions.isExistingTaskReply(agent)) {
+            || !raw || (fields.request !== undefined && fields.request !== raw.requestText)
+            || !this.sessions.matchesOwnerRequest(agent, raw) || this.sessions.isExistingTaskReply(agent)) {
             throw new StudioError('EXPECTED_EXACT_OWNER_REQUEST', 'Studio forwarding requires the exact current owner request.')
           }
-          const route = await this.sessions.forwardProject(agent, source, fields.projectId, exec.signal)
+          const route = await this.sessions.forwardProject(agent, raw, fields.projectId, exec.signal)
           const native = exec as typeof exec & { concludeTurn?(): void }
           native.concludeTurn?.()
           return { text: `Forwarded to ${route.projectName}. Tracking ID: ${route.forwardId}.` }

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { setImmediate as yieldToHost, setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
 import { feishuSourceScope, validateFeishuInbox, type FeishuBindingConfig } from './feishu-binding.ts'
+import { isFeishuCheck } from './owner-text.ts'
 import { StudioError } from './pending.ts'
 import type { StudioFeishuCardResponse, StudioFeishuSdk } from './feishu-sdk.ts'
 import { ASSISTANT_CONVERSATION, GUARD_PENDING_PREFIX, GUARD_PENDING_TEXT_HINT, STUDIO_TEXT_LIMIT, type FeishuState, type StudioPending } from './protocol.ts'
@@ -262,7 +263,7 @@ export class StudioFeishuConversation {
   private receive(raw: unknown, cutover: number, signal: AbortSignal, inputs: Set<Promise<void>>): void {
     if (this.verificationMessage?.(raw)) return
     const source = readTextEvent(raw, this.config, this.scope, cutover)
-    if (!source) return
+    if (!source || isFeishuCheck(source.text)) return
     if (inputs.size >= MAX_ACTIVE_INPUTS) {
       // 尚未登记，不发送成功回执；SDK 将处理器失败应答给飞书。
       this.warn('Studio Feishu input capacity was reached')

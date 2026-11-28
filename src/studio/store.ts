@@ -585,11 +585,11 @@ export class StudioStore {
     // 项目原对话不镜像；只有宿主生成的执行收据可以独立投递，不猜测原消息在飞书的坐标。
     if (!delivery?.skipFeishu && binding && createdAt >= binding.cutover) {
       if (!delivery?.forwardOrigin) this.enqueue(binding.generation, 'message', id, null, assistant ? request.id : undefined)
-      // 原飞书消息只允许回到同一绑定代；Web 原入口未镜像到本代时，用已绑定私聊的主聊天。
+      // 转发回执随原请求的飞书坐标投递；Web 原请求没有本代出箱锚点时，只留在 Web。
       else if (request.channel === 'gui') {
-        const sent = this.db.prepare('SELECT 1 FROM agent_studio_feishu_outbox WHERE generation = ? AND message_id = ?')
+        const anchor = this.db.prepare("SELECT 1 FROM agent_studio_feishu_outbox WHERE generation = ? AND kind = 'message' AND message_id = ?")
           .get(binding.generation, request.id)
-        this.enqueue(binding.generation, 'message', id, null, sent ? request.id : undefined)
+        if (anchor) this.enqueue(binding.generation, 'message', id, null, request.id)
       } else if (request.feishu_generation === binding.generation) this.enqueue(binding.generation, 'message', id, null, request.id)
     }
     return decodeMessage(this.messageRow(id)!)

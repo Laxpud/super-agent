@@ -3,7 +3,7 @@ import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, rea
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { randomUUID } from 'node:crypto'
-import type { ManagedWorkerStore } from '../managed-worker/store.ts'
+import { validateStudioCopy, type ManagedWorkerStore } from '../managed-worker/store.ts'
 import { StudioError } from './pending.ts'
 import type { DirectoryMode } from './settings-protocol.ts'
 
@@ -67,7 +67,7 @@ export class StudioDirectorySwitch {
     if (this.mode === 'copy') {
       await store.copySettingsState(database)
       using copy = new DatabaseSync(database, { readOnly: true })
-      if (copy.prepare('PRAGMA quick_check').all().some(row => row.quick_check !== 'ok')) throw new Error('Studio database copy did not pass integrity checking')
+      validateStudioCopy(copy)
     }
     syncPath(database)
     // Publish the preparation receipt last. A failed copy remains untouched at its new path for diagnosis.

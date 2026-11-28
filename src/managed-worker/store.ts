@@ -73,7 +73,8 @@ const V1_TABLES = [
   'agent_studio_session', 'agent_studio_pending', 'agent_studio_feishu_binding', 'agent_studio_feishu_outbox',
 ] as const
 
-const V2_TABLES = ['studio_project_forward', 'studio_project_forward_notice'] as const
+const V2_TABLES = [...V1_TABLES, 'studio_project_forward', 'studio_project_forward_notice'] as const
+const CURRENT_STUDIO_VERSION = 2
 
 const MIGRATED_AT = new Date(0).toISOString()
 export const studioNow = () => new Date().toISOString()
@@ -281,7 +282,7 @@ function migrateV1(db: DatabaseSync): void {
         BEGIN SELECT RAISE(ABORT, 'Legacy Studio snapshot is read-only'); END`)
     }
   }
-  validateForeignKeys(db, V1_TABLES, 1)
+  validateForeignKeys(db, V1_TABLES, 'Studio V1 migration')
 }
 
 /** V0 和 V1 共用同一次提交；只校验现役图，旧快照允许保留已知的不完整外键。 */
@@ -292,14 +293,22 @@ function migrateV2(db: DatabaseSync): void {
     SELECT coalesce(m.source_session_id, m.run_session_id) FROM agent_studio_message m
     WHERE m.id = substr(t.source_message_id, ?) AND m.role = 'user' AND m.conversation_id = coalesce(t.project_id, 'assistant'))
     WHERE substr(t.source_message_id, 1, ?) = ?`).run(STUDIO_OWNER_PREFIX.length + 1, STUDIO_OWNER_PREFIX.length, STUDIO_OWNER_PREFIX)
-  validateForeignKeys(db, [...V1_TABLES, ...V2_TABLES], 2)
+  validateForeignKeys(db, V2_TABLES, 'Studio V2 migration')
   db.exec('PRAGMA user_version=2')
 }
 
-function validateForeignKeys(db: DatabaseSync, tables: readonly string[], version: number): void {
+function validateForeignKeys(db: DatabaseSync, tables: readonly string[], subject: string): void {
   for (const table of tables) {
-    if (db.prepare(`PRAGMA foreign_key_check(${quote(table)})`).get()) throw new Error(`Studio V${version} migration failed foreign key validation: ${table}`)
+    if (db.prepare(`PRAGMA foreign_key_check(${quote(table)})`).get()) throw new Error(`${subject} failed foreign key validation: ${table}`)
   }
+}
+
+/** 目录副本必须是当前版本且现役表外键完整；迁移保留的只读旧表不属于现役关系图。 */
+export function validateStudioCopy(db: DatabaseSync): void {
+  if (db.prepare('PRAGMA quick_check').all().some(row => row.quick_check !== 'ok')) throw new Error('Studio database copy did not pass integrity checking')
+  const version = db.prepare('PRAGMA user_version').get()?.user_version
+  if (version !== CURRENT_STUDIO_VERSION) throw new Error(`Unsupported Studio database copy user_version: ${String(version)}`)
+  validateForeignKeys(db, V2_TABLES, 'Studio database copy')
 }
 
 function privateFile(path: string, create: boolean): void {
@@ -359,7 +368,7 @@ export class ManagedWorkerStore {
       // 未知版本在写入数据库前即拒绝；锁内再检查一次，避免并发打开重复执行迁移。
       const checkVersion = () => {
         const version = db.prepare('PRAGMA user_version').get()?.user_version
-        if (version !== 0 && version !== 1 && version !== 2) throw new Error(`Unsupported Studio SQLite user_version: ${String(version)}`)
+        if (version !== 0 && version !== 1 && version !== CURRENT_STUDIO_VERSION) throw new Error(`Unsupported Studio SQLite user_version: ${String(version)}`)
         return version
       }
       checkVersion()
