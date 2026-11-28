@@ -409,7 +409,6 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/managed-worker/preference-correction-store.ts` | Journals one correction for an exact active revision and run; binds the terminal decision to the matching new revision in the same transaction |
 | `src/managed-worker/preference-scope-change-intent.ts` | Recognizes a standalone restriction or forget request with exact preference and project identifiers |
 | `src/managed-worker/preference-scope-change-store.ts` | Stores one-use scope decisions without preference text and binds confirmation to its exact journal transition |
-| `src/managed-worker/feishu-sdk.ts` | Connects one Feishu application through the official Node SDK, verifies the bot, and validates outbound receipts without logging credentials or payloads |
 | `src/managed-worker/feishu-inbox.ts` | Routes the configured owner's private-chat events from the SDK to existing text, review or continuation paths, and sends best-effort plain-text receipts |
 | `src/managed-worker/feishu-text.ts` | Routes explicit single-message text commands to a restricted Worker or exact result retrieval without rerunning completed work |
 | `src/managed-worker/feishu-draft-store.ts` | Preserves Feishu input, task and Worker identities, and result provenance; deduplicates deliveries under the shared SQLite run fence |
@@ -468,6 +467,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/studio/service.ts` | Joins Web and Feishu intake to one conversation, task and pending-item API |
 | `src/studio/http.ts` | Browser-owner-authenticated Studio operations with validated input and bounded responses |
 | `src/studio/feishu.ts` | Maintains one verified private-chat connection and mirrors visible text, topic replies and exact pending-card states |
+| `src/studio/feishu-binding.ts` | Defines and validates the bot and owner private-chat binding and preserves the serialized scope used by existing SQLite records |
+| `src/studio/feishu-sdk.ts` | Connects one Feishu application through the official Node SDK, verifies the bot, and validates outbound receipts without logging credentials or payloads |
 | `src/studio/settings-protocol.ts`, `settings-schema.ts` | Defines the full owner settings view and validates versioned changes and private-chat verification requests |
 | `src/studio/configuration.ts` | Checks effective revisions and runtime constraints, then applies Studio settings through the DSH profile configuration editor |
 | `src/studio/feishu-setup.ts` | Confirms the bot and private chat using an expiring owner challenge without dispatching or recording it in the conversation |

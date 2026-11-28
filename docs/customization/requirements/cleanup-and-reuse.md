@@ -19,7 +19,7 @@
 | 模块 | 当前价值 | V1 演进方向 |
 | --- | --- | --- |
 | `src/studio/service.ts`、`sessions.ts`、`http.ts`、`protocol.ts`、`store.ts`、`domain.ts`、`pending.ts`、`models.ts` | 统一入口、隐式 Session 封装、并发对话、待办状态与 HTTP API 骨架。 | 补齐**统一任务账本**、**项目生命周期（目标/工作区/归档）**与**飞书指名项目路由**；松绑 Assistant 简单问题直接回复；收缩 `service.ts` / `owner-text.ts` 中过度堆叠的正则控制分支。 |
-| `src/studio/feishu.ts`、`feishu-setup.ts` + `src/managed-worker/feishu-sdk.ts` | 官方 `@larksuiteoapi/node-sdk` 长连接、私聊白名单验证、跨端消息/话题/卡片同步。 | 将 `feishu-sdk.ts` 收拢进 `src/studio/`；强化飞书消息受理状态回执与指名项目交办，彻底删除另外两套旧版互斥飞书收件箱。 |
+| `src/studio/feishu.ts`、`feishu-setup.ts`、`feishu-sdk.ts`、`feishu-binding.ts` | 官方 `@larksuiteoapi/node-sdk` 长连接、私聊白名单验证、跨端消息/话题/卡片同步。 | 强化飞书消息受理状态回执与指名项目交办，彻底删除另外两套旧版互斥飞书收件箱。 |
 | `src/studio/configuration.ts`、`settings-credentials.ts`、`settings-directory.ts`、`settings-protocol.ts`、`settings-schema.ts` | Web 化 Studio 设置、DSH 凭据存储、数据目录安全切换。 | 精简配置 schema，移除旧版文档/旧飞书/Watchdog/systemd 等 V1 废弃开关，新增本地执行默认策略与自举更新相关配置。 |
 | `src/studio-web/*` | 独立左侧栏入口、Assistant/项目对话、引用与话题、待我处理、只读会话记录、Studio 设置与飞书引导。 | 保留整体界面骨架，补齐**任务列表与详情面板**、**项目创建/编辑/工作区绑定/归档**、**自举更新触发与状态展示**；清理设置页中的废弃分类。 |
 

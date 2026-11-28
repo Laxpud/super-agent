@@ -2,8 +2,8 @@
 import { createHash } from 'node:crypto'
 import { setImmediate as yieldToHost, setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
-import { feishuSourceScope, validateFeishuInbox, type FeishuInboxConfig } from '../managed-worker/feishu-inbox.ts'
-import type { StudioFeishuCardResponse, StudioFeishuSdk } from '../managed-worker/feishu-sdk.ts'
+import { feishuSourceScope, validateFeishuInbox, type FeishuBindingConfig } from './feishu-binding.ts'
+import type { StudioFeishuCardResponse, StudioFeishuSdk } from './feishu-sdk.ts'
 import { ASSISTANT_CONVERSATION, STUDIO_TEXT_LIMIT, type FeishuState, type StudioPending } from './protocol.ts'
 import type { StudioFeishuDelivery, StudioFeishuInput } from './store.ts'
 export type { StudioFeishuDelivery, StudioFeishuInput } from './store.ts'
@@ -56,7 +56,7 @@ export interface StudioFeishuPort {
 }
 
 /** 保留原始纯文本，独立保存坐标；不尝试把无效回复重新解释为主时间线消息。 */
-function readTextEvent(raw: unknown, config: FeishuInboxConfig, scope: string, cutover: number): StudioFeishuInput | undefined {
+function readTextEvent(raw: unknown, config: FeishuBindingConfig, scope: string, cutover: number): StudioFeishuInput | undefined {
   const event = textEvent.safeParse(raw)
   if (!event.success) return
   const { app_id, sender, message } = event.data
@@ -142,12 +142,12 @@ function confirmationText(item: StudioPending): string {
 /** 为一个已配置的所有者私聊管理长连接；输入和投递结果均由宿主账本登记。 */
 export class StudioFeishuConversation {
   readonly scope: string
-  private readonly config: FeishuInboxConfig
+  private readonly config: FeishuBindingConfig
   private status: FeishuState = 'connecting'
   private running = false
   private wakeDelivery: (() => void) | undefined
 
-  constructor(private readonly sdk: StudioFeishuSdk, config: FeishuInboxConfig, private readonly port: StudioFeishuPort,
+  constructor(private readonly sdk: StudioFeishuSdk, config: FeishuBindingConfig, private readonly port: StudioFeishuPort,
     private readonly ready: () => boolean, private readonly warn: (message: string) => void,
     private readonly verificationMessage?: (value: unknown) => boolean) {
     validateFeishuInbox(config)

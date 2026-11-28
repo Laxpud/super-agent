@@ -4,15 +4,15 @@ import { setTimeout as delay } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import s from '@deepseek-ai/schemastery'
 import { z } from 'zod'
+import { feishuBindingFields, feishuBindingPatterns, feishuSourceScope, type FeishuInboxConfig } from '../studio/feishu-binding.ts'
+import type { StudioFeishuSdk } from '../studio/feishu-sdk.ts'
 import type { FeishuState } from '../studio/protocol.ts'
 import { documentContinuationIntent, type DocumentContinuationIntent } from './document-continuation-intent.ts'
-import type { StudioFeishuSdk } from './feishu-sdk.ts'
 import { feishuTextCommand, type FeishuTextRoute, type StudioFeishuText } from './feishu-text.ts'
 import type { ManagedResult, ManagedTask, ManagedWorkerStore, StudioFeishuInstruction } from './store.ts'
+export { FeishuConversationConfig as FeishuDocumentInboxConfig, feishuSourceScope, validateFeishuInbox, type FeishuInboxConfig } from '../studio/feishu-binding.ts'
 
-const appId = /^cli_[a-fA-F0-9]{16}$/
-const openId = /^ou_[a-zA-Z0-9]+$/
-const chatId = /^oc_[a-zA-Z0-9]+$/
+const { appId, openId, chatId } = feishuBindingPatterns
 const messageId = /^om_[a-zA-Z0-9_-]+$/
 const threadId = /^omt?_[a-zA-Z0-9_-]+$/
 const MAX_TEXT = 32_000
@@ -47,40 +47,14 @@ export interface StudioFeishuNoticeDestination {
   send(text: string, key: string): Promise<string | undefined>
 }
 
-export interface FeishuInboxConfig {
-  appId: string
-  botOpenId: string
-  ownerOpenId: string
-  chatId: string
-}
-
-const inboxFields = {
-  appId: s.string().pattern(appId).required().description('Feishu self-built application ID; provide its App Secret in STUDIO_FEISHU_APP_SECRET at startup.'),
-  botOpenId: s.string().pattern(openId).required(),
-  ownerOpenId: s.string().pattern(openId).required(),
-  chatId: s.string().pattern(chatId).required(),
-}
-export const FeishuDocumentInboxConfig: s<FeishuInboxConfig> = s.object(inboxFields)
 export const FeishuTextInboxConfig: s<FeishuInboxConfig & FeishuTextRoute & { documentCorrections: boolean }> = s.object({
-  ...inboxFields,
+  ...feishuBindingFields,
   cwd: s.string().required(),
   provider: s.string().required(),
   model: s.string().required(),
   reasoningEffort: s.string().default(''),
   documentCorrections: s.boolean().default(false).description('Also route ordinary messages to the one explicitly linked document task for review.'),
 })
-
-export function feishuSourceScope(config: FeishuInboxConfig): string {
-  return JSON.stringify(['feishu', config.appId, config.botOpenId, config.chatId, config.ownerOpenId])
-}
-
-/** Fail before opening the Studio database if this optional transport is misconfigured. */
-export function validateFeishuInbox(config: FeishuInboxConfig): void {
-  if (!appId.test(config.appId) || !openId.test(config.botOpenId) || !openId.test(config.ownerOpenId)
-    || !chatId.test(config.chatId) || config.botOpenId === config.ownerOpenId) {
-    throw new Error('Studio Feishu requires an exact application, separate bot and owner identities, and a private chat ID')
-  }
-}
 
 /** Own the private bot listener and its limited best-effort receipts, without starting the GitHub-backed Runtime. */
 export class StudioFeishuInbox {

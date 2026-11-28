@@ -1,7 +1,7 @@
 /** Verify a bot and one exact private chat without adding test messages to history, dispatching or posting a reply. */
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
-import { StudioFeishuSdk } from '../managed-worker/feishu-sdk.ts'
+import { StudioFeishuSdk } from './feishu-sdk.ts'
 import { StudioError } from './pending.ts'
 import { sameBinding, type FeishuBinding, type FeishuCheck, type FeishuCheckResult } from './settings-protocol.ts'
 

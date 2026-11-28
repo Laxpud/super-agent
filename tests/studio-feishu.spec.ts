@@ -1,7 +1,7 @@
 import type { EventDispatcher } from '@larksuiteoapi/node-sdk'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { feishuSourceScope, type FeishuInboxConfig } from '../src/managed-worker/feishu-inbox.ts'
-import { StudioFeishuSdk } from '../src/managed-worker/feishu-sdk.ts'
+import { feishuSourceScope, type FeishuBindingConfig } from '../src/studio/feishu-binding.ts'
+import { StudioFeishuSdk } from '../src/studio/feishu-sdk.ts'
 import { StudioFeishuConversation, type StudioFeishuDelivery, type StudioFeishuPort } from '../src/studio/feishu.ts'
 import { ASSISTANT_CONVERSATION, type StudioPending } from '../src/studio/protocol.ts'
 
@@ -12,6 +12,7 @@ const network = vi.hoisted(() => ({ request: vi.fn<(config: HttpRequest) => unkn
 // 只替换网络边界。实际 SDK 仍负责 V2 分发、token 请求、路径和请求体序列化。
 vi.mock('@larksuiteoapi/node-sdk', async importOriginal => {
   const sdk = await importOriginal<typeof import('@larksuiteoapi/node-sdk')>()
+  /** 让测试显式控制长连接的建立与断开，同时保留 SDK 的事件分发器。 */
   class MockWSClient {
     private connected = false
     constructor(private readonly options: ConstructorParameters<typeof sdk.WSClient>[0]) {}
@@ -30,7 +31,7 @@ vi.mock('@larksuiteoapi/node-sdk', async importOriginal => {
   } }
 })
 
-const binding: FeishuInboxConfig = { appId: 'cli_0123456789abcdef', botOpenId: 'ou_robot', ownerOpenId: 'ou_owner', chatId: 'oc_private' }
+const binding: FeishuBindingConfig = { appId: 'cli_0123456789abcdef', botOpenId: 'ou_robot', ownerOpenId: 'ou_owner', chatId: 'oc_private' }
 const scope = feishuSourceScope(binding)
 const cutover = 1_790_000_000_000
 const receipt = (messageId: string, chatId = binding.chatId) => ({ code: 0, data: { message_id: messageId, chat_id: chatId } })

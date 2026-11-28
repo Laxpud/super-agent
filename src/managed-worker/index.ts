@@ -12,6 +12,8 @@ import { z } from 'zod'
 import { AgentDelivery } from '../app/delivery.ts'
 import { currentPresetId } from '../infra/preset-names.ts'
 import { StudioConfigurationControl } from '../studio/configuration.ts'
+import { FeishuConversationConfig, feishuSourceScope, validateFeishuInbox } from '../studio/feishu-binding.ts'
+import { StudioFeishuSdk } from '../studio/feishu-sdk.ts'
 import { StudioFeishuConversation } from '../studio/feishu.ts'
 import { StudioFeishuSetup } from '../studio/feishu-setup.ts'
 import { registerStudioHttp } from '../studio/http.ts'
@@ -34,8 +36,7 @@ import { DOCUMENT_WRITE_TOOL as TOOL, GUARD_REVIEW_HINT, documentGuardReviewComm
 import type { DocumentGuardCapture } from './document-guard-store.ts'
 import { DOCUMENT_GUARD_HINT, documentGuardCommand, documentGuardFeedback } from './document-guard.ts'
 import { StudioDocumentRecovery } from './document-recovery.ts'
-import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox, feishuSourceScope, validateFeishuInbox } from './feishu-inbox.ts'
-import { StudioFeishuSdk } from './feishu-sdk.ts'
+import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox } from './feishu-inbox.ts'
 import { StudioFeishuText, feishuDraftOutput, feishuDraftsCommand, validateFeishuTextRoute } from './feishu-text.ts'
 import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
 import { MEMORY_COMMAND, MEMORY_HINT, memoryCommand } from './memory.ts'
@@ -67,7 +68,7 @@ export const Config = s.object({
   studioCwd: s.string().default('').description('Workspace directory for new Assistant Sessions; defaults to the Host working directory.'),
   assistantModel: s.union([s.const(null), StudioRoleModel]).default(null).description('Initial Assistant model selection for Agent Studio.'),
   leaderModel: s.union([s.const(null), StudioRoleModel]).default(null).description('Initial Leader model selection for Agent Studio.'),
-  feishuConversation: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
+  feishuConversation: s.union([s.const(null), FeishuConversationConfig]).default(null)
     .description('Bind the unified Assistant conversation to an exact Feishu bot and owner private chat. Mutually exclusive with legacy inboxes.'),
   guiDocumentInbox: s.boolean().default(false).description('Hold pending document writes for owner review when a new chat message arrives in the bound document Worker.'),
   documentContinuations: s.boolean().default(false)
