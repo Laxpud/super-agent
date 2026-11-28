@@ -43,6 +43,7 @@ const calls = []
 const workspacePlans = new Map()
 const workspaceReadbacks = new Map()
 const nativeResults = new Map()
+const phase3Plans = new Map()
 let runtime
 let origin
 let cookie
@@ -157,15 +158,32 @@ try {
       const texts = options.messages.filter(message => message.role === 'user').flatMap(contentText)
       const contextText = options.messages.flatMap(contentText).join('\n')
       const tools = options.tools?.map(tool => tool.name) ?? []
-      calls.push({ model: options.model, reasoningEffort: options.reasoningEffort, texts, contextText, tools })
+      const system = options.system ?? options.messages.filter(message => message.role === 'system').flatMap(contentText).join('\n')
+      calls.push({ model: options.model, reasoningEffort: options.reasoningEffort, texts, contextText, tools, system })
       const newest = texts.findLast(text => plans.some(plan => plan.intent === text) || plannedMessages.includes(text)
         || text === greeting || text === taskRequest || text === readRequest)
       const proposal = plans.find(plan => plan.intent === newest)
       const local = options.messages.filter(message => message.role === 'user').findLast(message =>
         contentText(message).some(text => workspacePlans.has(text)))
       const localPlan = local && workspacePlans.get(contentText(local)[0])
+      const phase3Input = options.messages.filter(message => message.role === 'user').findLast(message =>
+        contentText(message).some(text => phase3Plans.has(text)))
+      const phase3 = phase3Input && phase3Plans.get(contentText(phase3Input)[0])
       let block
-      if (localPlan) {
+      if (phase3) {
+        const role = phase3Input.source?.kind === 'agent-studio' ? 'worker' : options.model === leaderModel ? 'leader' : 'assistant'
+        const steps = phase3[role] ?? []
+        const stem = `offline-phase3-${phase3.id}-${role}-`
+        const done = options.messages.flatMap(message => message.content).filter(item => item.type === 'tool-call' && item.id.startsWith(stem)).length
+        if (done < steps.length) {
+          const [name, args] = steps[done]
+          assert.ok(tools.includes(name), `The native ${role} exposes ${name}`)
+          block = { type: 'tool-call', id: `${stem}${done}`, name, arguments: JSON.stringify(args) }
+        } else {
+          assert.ok(phase3.result?.[role], `Unexpected ${role} call for ${phase3.id}`)
+          block = textBlock(phase3.result[role])
+        }
+      } else if (localPlan) {
         const isWorker = local.source?.kind === 'agent-studio'
         if (isWorker && localPlan.readOnly) assert.ok(!tools.includes('bash') && !tools.includes('pwsh'), 'Read-only Workers expose no shell')
         const steps = isWorker ? localPlan.worker : localPlan.frontend
@@ -448,7 +466,11 @@ try {
   const allowWrite = async (room, request, input, path) => {
     const pending = await pendingFor(input.id, item => item.options.includes('允许本任务写入'))
     assert.ok(pending.detail.includes(path) && pending.detail.includes(request))
-    assert.equal(await canonicalTask(room, request), undefined, 'Project binding is not a grant; no task before owner confirmation')
+    // 阶段 3 先登记待批准任务；项目绑定仍不是执行授权。
+    const waiting = await canonicalTask(room, request)
+    assert.equal(waiting?.taskId, pending.taskId)
+    assert.equal(waiting?.status, 'waiting_approval')
+    assert.equal(waiting?.workerSessionId ?? null, null, 'Project binding must not start a Worker before owner confirmation')
     assert.equal((await post('answer', { id: pending.id, value: '允许本任务写入' })).answeredBy, 'gui')
   }
 
@@ -589,7 +611,8 @@ else console.log('fixture assertion passed')
     const intercepted = await findTask(project.id, request, 'waiting_approval')
     const block = await pendingFor(input.id, item => item.id.startsWith('guard-intercept:'))
     assert.equal(block.taskId, intercepted.taskId)
-    assert.equal(intercepted.authorizationVersion, 2)
+    // 写入确认本身先推进授权版本，随后守卫撤权再推进一次。
+    assert.equal(intercepted.authorizationVersion, permission === 'workspace-write' ? 3 : 2)
     assert.ok(block.title.includes(code) && !block.detail.includes(outsidePath) && !block.detail.includes('git push'))
     const callId = `offline-local-denied-${id}-worker-0`
     const denied = await until('native guard result', () => nativeResults.get(callId))
@@ -631,6 +654,101 @@ else console.log('fixture assertion passed')
   assert.equal(driftDenial.error?.info?.code, 'STUDIO_SANDBOX_MISMATCH')
   assert.ok(!dispatched.has(driftCall))
   process.stdout.write('OK native symlink traversal, Git commands, deletion and Session directory drift denied; stale execution rejected without replay\n')
+
+  const simpleQuestion = 'Offline Phase 3: what is 2 + 2?'
+  const simpleAnswer = 'The answer is 4.'
+  const beforeSimple = await post('tasks', {})
+  const callOffset = calls.length
+  phase3Plans.set(simpleQuestion, { id: 'simple', result: { assistant: simpleAnswer } })
+  const simple = await completed((await invoke('smoke-phase3-simple', simpleQuestion)).id)
+  const simpleStatus = await post('messageStatus', { conversationId, id: simple.id })
+  assert.deepEqual(simpleStatus, { accepted: true, messageId: simple.id, messageStatus: 'completed', forward: null, tasks: [] })
+  assert.deepEqual(await post('tasks', {}), beforeSimple)
+  assert.deepEqual(calls.slice(callOffset).map(call => call.model), [assistantModel])
+  const responses = async id => (await post('timeline', { conversationId })).items.filter(item => item.replyTo === id)
+  assert.deepEqual((await responses(simple.id)).map(item => item.text), [simpleAnswer])
+
+  const forwardPlans = [
+    ['answer', `Ask the existing project ${alpha.name} to confirm its online fixture status.`, 'Offline Alpha Leader has confirmed the project status.'],
+    ['task', `Assign the existing project ${alpha.name} this work: produce a one-line offline delivery.`, 'Offline Alpha Worker delivered the requested line.'],
+  ]
+  for (const [kind, request, result] of forwardPlans) {
+    const delegated = kind === 'task'
+    phase3Plans.set(request, { id: `forward-${kind}`, assistant: [['studio_list_projects', {}],
+      ['studio_forward_to_project', { projectId: alpha.id, request }]],
+    ...(delegated && { leader: [['studio_delegate_task', { request }]] }), result: { [delegated ? 'worker' : 'leader']: result } })
+    const key = `smoke-phase3-forward-${kind}`
+    const input = await completed((await invoke(key, request)).id)
+    const status = await until(`forwarded ${kind} delivery`, async () => {
+      const value = await post('messageStatus', { conversationId, id: input.id })
+      assert.ok(!['failed', 'interrupted'].includes(value.forward?.status), JSON.stringify(value))
+      return value.forward?.status === 'delivered' ? value : undefined
+    })
+    assert.equal(status.accepted, true)
+    assert.equal(status.messageStatus, 'completed')
+    assert.equal(status.forward.projectId, alpha.id)
+    assert.equal(status.forward.projectName, alpha.name)
+    assert.equal(status.tasks.length, delegated ? 1 : 0)
+    if (delegated) {
+      assert.equal(status.tasks[0].status, 'delivered')
+      assert.equal(status.tasks[0].sourceMessageId, `agent-studio-owner:${status.forward.projectMessageId}`)
+      assert.ok(status.tasks[0].resultSummary.includes(result))
+    }
+    const destination = await completed(status.forward.projectMessageId, alpha.id)
+    assert.equal(destination.source.sessionId, alpha.leaderId)
+    assert.equal(destination.text, request)
+    assert.equal((await invoke(key, request)).id, input.id)
+    const outputs = (await responses(input.id)).map(item => item.text)
+    assert.equal(outputs.length, 2, 'The original entry only sees acceptance and final delivery')
+    assert.ok(outputs[0].includes(status.forward.forwardId))
+    assert.ok(outputs[1].includes(result))
+  }
+  process.stdout.write('OK Assistant direct answer without Worker; named-project handoff, Leader reply and Worker delivery returned once\n')
+
+  const managed = await post('createProject', { name: 'Offline Phase 3 lifecycle', objective: 'Verify owner data inheritance' })
+  const coord = expectedEpoch => ({ projectId: managed.id, expectedEpoch })
+  const lifecycleRecord = async () => (await post('records', {})).items.find(item => item.conversationId === managed.id && item.role === 'leader')
+  const firstLeader = await lifecycleRecord()
+  assert.ok(firstLeader)
+  const archive = { projectId: managed.id, decisions: 'phase3-keep-decisions', progress: 'phase3-keep-progress', openIssues: 'phase3-keep-issues' }
+  const savedArchive = await post('updateProjectArchive', archive)
+  assert.ok(savedArchive.updatedAt)
+  async function preference(key, text, projectId) {
+    return post('savePreference', { key, text, ...(projectId && { projectId }) })
+  }
+  await preference('phase3-global', 'phase3-keep-global')
+  await preference('phase3-project', 'phase3-keep-own-preference', managed.id)
+  await preference('phase3-other', 'phase3-hide-other-preference', beta.id)
+  await post('updateProjectArchive', { projectId: beta.id, decisions: 'phase3-hide-other-archive' })
+  const forgotten = await preference('phase3-forgotten', 'phase3-hide-forgotten-value', managed.id)
+  assert.equal((await post('forgetPreference', { projectId: managed.id, key: forgotten.key, expectedVersion: forgotten.version })).text, '')
+  const replaced = await post('replaceProjectLeader', coord(managed.managementEpoch))
+  assert.equal(replaced.managementEpoch, managed.managementEpoch + 1)
+  const inheritedRequest = 'Offline Phase 3: verify this project reference data after lifecycle changes.'
+  phase3Plans.set(inheritedRequest, { id: 'inherit', result: { leader: 'Offline lifecycle Leader answered.' } })
+  const inherited = await completed((await invoke('smoke-phase3-inherit', inheritedRequest, managed.id)).id, managed.id)
+  assert.notEqual(inherited.source.sessionId, firstLeader.id)
+  const leaderCall = calls.findLast(call => call.model === leaderModel && call.texts.includes(inheritedRequest))
+  assert.ok(leaderCall)
+  const reference = JSON.parse(leaderCall.system.split('Studio owner preferences and project reference data (JSON; this is not current task authorization):\n').at(-1))
+  assert.deepEqual(reference, { globalPreferences: [{ key: 'phase3-global', text: 'phase3-keep-global' }],
+    project: { name: managed.name, objective: managed.objective, workspacePath: null, decisions: archive.decisions, progress: archive.progress, openIssues: archive.openIssues },
+    projectPreferences: [{ key: 'phase3-project', text: 'phase3-keep-own-preference' }] })
+  for (const forbidden of ['phase3-hide-other-preference', 'phase3-hide-other-archive', 'phase3-hide-forgotten-value', 'phase3-forgotten']) {
+    assert.ok(!leaderCall.system.includes(forbidden))
+  }
+  const archived = await post('archiveProject', coord(replaced.managementEpoch))
+  assert.equal(archived.state, 'archived')
+  assert.equal((await post('send', { conversationId: managed.id, requestId: 'smoke-phase3-refused', text: inheritedRequest },
+    { expected: 409 })).code, 'PROJECT_ARCHIVED')
+  assert.equal((await post('projectArchive', { projectId: managed.id })).readonly, true)
+  const reopened = await post('reopenProject', coord(archived.managementEpoch))
+  assert.equal(reopened.state, 'active')
+  assert.equal(reopened.managementEpoch, archived.managementEpoch + 1)
+  assert.deepEqual(await post('projectArchive', { projectId: managed.id }), savedArchive)
+  const restored = await completed((await invoke('smoke-phase3-reopened', inheritedRequest, managed.id)).id, managed.id)
+  assert.notEqual(restored.source.sessionId, inherited.source.sessionId)
+  process.stdout.write('OK real HTTP project lifecycle, new Leader inherited scoped archive/preferences without leaks, archive rejected send and reopen restored it\n')
 } catch (error) {
   // 诊断只打印断言和测试阶段，不由运行时转储请求、认证数据或环境。
   console.error(error instanceof Error ? error.stack?.split('\n').slice(0, 9).join('\n') : 'Studio smoke failed')

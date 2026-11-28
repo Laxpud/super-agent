@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, expect, it, vi } from 'vitest'
 import { DRAFT_DELEGATE, DRAFT_READ, STUDIO_API, STUDIO_HEADER, WORKER_DELEGATE, WORKER_READ, type StudioMessage, type StudioOp, type StudioPending, type StudioSessionRecord,
   type StudioState } from '../src/studio/protocol.ts'
+import { STUDIO_TASK_STATUSES, type StudioPreference, type StudioProjectArchive, type StudioProjectSummary, type StudioTaskSummary } from '../src/studio/protocol.ts'
 import type { ConfigurationSnapshot } from '../src/studio/settings-protocol.ts'
 import { apply } from '../src/studio-web/index.tsx'
 import { en, NS, zh, type T } from '../src/studio-web/locales.ts'
@@ -363,4 +364,221 @@ it('preserves model edits on a revision conflict, rebases explicitly, and sends 
   expect(document.body.textContent).toContain(en.configApplied)
   await click(en['section.feishu'], tabs)
   expect(Array.from(node<HTMLSelectElement>('.as-config-view:not([hidden]) select').options, item => item.value)).toEqual(['disabled', 'conversation'])
+})
+
+function field<E extends HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(label: string, root: ParentNode) {
+  const match = Array.from(root.querySelectorAll('label')).find(item => item.textContent?.trim().startsWith(label))
+  if (!match?.control) throw new Error(`Missing field: ${label}`)
+  return match.control as E
+}
+
+it('renders all seven task badges, filters the ledger and opens evidence and source without writing to the Session', async () => {
+  const tasks = STUDIO_TASK_STATUSES.map((status, index): StudioTaskSummary => {
+    const project = status !== 'queued' && status !== 'cancelled'
+    return { taskId: `task-${index}`, projectId: project ? 'project-a' : null, projectName: project ? 'Project A' : null,
+      conversationId: project ? 'project-a' : 'assistant', sourceSessionId: 'origin-session', workerSessionId: record.id,
+      sourceMessageId: 'origin-message', requesterBotId: 'bot-1', assigneeBotId: null, workspacePath: '/studio-work',
+      permission: 'workspace-write', authorizationVersion: 3, status, title: `Fixture ${status}`, requestText: 'Exact test request',
+      resultSummary: status === 'delivered' ? 'Worker delivery is separate from evidence' : null, checkResult: status === 'delivered' ? {
+        version: 1, changedFiles: [{ path: 'src/report.ts', action: 'edit' }, { path: 'notes.txt', action: 'write' }], checks: [
+          { command: 'pnpm check', workdir: '/studio-work', exitCode: 0, signal: null, timedOut: false, aborted: false, status: 'passed', output: 'Typecheck passed' },
+          { command: 'pnpm test', workdir: '/studio-work', exitCode: 7, signal: null, timedOut: false, aborted: false, status: 'failed', output: 'Fixture failed' },
+        ], overallCheckStatus: 'failed',
+      } : null, artifacts: [], externalJob: null, createdAt: at, updatedAt: at,
+      ...(status === 'delivered' && { source: { sessionId: record.id, eventSeq: 17 } }) }
+  })
+  const active = new Set(['queued', 'running', 'waiting_approval', 'blocked'])
+  const app = server(({ op, input }) => {
+    if (op === 'tasks') return { items: tasks.filter(task => (!input.conversationId || task.conversationId === input.conversationId)
+      && (input.scope === 'all' || active.has(task.status) === (input.scope === 'active'))) }
+    if (op === 'task') return tasks.find(task => task.taskId === input.taskId)
+    if (op === 'stopTask') {
+      const task = tasks.find(task => task.taskId === input.taskId)!
+      return Object.assign(task, { status: 'cancelled', authorizationVersion: 4 })
+    }
+    if (op === 'record') return { record, events: [{ seq: 17, kind: 'assistant/message', text: 'Cold result from source' }] }
+  })
+  const panel = await render(slots().main)
+  await click(en.tasks, panel)
+  const badges = () => Array.from(panel.querySelectorAll('.as-task-row .as-pill'), item => item.textContent)
+  expect(badges()).toEqual(STUDIO_TASK_STATUSES.map(status => en[`taskStatus.${status}`]))
+  const filters = node('.as-task-filters', panel)
+  await change(field<HTMLSelectElement>(en.taskConversation, filters), 'project-a')
+  await change(field<HTMLSelectElement>(en.taskScope, filters), 'active')
+  expect(app.requests.filter(request => request.op === 'tasks').at(-1)?.input).toEqual({ scope: 'active', conversationId: 'project-a' })
+  expect(badges()).toEqual((['running', 'waiting_approval', 'blocked'] as const).map(status => en[`taskStatus.${status}`]))
+  const row = (title: string) => Array.from(panel.querySelectorAll<HTMLButtonElement>('.as-task-row')).find(item =>
+    item.querySelector('strong')?.textContent === title)!
+  await click(row('Fixture waiting_approval'))
+  const waiting = tasks.find(task => task.title === 'Fixture waiting_approval')!
+  await click(en.stopTask, node('.as-task-detail', panel))
+  expect(app.requests.filter(request => request.op === 'stopTask').map(request => request.input)).toEqual([{ taskId: waiting.taskId }])
+  expect(row('Fixture waiting_approval')).toBeUndefined()
+  expect(node('.as-task-detail', panel).textContent).toContain(en['taskStatus.cancelled'])
+
+  await change(field<HTMLSelectElement>(en.taskScope, filters), 'terminal')
+  expect(app.requests.filter(request => request.op === 'tasks').at(-1)?.input).toEqual({ scope: 'terminal', conversationId: 'project-a' })
+  await click(row('Fixture delivered'))
+  const detail = node('.as-task-detail', panel)
+  const proof = Array.from(detail.querySelectorAll('.as-task-section')).find(item => item.querySelector('h4')?.textContent === en.checkReceipt)!
+  expect(proof.querySelector('.as-meta .as-pill')?.textContent).toBe(en['checkStatus.failed'])
+  expect(Array.from(proof.querySelectorAll('.as-task-files code'), item => item.textContent)).toEqual(['src/report.ts', 'notes.txt'])
+  const checks = [...proof.querySelectorAll('details')]
+  expect(checks.map(item => [item.querySelector('code')?.textContent, item.querySelector('.as-pill')?.textContent, item.querySelector('summary .as-muted')?.textContent?.trim()]))
+    .toEqual([['pnpm check', en['checkStatus.passed'], t('checkExitCode', { code: 0 })], ['pnpm test', en['checkStatus.failed'], t('checkExitCode', { code: 7 })]])
+  await click(node('summary', checks[1]))
+  expect(checks[1]?.open).toBe(true)
+  expect(node('pre', checks[1]).textContent).toBe('Fixture failed')
+  expect(detail.textContent).toContain('Worker delivery is separate from evidence')
+  await click(en.source, detail)
+  expect(app.requests.at(-1)).toMatchObject({ op: 'record', input: { sessionId: record.id, from: 17 } })
+  expect(node('.as-event-list [data-focused]', panel).textContent).toContain('Cold result from source')
+  expect(panel.querySelector('textarea')).toBeNull()
+  expect(app.requests.some(request => request.op === 'send')).toBe(false)
+})
+
+it('creates and edits an active project, sends an explicit null workspace and saves only edited archive fields', async () => {
+  let current: StudioProjectSummary = { id: 'created', name: 'Phase Three', objective: 'Test workflow', workspacePath: '/work/phase3', state: 'active', managementEpoch: 1 }
+  const archive: StudioProjectArchive = { projectId: current.id, decisions: 'Keep evidence', progress: '', openIssues: '', updatedAt: null, readonly: false }
+  const app = server(({ op, input }) => {
+    if (op === 'createProject' || op === 'updateProject') {
+      if (op === 'updateProject') current = { ...current, objective: String(input.objective), workspacePath: null, managementEpoch: 2 }
+      app.state.projects = [...app.state.projects.filter(project => project.id !== current.id), current]
+      return current
+    }
+    if (op === 'projectArchive') return archive
+    if (op === 'updateProjectArchive') return { ...archive, ...input, updatedAt: new Date(at).toISOString() }
+  })
+  const panel = await render(slots().main)
+  const launcher = node('.as-project-nav > button', panel)
+  expect(launcher.textContent).toContain(en.newProject)
+  await click(launcher)
+  const newForm = node('.as-project-nav form', panel)
+  expect(button(en.createProject, newForm).disabled).toBe(true)
+  await change(field<HTMLInputElement>(en.projectName, newForm), current.name)
+  await change(field<HTMLTextAreaElement>(en.projectObjective, newForm), current.objective)
+  await change(field<HTMLInputElement>(en.projectWorkspace, newForm), ` ${current.workspacePath} `)
+  await click(en.createProject, newForm)
+  expect(app.requests.find(request => request.op === 'createProject')?.input).toEqual({ name: current.name, objective: current.objective, workspacePath: current.workspacePath })
+  expect(node('h2', panel).textContent).toBe(current.name)
+  expect(panel.querySelector('.as-project-nav form')).toBeNull()
+  const bar = node('.as-project-bar', panel)
+  await click(en.manageProject, bar)
+  const edit = node('.as-project-drawer form', bar)
+  await change(field<HTMLTextAreaElement>(en.projectObjective, edit), 'Updated objective')
+  await change(field<HTMLInputElement>(en.projectWorkspace, edit), '')
+  await click(en.saveProject, edit)
+  expect(app.requests.find(request => request.op === 'updateProject')?.input).toEqual({ projectId: current.id, expectedEpoch: 1, objective: 'Updated objective', workspacePath: null })
+  expect(bar.textContent).toContain(en.noWorkspace)
+  await click(en.projectArchive, bar)
+  const dossier = node('.as-project-drawer form', bar)
+  expect(field<HTMLTextAreaElement>(en['archiveField.decisions'], dossier).value).toBe(archive.decisions)
+  const progress = field<HTMLTextAreaElement>(en['archiveField.progress'], dossier)
+  expect(progress.readOnly).toBe(false)
+  await change(progress, 'Verified the milestone')
+  await click(en.saveArchive, dossier)
+  expect(app.requests.find(request => request.op === 'updateProjectArchive')?.input).toEqual({ projectId: current.id, progress: 'Verified the milestone' })
+  expect(dossier.textContent).toContain(en.archiveSaved)
+})
+
+it('confirms replacement and archiving, then opens the archived project read-only and reopens it from the archive list', async () => {
+  const app = server(({ op, input }) => {
+    const current = [...app.state.projects, ...(app.state.archivedProjects ?? [])][0]!
+    if (op === 'projectArchive') return { projectId: current.id, decisions: 'Preserved decision', progress: '', openIssues: '', updatedAt: null, readonly: current.state === 'archived' }
+    if (op === 'replaceProjectLeader' || op === 'archiveProject' || op === 'reopenProject') {
+      const receipt = { ...current, managementEpoch: Number(input.expectedEpoch) + 1, state: op === 'archiveProject' ? 'archived' : 'active' } as const
+      app.state.projects = receipt.state === 'active' ? [receipt] : []
+      app.state.archivedProjects = receipt.state === 'archived' ? [receipt] : []
+      return receipt
+    }
+  })
+  const panel = await render(slots().main)
+  await change(node<HTMLSelectElement>('[aria-label="Project conversation"]', panel), 'project-a')
+  await click(en.manageProject, panel)
+  await click(en.replaceProjectLeader, panel)
+  const replace = node('dialog', panel)
+  expect(replace.textContent).toContain(t('confirmBody.replaceProjectLeader', { name: 'Project A' }))
+  expect(app.requests.some(request => request.op === 'replaceProjectLeader')).toBe(false)
+  await click(en.cancel, replace)
+  expect(panel.querySelector('dialog')).toBeNull()
+  await click(en.replaceProjectLeader, panel)
+  await click(en.replaceProjectLeader, node('dialog', panel))
+  expect(app.requests.find(request => request.op === 'replaceProjectLeader')?.input).toEqual({ projectId: 'project-a', expectedEpoch: 1 })
+  await click(en.archiveProject, panel)
+  const archive = node('dialog', panel)
+  expect(archive.textContent).toContain(t('confirmBody.archiveProject', { name: 'Project A' }))
+  expect(app.requests.some(request => request.op === 'archiveProject')).toBe(false)
+  await click(en.archiveProject, archive)
+  expect(app.requests.find(request => request.op === 'archiveProject')?.input).toEqual({ projectId: 'project-a', expectedEpoch: 2 })
+  await click(en.assistant, panel)
+  const list = node<HTMLDetailsElement>('.as-project-nav-archived', panel)
+  if (!list.open) await click(node('summary', list))
+  await click('Project A', list)
+  expect(node('h2', panel).textContent).toBe('Project A')
+  expect(compose().disabled).toBe(true)
+  expect(button(en.send, panel).disabled).toBe(true)
+  expect(panel.querySelector(`[aria-label="${en.projectManagement}"] input`)).toBeNull()
+  await click(en.projectArchive, node('.as-project-bar', panel))
+  const readOnly = node('.as-project-drawer form', panel)
+  expect(readOnly.textContent).toContain(en.archiveReadOnly)
+  const textarea = field<HTMLTextAreaElement>(en['archiveField.decisions'], readOnly)
+  expect(textarea.value).toBe('Preserved decision')
+  expect(textarea.readOnly).toBe(true)
+  expect(button(en.saveArchive, readOnly).disabled).toBe(true)
+  await click(en.reopenProject, panel)
+  expect(app.requests.find(request => request.op === 'reopenProject')?.input).toEqual({ projectId: 'project-a', expectedEpoch: 3 })
+  expect(compose().disabled).toBe(false)
+  expect(node('.as-project-bar', panel).textContent).toContain(en['projectSaved.reopenProject'])
+  expect(list.textContent).toContain(en.noArchivedProjects)
+})
+
+it('isolates global and project preferences, edits the displayed version and forgets only after confirming literal text', async () => {
+  const sample = '<img src=x onerror="bad()"> & <b>literal</b>'
+  const global: StudioPreference = { preferenceId: 'global', key: 'format', projectId: null, text: 'Global value', state: 'active', version: 1,
+    updatedAt: new Date(at).toISOString() }
+  let current: StudioPreference | undefined
+  const app = server(({ op, input }) => {
+    if (op === 'preferences') return input.projectId ? current ? [current] : [] : [global]
+    if (op === 'savePreference') return current = { ...global, preferenceId: 'project', projectId: 'project-a', text: String(input.text) }
+    if (op === 'updatePreference') return current = { ...current!, text: String(input.text), version: 2 }
+    if (op === 'forgetPreference') {
+      const tombstone = { ...current!, text: '', state: 'forgotten', version: 3 }
+      current = undefined
+      return tombstone
+    }
+  })
+  const panel = await render(slots().main)
+  await change(node<HTMLSelectElement>('[aria-label="Project conversation"]', panel), 'project-a')
+  await click(en.preferences, panel)
+  expect(app.requests.at(-1)).toMatchObject({ op: 'preferences', input: {} })
+  expect(panel.textContent).toContain(global.text)
+  await click(en.projectPreferences, panel)
+  expect(app.requests.at(-1)).toMatchObject({ op: 'preferences', input: { projectId: 'project-a' } })
+  expect(panel.textContent).not.toContain(global.text)
+  const form = node('.as-detail form', panel)
+  await change(field<HTMLInputElement>(en.preferenceKey, form), 'format')
+  await change(field<HTMLTextAreaElement>(en.preferenceText, form), sample)
+  await click(en.addPreference, form)
+  expect(app.requests.find(request => request.op === 'savePreference')?.input).toEqual({ projectId: 'project-a', key: 'format', text: sample })
+  const item = node('.as-detail article', panel)
+  expect(node('.as-message-text', item).textContent).toBe(sample)
+  expect(item.querySelector('img, b')).toBeNull()
+  await click(en.editPreference, item)
+  expect(item.textContent).toContain(t('preferenceVersion', { version: 1 }))
+  await change(field<HTMLTextAreaElement>(en.preferenceText, item), `${sample} updated`)
+  await click(en.savePreference, item)
+  expect(app.requests.find(request => request.op === 'updatePreference')?.input).toEqual({ projectId: 'project-a', key: 'format', expectedVersion: 1, text: `${sample} updated` })
+  expect(item.textContent).toContain(t('preferenceVersion', { version: 2 }))
+  expect(node('.as-message-text', item).textContent).toBe(`${sample} updated`)
+  expect(item.querySelector('img, b')).toBeNull()
+  await click(en.forgetPreference, item)
+  expect(app.requests.some(request => request.op === 'forgetPreference')).toBe(false)
+  const dialog = node('dialog', panel)
+  expect(dialog.textContent).toContain(en.forgetPreferenceTitle)
+  await click(en.forgetPreference, dialog)
+  expect(app.requests.find(request => request.op === 'forgetPreference')?.input).toEqual({ projectId: 'project-a', key: 'format', expectedVersion: 2 })
+  expect(panel.querySelector('.as-detail article')).toBeNull()
+  expect(panel.textContent).toContain(en.preferenceForgotten)
+  await click(en.globalPreferences, panel)
+  expect(node('.as-detail article .as-message-text', panel).textContent).toBe(global.text)
 })
