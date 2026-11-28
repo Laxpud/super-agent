@@ -145,7 +145,7 @@ function taskRow(row: Row): StudioTaskSummary {
     requesterBotId: nullable(row.requester_bot_id), assigneeBotId: nullable(row.assignee_bot_id), workspacePath: nullable(row.workspace_path),
     permission: row.permission as StudioTaskSummary['permission'], authorizationVersion: Number(row.authorization_version),
     status: row.status as StudioTaskSummary['status'], title: String(row.title), requestText: String(row.request_text),
-    resultSummary: summary, checkResult: nullable(row.check_result), artifacts, externalJob: json(row.external_job, null),
+    resultSummary: summary, checkResult: taskCheckResult(row.check_result), artifacts, externalJob: json(row.external_job, null),
     createdAt: at(row.created_at), updatedAt: at(row.updated_at), ...(source ? { source } : {}) }
 }
 

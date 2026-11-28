@@ -489,7 +489,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/studio-v1-host.spec.ts` | Settings round trips and legacy projection, Worker model routing and failure classification, and the live Worker tool guard with workspace-write recorded |
 | `tests/studio-service.spec.ts`, `studio-feishu.spec.ts` | Shared conversation intake, topic and confirmation addressing, task blocker clearance, SDK payloads and Feishu binding with offline network fixtures |
 | `tests/studio-web.spec.tsx`, `studio-workspace.spec.ts` | Sidebar/main entry, literal tool output, read-only history, settings CAS and owner flows, and reversible hiding of Studio Sessions from the browser catalog |
-| `tests/fixtures/studio-runtime.smoke.mjs` | Opt-in installed DSH rc.5 Host smoke test for native Web authorization, exact provenance, isolated Leader contexts and unified task delivery, using a local deterministic model adapter |
+| `tests/studio-workspace-guard.spec.ts` | Real workspace paths and symlinks, per-task tool and shell guards, native-result receipts, SQLite rollback and execution revocation, cross-channel guard decisions and dispatch approval |
+| `tests/fixtures/studio-runtime.smoke.mjs` | Opt-in installed DSH rc.5 Host smoke test for native Web authorization, exact provenance, isolated Leader contexts, unified task delivery, local read/write checks and guard interception, using a local deterministic model adapter |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
 
