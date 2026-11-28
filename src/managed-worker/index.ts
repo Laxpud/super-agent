@@ -135,11 +135,12 @@ function localOwnerHost(ctx: Context): ManagedHost {
   const required = [
     ['commands.register', host.commands?.register], ['agentPresets.mount', host.agentPresets?.mount],
     ['agentPresets.presetForSession', host.agentPresets?.presetForSession], ['agents.create', host.agents?.create],
-    ['agents.resume', host.agents?.resume], ['agents.withoutInitiator', host.agents?.withoutInitiator],
+    ['agents.resume', host.agents?.resume], ['agents.list', host.agents?.list], ['agents.withoutInitiator', host.agents?.withoutInitiator],
     ['tools.guard', host.tools?.guard], ['webServer.getOrigin', host.webServer?.getOrigin], ['webServer.register', host.webServer?.register],
     ['connection.admit', host.connection?.admit], ['sandboxPolicy.resolve', host.sandboxPolicy?.resolve],
     ['sessionPersistence.flush', host.sessionPersistence?.flush], ['sessionPersistence.open', host.sessionPersistence?.open],
     ['permissionPresets.resolve', host.permissionPresets?.resolve], ['llm.resolveModelInfo', host.llm?.resolveModelInfo],
+    ['llm.listProviders', host.llm?.listProviders], ['llm.listModels', host.llm?.listModels],
   ] as const
   const missing = required.filter(([, value]) => typeof value !== 'function').map(([entry]) => entry)
   if (missing.length) throw new Error(`Agent Studio requires DSH Web Host contracts: ${missing.join(', ')}`)

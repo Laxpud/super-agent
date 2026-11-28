@@ -28,7 +28,12 @@ const repo = join(root, 'repo'), installRoot = join(root, 'i'), releases = join(
 const current = join(installRoot, 'current'), baseline = join(releases, 'v0'), stateDir = join(root, 's')
 const home = join(root, 'h'), dshHome = join(root, 'd'), sideHome = join(root, 'h2'), sideDshHome = join(root, 'd2')
 const workspace = join(root, 'w'), dbPath = join(stateDir, 'managed-worker.sqlite'), preload = join(root, 'offline.mjs')
-const markerNew = 'Assistant Stage 4 Fixture', badFlag = join(root, 'disable-bad-build')
+const labelPath = 'src/studio-web/locales.ts', markerNew = 'Assistant V1 Worker Fixture', badFlag = join(root, 'disable-bad-build')
+const editLabel = { file_path: labelPath, old_string: "assistant: 'Assistant'", new_string: `assistant: '${markerNew}'`, replace_all: true }
+const assistantRequest = 'Keep the Assistant conversation across self-update.'
+const iterationRequest = `In this project’s repository, change the Assistant navigation label in ${labelPath} to "${markerNew}" in both locales, then run pnpm check.`
+const assistantReply = 'Persistent synthetic native reply.'
+const workerReply = 'Updated both Assistant navigation labels and ran the requested check.'
 const profile = 'studio-update-smoke', sideProfile = 'studio-bystander-smoke'
 const assetNames = ['lib', 'studio-web', 'cordis.patch.yml', 'package.json', 'locale', 'prompts', 'skills', 'README.md']
 const ticketRows = ['agent-studio', 'agent-studio-github', 'agent-studio-feishu', 'agent-studio-worker-preset', 'agent-studio-router-preset']
@@ -56,7 +61,8 @@ function remember(pid) {
 }
 function same(pid) { return own.has(pid) && birth(pid) === own.get(pid) }
 function envFor(user, dshDir) {
-  return { HOME: user, DSH_HOME: dshDir, DSH_TELEMETRY_DISABLED: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', CI: 'true',
+  // 独立 HOME/XDG 已隔离用户 Git 配置；不要设置 GIT_CONFIG_GLOBAL，仓库回归会验证它原先未设置。
+  return { HOME: user, DSH_HOME: dshDir, DSH_TELEMETRY_DISABLED: '1', GIT_CONFIG_NOSYSTEM: '1', CI: 'true',
     XDG_CONFIG_HOME: join(user, '.config'), XDG_CACHE_HOME: join(user, '.cache'), XDG_DATA_HOME: join(user, '.local/share'),
     npm_config_cache: join(user, '.npm'), TMPDIR: root, LANG: 'C.UTF-8', PATH: [...new Set([dirname(process.execPath),
       ...(process.env.PATH ?? '').split(delimiter).filter(isAbsolute), '/usr/bin', '/bin'])].join(delimiter) }
@@ -343,6 +349,13 @@ import { renameSync, realpathSync, writeFileSync } from 'node:fs'
 import { LlmAdapter } from ${JSON.stringify(pathToFileURL(llmPath).href)}
 const provider = ${JSON.stringify(nativeProvider)}, model = { id: 'offline', name: 'Synthetic offline', provider, inputModalities: ['text'],
   context: { contextWindow: 65536 }, defaultMaxTokens: 4096 }
+const iteration = ${JSON.stringify(iterationRequest)}
+const steps = {
+  leader: [['studio_delegate_task', { permission: 'workspace-write' }]],
+  worker: [['read', { file_path: ${JSON.stringify(labelPath)} }], ['edit', ${JSON.stringify(editLabel)}],
+    ['bash', { command: 'pnpm check', description: 'Check the Studio repository after editing', timeoutMs: 120_000 }]],
+}
+const workerReply = ${JSON.stringify(workerReply)}
 export const inject = ['connection', 'webServer', 'llm', 'profileContext', 'clientModules']
 export function apply(ctx) {
   assert.deepEqual(ctx.llm.listProviders(), [])
@@ -350,14 +363,40 @@ export function apply(ctx) {
   class Offline extends LlmAdapter {
     async listModels() { return [model] }
     async resolveModel() { return model }
-    async *stream() {
-      yield { type: 'block-start', index: 0, blockType: 'text' }
-      yield { type: 'block-end', index: 0, block: { type: 'text', text: 'Persistent synthetic native reply.' } }
+    async *stream(options) {
+      options.signal?.throwIfAborted()
+      // 仅对本轮精确原文脚本化出工具调用；文件读取、编辑、命令和收据都是原生执行。
+      const input = options.messages.findLast(message => message.role === 'user'
+        && message.content.some(block => block.type === 'text' && block.text === iteration))
+      let block = { type: 'text', text: ${JSON.stringify(assistantReply)} }
+      if (input) {
+        const role = input.source?.kind === 'agent-studio' ? 'worker' : 'leader'
+        const prefix = 'v1-self-update-' + role + '-'
+        const done = options.messages.flatMap(message => message.content)
+          .filter(item => item.type === 'tool-call' && item.id.startsWith(prefix)).length
+        const next = steps[role][done]
+        if (next) {
+          const [name, args] = next
+          assert.ok(options.tools?.some(tool => tool.name === name), 'Native ' + role + ' must expose ' + name)
+          block = { type: 'tool-call', id: prefix + done, name, arguments: JSON.stringify(args) }
+        } else {
+          // 委派工具自行结束前台轮次；只有 Worker 会在工具执行后输出交付正文。
+          assert.equal(role, 'worker')
+          block = { type: 'text', text: workerReply }
+        }
+      }
+      yield { type: 'block-start', index: 0, blockType: block.type }
+      yield { type: 'block-end', index: 0, block }
       yield { type: 'usage', usage: { inputTokens: 4, outputTokens: 5 } }
-      yield { type: 'finish', reason: { kind: 'stop' } }
+      yield { type: 'finish', reason: { kind: block.type === 'tool-call' ? 'tool-calls' : 'stop' } }
     }
   }
   ctx.llm.registerAdapter([provider], new Offline())
+  ctx.on('tools/result', (exec, result) => {
+    if (exec.name === 'bash' && exec.callId.startsWith('v1-self-update-worker-') && result.value?.exitCode !== 0) {
+      console.error('Worker check failed:\\n' + (result.value?.stderr?.text ?? result.error?.message ?? 'No native result'))
+    }
+  })
   const timer = setInterval(() => {
     const origin = ctx.webServer.getOrigin()
     if (!origin || !new URL(origin).port) return
@@ -385,27 +424,69 @@ export function apply(ctx) {
     if (sidePending) return
     sidePending = true
     void sidePing().then(() => { sideSamples++ }, error => runSignal.abort(error)).finally(() => { sidePending = false })
-  }, 500).unref()
+  }, 100).unref()
   assert.equal(one.pid, first.child.pid); assert.notEqual(one.pid, bystander.pid)
   assert.equal(one.graph.includes('agent-studio'), false); assert.equal(one.graph.includes('agent-studio-web'), true)
   const healthy0 = await health(origin, one.cookie)
   assert.equal(healthy0.buildId, 'studio-smoke-v0'); assert.match(healthy0.artifactFingerprint, /^[a-f0-9]{64}$/u)
   proof(`isolated DSH ${pkg.version} primary PID=${one.pid} on ${primaryPort}, bystander PID=${bystander.pid} on ${sidePort}; Ticket rows disabled`)
 
-  const project = await post(origin, one.cookie, 'createProject', { name: 'Agent Studio self-host fixture', objective: 'Verify data across release changes', workspacePath: repo })
+  const project = await post(origin, one.cookie, 'createProject', { name: 'Agent Studio self-host fixture', objective: 'Iterate on Studio and verify data across release changes', workspacePath: repo })
+  assert.equal(project.workspacePath, repo); assert.equal(project.state, 'active'); assert.equal(project.managementEpoch, 1)
+  const coordinate = { projectId: project.id, expectedEpoch: project.managementEpoch }
+  const leader = (await post(origin, one.cookie, 'records')).items.find(item => item.conversationId === project.id && item.role === 'leader')
+  assert.ok(leader, 'The bound project must have a current native Leader')
   await post(origin, one.cookie, 'updateProjectArchive', { projectId: project.id, decisions: 'retain decisions', progress: 'retain progress', openIssues: 'retain issues' })
   await post(origin, one.cookie, 'savePreference', { key: 'durable-global', text: 'remember globally' })
   await post(origin, one.cookie, 'savePreference', { projectId: project.id, key: 'durable-project', text: 'remember in this project' })
-  const messageIds = []
-  for (const conversationId of ['assistant', project.id]) {
-    const sent = await post(origin, one.cookie, 'send', { conversationId, requestId: `message-${conversationId}`, text: `Keep ${conversationId} conversation` })
-    await until('native message completion', async () => {
-      const message = await post(origin, one.cookie, 'message', { conversationId, id: sent.id })
-      assert.ok(!['failed', 'interrupted'].includes(message.status), message.error)
-      return message.status === 'completed'
-    })
-    messageIds.push(sent.id)
-  }
+  const send = (conversationId, requestId, text) => post(origin, one.cookie, 'send', { conversationId, requestId, text })
+  const messageCompleted = (conversationId, id) => until('native message completion', async () => {
+    const message = await post(origin, one.cookie, 'message', { conversationId, id })
+    assert.ok(!['failed', 'interrupted'].includes(message.status), message.error)
+    return message.status === 'completed' && message
+  })
+  const assistant = await send('assistant', 'message-assistant', assistantRequest)
+  await messageCompleted('assistant', assistant.id)
+
+  // 将源码编辑交给获批的 Worker；验收脚本只读本次修改路径并计算预期文本，不写该文件。
+  const changed = join(repo, labelPath), oldText = readFileSync(changed, 'utf8')
+  assert.equal(oldText.split(editLabel.old_string).length - 1, 2, 'Expected the old visible label in both locales')
+  assert.equal(oldText.includes(markerNew), false)
+  const iteration = await send(project.id, 'message-self-iteration', iterationRequest)
+  const projectTasks = cookie => post(origin, cookie, 'tasks', { conversationId: project.id })
+  const pending = await until('Leader to request workspace-write in the unified inbox', async () => (await post(origin, one.cookie, 'pending')).items
+    .find(item => item.messageId === iteration.id && item.state === 'pending' && item.options.includes('允许本任务写入')))
+  assert.deepEqual(pending.options, ['允许本任务写入', 'Not now'])
+  assert.ok(pending.detail.includes(repo) && pending.detail.includes(iterationRequest))
+  const waiting = await post(origin, one.cookie, 'task', { taskId: pending.taskId })
+  assert.deepEqual((await projectTasks(one.cookie)).items, [waiting])
+  assert.equal(waiting.status, 'waiting_approval'); assert.equal(waiting.workerSessionId, null); assert.equal(waiting.checkResult, null)
+  assert.equal(waiting.permission, 'workspace-write'); assert.equal(waiting.workspacePath, repo)
+  assert.equal(waiting.sourceSessionId, leader.id); assert.equal(waiting.requestText, iterationRequest)
+  assert.deepEqual(snapshot('SELECT session_id FROM studio_task_execution WHERE task_id = ?', [waiting.taskId]), [])
+  assert.equal(readFileSync(changed, 'utf8'), oldText, 'The edit must not run before owner approval')
+  const writeGranted = await post(origin, one.cookie, 'answer', { id: pending.id, value: '允许本任务写入' })
+  assert.equal(writeGranted.state, 'resolved'); assert.equal(writeGranted.answeredBy, 'gui')
+  assert.equal((await messageCompleted(project.id, iteration.id)).source.sessionId, leader.id)
+  const task = await until('authorized Worker to deliver its native edit and pnpm check', async () => {
+    const row = await post(origin, one.cookie, 'task', { taskId: waiting.taskId })
+    assert.ok(!['waiting_approval', 'blocked', 'interrupted', 'cancelled'].includes(row.status), JSON.stringify(row))
+    return row.status === 'delivered' && row
+  }, 135_000)
+  assert.deepEqual((await projectTasks(one.cookie)).items, [task])
+  assert.deepEqual([task.projectId, task.sourceSessionId, task.sourceMessageId, task.permission, task.workspacePath],
+    [project.id, leader.id, `agent-studio-owner:${iteration.id}`, 'workspace-write', repo])
+  assert.equal(task.authorizationVersion, waiting.authorizationVersion + 2) // 批准写入和交付撤权各推进一次。
+  assert.equal(task.workerSessionId, task.source.sessionId); assert.notEqual(task.workerSessionId, leader.id)
+  assert.equal(task.checkResult.version, 1)
+  assert.deepEqual(task.checkResult.changedFiles, [{ path: labelPath, action: 'edit' }])
+  assert.equal(task.checkResult.overallCheckStatus, 'passed', JSON.stringify(task.checkResult))
+  assert.deepEqual(task.checkResult.checks.map(({ command, workdir, exitCode, status }) => [command, workdir, exitCode, status]),
+    [['pnpm check', repo, 0, 'passed']])
+  assert.ok(task.resultSummary.includes(workerReply))
+  assert.equal(readFileSync(changed, 'utf8'), oldText.replaceAll(editLabel.old_string, editLabel.new_string))
+  assert.equal(readFileSync(join(source, labelPath), 'utf8'), oldText, 'Only the clone label may change')
+  proof(`PID1 current Leader delegated task ${task.taskId}; waiting_approval → GUI workspace-write approval → native Worker read/edit and pnpm check (exit 0); changedFiles=${JSON.stringify(task.checkResult.changedFiles)}`)
   const settings = await post(origin, one.cookie, 'configuration')
   assert.equal(settings.profile, profile); assert.equal(settings.writable, true); assert.equal(settings.credentialsWritable, true)
   const check = await post(origin, one.cookie, 'feishuCheck', { action: 'start', revision: settings.revision, ...binding, secret })
@@ -430,25 +511,38 @@ export function apply(ctx) {
   assert.ok(reference)
   const data = async cookie => ({
     project: (await post(origin, cookie, 'state')).projects.find(item => item.id === project.id),
-    assistant: (await post(origin, cookie, 'timeline', { conversationId: 'assistant' })).items.filter(item => item.id === messageIds[0] || item.replyTo === messageIds[0]),
-    leader: (await post(origin, cookie, 'timeline', { conversationId: project.id })).items.filter(item => item.id === messageIds[1] || item.replyTo === messageIds[1]),
+    assistant: (await post(origin, cookie, 'timeline', { conversationId: 'assistant' })).items,
+    leader: (await post(origin, cookie, 'timeline', { conversationId: project.id })).items,
+    leaderRecord: await post(origin, cookie, 'record', { sessionId: leader.id }),
+    task: await post(origin, cookie, 'task', { taskId: task.taskId }),
+    taskLedger: snapshot(`SELECT t.*, e.* FROM studio_task t JOIN studio_task_execution e USING (task_id)
+      WHERE t.task_id = ? ORDER BY e.execution_epoch`, [task.taskId]),
+    worker: await post(origin, cookie, 'record', { sessionId: task.workerSessionId }),
     archive: await post(origin, cookie, 'projectArchive', { projectId: project.id }), global: await post(origin, cookie, 'preferences'),
     scoped: await post(origin, cookie, 'preferences', { projectId: project.id }),
     feishu: (await post(origin, cookie, 'configuration')).feishu, binding: snapshot('SELECT * FROM agent_studio_feishu_binding'),
+    profileFingerprint: createHash('sha256').update(readFileSync(profileFile)).digest('hex'),
     reference: /studioFeishuCredentialId:\s*([a-f0-9-]{36})/u.exec(readFileSync(profileFile, 'utf8'))?.[1],
   })
   const original = await data(one.cookie)
   assert.equal(original.reference, reference); assert.equal(original.binding.length, 1)
   assert.equal(original.feishu.credential, 'stored'); assert.equal(original.feishu.state, 'online')
-  assert.ok([original.assistant, original.leader].every(items => items.some(item => item.text === 'Persistent synthetic native reply.')))
+  assert.ok(original.assistant.some(item => item.replyTo === assistant.id && item.text === assistantReply))
+  assert.ok(original.leader.some(item => item.id === iteration.id && item.text === iterationRequest))
+  assert.ok(original.leaderRecord.events.some(event => event.kind === 'tool/call'
+    && event.text === 'studio_delegate_task\n{"permission":"workspace-write"}'))
+  assert.ok(original.leader.some(item => item.replyTo === iteration.id && item.text === task.resultSummary && item.source?.sessionId === task.workerSessionId))
+  assert.deepEqual(original.task, task)
+  assert.equal(original.taskLedger.length, 1)
+  const [ledger] = original.taskLedger
+  assert.deepEqual(JSON.parse(ledger.check_result), task.checkResult)
+  assert.deepEqual([ledger.status, ledger.outcome, ledger.session_id, ledger.result_event_seq, ledger.captured_management_epoch],
+    ['delivered', 'delivered', task.workerSessionId, task.source.eventSeq, coordinate.expectedEpoch])
+  assert.equal(original.worker.record.role, 'worker')
+  assert.ok(original.worker.events.some(event => event.kind === 'tool/call' && event.text === `edit\n${JSON.stringify(editLabel)}`))
+  assert.equal(original.worker.events.find(event => event.seq === task.source.eventSeq)?.text, workerReply)
   assert.equal(readFileSync(profileFile, 'utf8').includes(secret), false)
-  proof('wrote and read back native conversations, project/archive, both preferences, Feishu binding and credential reference through Studio API')
-
-  const changed = join(repo, 'src/studio-web/locales.ts'), oldText = readFileSync(changed, 'utf8')
-  const newText = oldText.replace(/(assistant:\s*)'Assistant'/gu, `$1'${markerNew}'`)
-  assert.notEqual(oldText, newText, 'Expected a visible Studio navigation label to change')
-  write(changed, newText)
-  const coordinate = { projectId: project.id, expectedEpoch: project.managementEpoch }
+  proof('read back native conversations, SQLite task receipt and Worker provenance, project/archive, both preferences, Feishu binding and credential reference')
   const prepare = (cookie, requestId, expectedCurrentFingerprint) => post(origin, cookie, 'prepareSelfUpdate', { requestId, expectedCurrentFingerprint, ...coordinate })
   const approveUpdate = async (cookie, row) => {
     assert.equal(row.pendingId, `self-update:${row.updateId}`)
@@ -460,11 +554,13 @@ export function apply(ctx) {
   const firstUpdate = await prepare(one.cookie, 'good-update', healthy0.artifactFingerprint)
   assert.equal(firstUpdate.phase, 'prechecking')
   const ready = await record(origin, one.cookie, firstUpdate.updateId, 'awaiting_confirmation', 610_000)
+  assert.deepEqual([ready.projectId, ready.projectEpoch, ready.baselineFingerprint],
+    [coordinate.projectId, coordinate.expectedEpoch, healthy0.artifactFingerprint])
   assert.equal(ready.exitCode, 0); assert.notEqual(ready.candidateFingerprint, healthy0.artifactFingerprint)
   const checkLog = readFileSync(updatePath(ready.updateId, 'precheck.log'), 'utf8')
   assert.match(checkLog, /pnpm exec tsc --noEmit[\s\S]+pnpm exec vitest run[\s\S]+pnpm exec tsdown/u)
   assert.equal(realpathSync(current), baseline); assert.equal(same(one.pid), true); await sidePing()
-  proof('isolated clone edit passed full pnpm typecheck, test and build; preparation did not switch current')
+  proof(`bound-project prepareSelfUpdate (epoch ${ready.projectEpoch}) passed isolated tsc, vitest and tsdown; preparation did not switch current`)
   const firstLink = lstatSync(current).ino
   await approveUpdate(one.cookie, ready)
   const success = await handoff(ready.updateId, 'succeeded')
@@ -483,7 +579,7 @@ export function apply(ctx) {
   assert.deepEqual(await data(two.cookie), original)
   await verifyBrowser(origin, two.url, healthy1.buildId)
   await sidePing()
-  proof(`PID1 exited 0 with SQLite seal; current atomically selected v1, PID2=${two.pid} ready with new build ${healthy1.buildId}; Chromium loaded and rendered it; retained records match`)
+  proof(`GUI approved update; detached controller sealed SQLite and atomically selected v1; PID1=${one.pid} exited 0, PID2=${two.pid} ready with build ${healthy1.buildId}; Chromium rendered "${markerNew}"; retained records match exactly`)
 
   const packagePath = join(repo, 'package.json'), packageText = readFileSync(packagePath, 'utf8')
   const brokenPackage = JSON.parse(packageText)
@@ -529,7 +625,7 @@ export function apply(ctx) {
   assert.deepEqual(await data(three.cookie), original)
   await sidePing()
   proof(`healthy build but unhealthy candidate PID=${candidates[0].pid} was terminated; current restored baseline with PID3=${three.pid}, original v1 hash and intact data; state=rolled_back failedPhase=starting log=controller.log`)
-  assert.ok(sideSamples > 0)
+  assert.ok(sideSamples >= 200, `Expected at least 200 authenticated bystander probes, got ${sideSamples}`)
   runSignal.signal.throwIfAborted()
   proof(`bystander PID=${bystander.pid} and authenticated Web listener stayed healthy across ${sideSamples} periodic probes and every checkpoint; no real accounts contacted`)
   completed = true
@@ -537,7 +633,7 @@ export function apply(ctx) {
   // 只在失败时输出隔离启动日志的尾部；auth URL 和凭据不进入这些日志。
   for (const name of ['primary.log', 'side.log', 'browser.log']) {
     const path = join(root, name)
-    if (existsSync(path)) console.error(`${name}:\n${readFileSync(path, 'utf8').slice(-2000)}`)
+    if (existsSync(path)) console.error(`${name}:\n${readFileSync(path, 'utf8').slice(name === 'primary.log' ? -14_000 : -2000)}`)
   }
   throw error
 } finally {
