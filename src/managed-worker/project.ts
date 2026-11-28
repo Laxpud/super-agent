@@ -3,7 +3,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
 import type { StudioProjectRoute } from '../studio/domain.ts'
 import type { StudioSessions } from '../studio/sessions.ts'
-import { verifyWorkspace } from '../studio/settings-directory.ts'
+import { verifyWorkspaceIdentity, WorkspacePathError } from './workspace.ts'
 import { projectArchiveCommand, PROJECT_ARCHIVE_HINT } from './project-archive.ts'
 import { PROJECT_NAME_LIMIT } from './project-store.ts'
 import type { ManagedWorkerStore } from './store.ts'
@@ -51,10 +51,11 @@ export class StudioProjectControl {
       if (archived !== undefined) return ok(archived)
       if (verb === 'create' && role === 'assistant') {
         const fields = z.strictObject({ ...projectFields, leaderBotId: id.exactOptional() }).parse(JSON.parse(value))
-        if (fields.workspacePath) verifyWorkspace(fields.workspacePath)
+        const workspace = fields.workspacePath == null ? null : this.store.projects.workspaceBinding(fields.workspacePath)
         const leaderSessionId = await this.sessions.prepareLeader(signal)
         if (!this.ready(agent, role)) return reject('Studio role changed; no project was created.')
-        return ok(projectText(this.store.projects.create({ ...fields, leaderSessionId })))
+        if (workspace && !verifyWorkspaceIdentity(workspace.root, workspace)) return reject('The workspace changed while preparing the project.')
+        return ok(projectText(this.store.projects.create({ ...fields, workspacePath: workspace?.root ?? null, leaderSessionId })))
       }
       if (verb === 'update') {
         const { projectId, epoch, ...changes } = z.strictObject({ ...coordinate, ...projectFields,
@@ -81,6 +82,9 @@ export class StudioProjectControl {
         return ok(projectText(result.project))
       }
       return reject(`Use /${PROJECT_COMMAND} ${PROJECT_HINT}.`)
-    } catch { return reject('The Studio project operation was not confirmed. Check the project, current management epoch, and command fields.') }
+    } catch (error) {
+      return reject(error instanceof WorkspacePathError ? error.message
+        : 'The Studio project operation was not confirmed. Check the project, current management epoch, and command fields.')
+    }
   }
 }

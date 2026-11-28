@@ -29,6 +29,8 @@ import { LEADER_PRESET, PROJECT_COMMAND, PROJECT_HINT, StudioProjectControl } fr
 import { ManagedWorkerStore } from './store.ts'
 import { LegacyWorkerDefaultsConfig, LegacyWorkerRouteConfig, migrateWorkerModels, WorkerModelDefaultsConfig, WorkerModelPolicy,
   WorkerModelRouteConfig } from './text-worker-model-policy.ts'
+import { evaluateWorkerToolCall, STUDIO_LIST_DIRECTORY, workerSandboxMatches, workerToolAllowlist, type WorkerSandboxPolicy } from './worker-guard.ts'
+import { verifyWorkspaceIdentity } from './workspace.ts'
 
 export const name = 'agent-studio-managed-worker'
 export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'permissionPresets', 'sandboxPolicy', 'sessionPersistence', 'systemPrompt', 'tools', 'webServer', 'llm']
@@ -55,7 +57,7 @@ const hostFields = s.object({
   workerModelRoutes: s.union([s.const(null), s.array(WorkerModelRouteConfig).max(64)]),
   workerModelDefaults: s.union([s.const(null), WorkerModelDefaultsConfig]),
   defaultWorkerPermission: s.union(['read-only' as const, 'workspace-write' as const]).default('read-only')
-    .description('Task permission recorded for future execution. This release does not enable file writes or shell.'),
+    .description('Default task permission for local tools in a bound Studio workspace.'),
   feishuConversation: s.union([s.const(null), FeishuConversationConfig]),
   studioFeishuCredentialId: s.string(),
   studioDirectoryToken: s.string(),
@@ -84,7 +86,7 @@ interface CommandResult { kind: 'success' | 'error'; text: string }
 interface StudioScope { role: StudioRole; dispose(): void }
 const presets: Record<StudioRole, string> = { assistant: ASSISTANT_PRESET, leader: LEADER_PRESET, worker: WORKER_PRESET }
 const roleForPreset = (preset: string | null) => (Object.keys(presets) as StudioRole[]).find(role => presets[role] === preset)
-const studioTools = new Set([WORKER_DELEGATE, WORKER_READ, LIST_PROJECTS, PROPOSE_PROJECT])
+const studioTools = new Set([WORKER_DELEGATE, WORKER_READ, LIST_PROJECTS, PROPOSE_PROJECT, STUDIO_LIST_DIRECTORY])
 const denied = 'Studio tool denied: INVALID_EXECUTION'
 
 /** 仅适配仓库较旧声明缺少的运行时入口；使用前统一校验，绝不把未接入的身份服务当成降级路径。 */
@@ -93,7 +95,7 @@ type ManagedHost = Context & {
   connection: Parameters<typeof registerStudioHttp>[1] & { allowsRemoteAuthorities: boolean }
   commands: { register(command: { name: string; description: string; input: { hint: string }; recordInput: boolean;
     handler(input: CommandInput): CommandResult | Promise<CommandResult> }): () => void }
-  sandboxPolicy: { resolve(request: { session: Agent['session'] }): { mode: string } }
+  sandboxPolicy: { resolve(request: { session: Agent['session'] }): WorkerSandboxPolicy }
   webServer: { host: string; getOrigin(): string }
 }
 
@@ -115,8 +117,7 @@ function localOwnerHost(ctx: Context): ManagedHost {
     ['tools.guard', host.tools?.guard], ['webServer.getOrigin', host.webServer?.getOrigin], ['webServer.register', host.webServer?.register],
     ['connection.admit', host.connection?.admit], ['sandboxPolicy.resolve', host.sandboxPolicy?.resolve],
     ['sessionPersistence.flush', host.sessionPersistence?.flush], ['sessionPersistence.open', host.sessionPersistence?.open],
-    ['permissionPresets.resolve', host.permissionPresets?.resolve], ['permissionPresets.current', host.permissionPresets?.current],
-    ['permissionPresets.set', host.permissionPresets?.set], ['llm.resolveModelInfo', host.llm?.resolveModelInfo],
+    ['permissionPresets.resolve', host.permissionPresets?.resolve], ['llm.resolveModelInfo', host.llm?.resolveModelInfo],
   ] as const
   const missing = required.filter(([, value]) => typeof value !== 'function').map(([entry]) => entry)
   if (missing.length) throw new Error(`Agent Studio requires DSH Web Host contracts: ${missing.join(', ')}`)
@@ -153,7 +154,7 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
     ctx.logger.error('Agent Studio lost its state directory lock: %s', String(error))
   } })
   let store: ManagedWorkerStore
-  try { store = new ManagedWorkerStore(join(stateDir, STUDIO_DB)) }
+  try { store = new ManagedWorkerStore(join(stateDir, STUDIO_DB), stateDir) }
   catch (error) { unlock(); throw error }
 
   let channel: StudioFeishuConversation | undefined
@@ -181,12 +182,19 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
     if (!available || applyingSettings || !localOwnerComposition(ctx)) return false
     try { return loopbackOrigin(ctx.webServer.getOrigin()) } catch { return false }
   }
-  const ready = (agent: Agent, role: StudioRole): boolean => {
-    if (!channelReady() || !current(agent) || scopes.get(agent)?.role !== role || presetOf(agent) !== presets[role]
-      || ctx.permissionPresets.current(agent.session) !== 'read-only' || ctx.sandboxPolicy.resolve({ session: agent.session }).mode !== 'read-only') return false
+  const roleReady = (agent: Agent, role: StudioRole): boolean => {
+    if (!channelReady() || !current(agent) || scopes.get(agent)?.role !== role || presetOf(agent) !== presets[role]) return false
     const record = store.studioSession(agent.id)
     if (record?.readonlyLegacy || (record && record.role !== role)) return false
     return role === 'leader' ? !!store.projects.currentLeader(agent.id) : role === 'worker' ? record?.role === 'worker' : true
+  }
+  const ready = (agent: Agent, role: StudioRole): boolean => {
+    if (!roleReady(agent, role)) return false
+    const sandbox = assistant.workerSandbox(agent)
+    if (role !== 'worker') return sandbox?.mode === 'read-only'
+    const authority = assistant.workerAuthority(agent)
+    return !!authority && workerSandboxMatches(sandbox, authority)
+      && (authority.workspacePath === null || verifyWorkspaceIdentity(authority.workspacePath, authority.workspaceIdentity))
   }
 
   const feishuState = (): FeishuState => channel?.state ?? (binding ? 'credential-missing' : 'disabled')
@@ -224,9 +232,12 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
     if (prior?.role === role) return
     prior?.dispose()
     scopes.delete(agent)
-    ctx.permissionPresets.set(agent.session, 'read-only')
-    const unmask = agent.ctx.tools.restrict({ allow: [] })
-    const dispose: Array<() => void> = [unmask]
+    if (role !== 'worker') ctx.permissionPresets.set?.(agent.session, 'read-only')
+    const authority = role === 'worker' ? assistant.workerAuthority(agent) : undefined
+    const allow = authority ? workerToolAllowlist(authority.workspacePath, authority.permission) : []
+    // rc.5 限制的是继承工具，原生 API 会拒绝传入 Agent 自己注册的工具名。
+    const inherited = allow.filter(name => name !== STUDIO_LIST_DIRECTORY && (name !== 'bash' || process.platform !== 'win32'))
+    const dispose: Array<() => void> = [agent.ctx.tools.restrict({ allow: inherited })]
     try {
       dispose.push(assistant.install(agent, role))
       if (role === 'assistant') dispose.push(intake.install(agent))
@@ -234,16 +245,24 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
     } catch (error) { for (const cleanup of dispose.reverse()) cleanup(); throw error }
   }
 
+  // rc.5 支持结构化拒绝；仓库保留上游 Ticket 的旧版依赖声明，只在此适配 Studio 入口。
+  const guards = ctx.tools as unknown as { guard(fn: (exec: Readonly<ToolExecution>) => string
+    | { reason: string; info: { name: string; code: string } } | undefined): () => void }
   // Studio 工具只存在于确切角色。普通 Ticket Agent 的工具不受 Studio 策略影响。
-  ctx.effect(() => ctx.tools.guard((exec: Readonly<ToolExecution>) => {
+  ctx.effect(() => guards.guard(exec => {
     const { agent } = exec
     if (!agent) return studioTools.has(exec.name) ? denied : undefined
     try {
-      const role = scopes.get(agent)?.role ?? inferred(agent)
-      if (!role && !store.studioSession(agent.id) && !isStudioInternalSession(agent.id)) return studioTools.has(exec.name) ? denied : undefined
-      if (!role || exec.parent !== undefined || !ready(agent, role)) return denied
-      if (role === 'worker') return assistant.executionCurrent(agent) ? 'Studio tool denied: no Worker tools are enabled in this stage' : denied
-      if (!sessions.canAsk(agent)) return denied
+      const record = store.studioSession(agent.id)
+      const role = record?.role === 'worker' ? 'worker' : scopes.get(agent)?.role ?? inferred(agent)
+      if (!role && !record && !isStudioInternalSession(agent.id)) return undefined
+      if (role === 'worker') {
+        const refusal = evaluateWorkerToolCall({ name: exec.name, arguments: exec.arguments, parent: exec.parent, signal: exec.signal,
+          execution: roleReady(agent, role) ? assistant.workerExecution(agent) : undefined, sandbox: assistant.workerSandbox(agent),
+          protectedRoots: store.protectedRoots })
+        return refusal ? { reason: refusal.reason, info: { name: 'StudioToolDenied', code: refusal.code } } : undefined
+      }
+      if (!role || exec.parent !== undefined || !ready(agent, role) || !sessions.canAsk(agent)) return denied
       if (exec.name === WORKER_READ || (role === 'assistant' && exec.name === LIST_PROJECTS)) return undefined
       if (!sessions.isExistingTaskReply(agent) && (exec.name === WORKER_DELEGATE || (role === 'assistant' && exec.name === PROPOSE_PROJECT))) return undefined
       return denied
@@ -270,6 +289,8 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
       if (inferred(agent) || isStudioInternalSession(agent.id) || store.studioSession(agent.id)) return { kind: 'reject' }
       return next()
     }
+    // 保存中间件收到的原始收件箱，防止下游过滤后把外部输入伪装成空续步。
+    const claimed = role === 'worker' ? [...step.messages] : []
     if (!ready(agent, role) || (role === 'worker' ? !assistant.executionCurrent(agent) : !sessions.canAsk(agent))) return { kind: 'reject' }
     const decision = await next()
     if (decision.kind !== 'enter') return decision
@@ -278,9 +299,9 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
       // DSH 预检追加的必需运行时快照不算任务输入；收件箱里的同类输入仍须通过 Worker 的原文检查。
       const inputs = decision.messages.filter(message => {
         const source: { kind: string; form?: string } = message.source
-        return source.kind !== 'runtime-context' || source.form !== 'snapshot' || step.messages.some(input => input.id === message.id)
+        return source.kind !== 'runtime-context' || source.form !== 'snapshot' || claimed.some(input => input.id === message.id)
       })
-      return assistant.admit(agent, inputs, step.turn) ? decision : { kind: 'reject' }
+      return assistant.admit(agent, inputs, step.turn, claimed) ? decision : { kind: 'reject' }
     }
     if (!sessions.canAsk(agent)) return { kind: 'reject' }
     const extra = sessions.contextFor(agent, decision.messages, step.step)

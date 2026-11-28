@@ -354,7 +354,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/managed-worker/index.ts` | The opt-in single-owner Studio Host: opens its own store, admits the three active roles, and mounts owner Web and optional Feishu operations independently of Ticket orchestration |
-| `src/managed-worker/assistant.ts` | Registers Assistant and Leader delegation and result tools, verifies exact native owner input, and runs a dedicated tool-free Worker whose result is tied to its execution epoch |
+| `src/managed-worker/assistant.ts` | Registers Assistant and Leader delegation and result tools, verifies exact native owner input, and runs a dedicated Worker bound to its execution epoch, native sandbox and optional workspace |
+| `src/managed-worker/workspace.ts` | Canonicalizes workspace bindings, rechecks directory identity, validates lexical and physical target containment, and lists direct entries without traversing external links |
+| `src/managed-worker/worker-guard.ts` | Enforces execution authority, permission-tier allowlists, native sandbox policy, and a restricted shell grammar; reports structured refusals with stable action fingerprints |
 | `src/managed-worker/text-worker-model-policy.ts` | Validates stable model route IDs and role defaults, accepts legacy model input aliases, and confirms the selected model before dispatch |
 | `src/managed-worker/project.ts` | Owner project lifecycle commands and task reads; creates passive native Leader Sessions before changing project management |
 | `src/managed-worker/project-intake.ts` | Turns an exact Assistant proposal into a project only after single-owner confirmation through the shared pending broker |

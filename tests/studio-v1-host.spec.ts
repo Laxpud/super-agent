@@ -242,7 +242,7 @@ describe('Studio V1 Worker models', () => {
   })
 })
 
-it('denies file and shell tools even inside an authorized workspace-write Worker', async () => {
+it('denies file and shell tools for an unbound Worker even with workspace-write task permission', async () => {
   const dir = mkdtempSync(join(realpathSync(tmpdir()), 'studio-v1-guard-'))
   const effects: Array<() => void | Promise<void>> = []
   onTestFinished(async () => {
@@ -255,9 +255,11 @@ it('denies file and shell tools even inside an authorized workspace-write Worker
   const llm = modelCatalog()
   const registered = new Map<string, Agent>()
   const browserPeer = { id: 'local-owner', principal: { kind: 'owner' } }
-  const reachedWorker = Promise.withResolvers<{ agent: Agent; verdicts: Array<string | void>; recorded: object | undefined }>()
+  type Verdict = string | { reason: string; info?: { name?: string; code: string } } | void
+  const reachedWorker = Promise.withResolvers<{ agent: Agent; verdicts: Verdict[]; recorded: object | undefined }>()
   let configure: (event: { agent: Agent }) => void
-  let guard: (exec: Readonly<ToolExecution>) => string | void
+  let guard: (exec: Readonly<ToolExecution>) => Verdict
+  const modes = new WeakMap<object, string>()
   let handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>
   const tools = ['write', 'edit', 'bash', 'pwsh', 'subagent', WORKER_DELEGATE]
 
@@ -300,8 +302,8 @@ it('denies file and shell tools even inside an authorized workspace-write Worker
     }, agentPresets: { presetForSession: (session: { preset: string }) => session.preset, mount: async () => {} },
     connection: { allowsRemoteAuthorities: false, browserPeer, admit: () => ({ peer: browserPeer }) },
     tools: { guard: (fn: typeof guard) => { guard = fn; return noop } },
-    commands: { register: disposer }, sandboxPolicy: { resolve: () => ({ mode: 'read-only' }) },
-    permissionPresets: { resolve: () => ({ sandbox: 'read-only' }), current: () => 'read-only', set: vi.fn() },
+    commands: { register: disposer }, sandboxPolicy: { resolve: ({ session }: { session: object }) => ({ mode: modes.get(session) ?? 'read-only' }) },
+    permissionPresets: { resolve: () => ({ sandbox: 'read-only' }), set: vi.fn((session: object, mode: string) => modes.set(session, mode)) },
     sessionPersistence: { flush: async () => {}, open: vi.fn() }, llm,
     webServer: { host: '127.0.0.1', getOrigin: () => 'http://127.0.0.1:8080', register: (route: { handler: typeof handler }) => { handler = route.handler; return noop } },
     on(name: string, fn: typeof configure) { if (name === 'agent/created') configure = fn; return noop },
@@ -316,9 +318,10 @@ it('denies file and shell tools even inside an authorized workspace-write Worker
   expect(response.writeHead).toHaveBeenCalledWith(200, expect.any(Object))
   const { agent, recorded, verdicts } = await reachedWorker.promise
   expect(recorded).toEqual({ permission: 'workspace-write', status: 'running', session_id: agent.id })
-  expect(host.permissionPresets.set).toHaveBeenCalledWith(agent.session, 'read-only')
-  // 只有当前执行才会到达这个拒绝分支；不是因为 Session 未登记或已经过期才拒绝。
-  expect(verdicts).toEqual(tools.map(() => 'Studio tool denied: no Worker tools are enabled in this stage'))
+  expect(host.permissionPresets.set).toHaveBeenCalledWith(agent.session, 'workspace-write')
+  // 否决来自 Worker 工具策略，而不是 Session 未登记或授权已失效。
+  expect(verdicts).toEqual(tools.map(() => expect.objectContaining({ reason: expect.any(String),
+    info: { name: 'StudioToolDenied', code: 'STUDIO_TOOL_FORBIDDEN' } })))
   const outside = { id: 'ordinary-session', session: { preset: 'standard' } } as unknown as Agent
   expect(guard!({ agent: outside, name: 'bash' } as ToolExecution)).toBeUndefined()
 })

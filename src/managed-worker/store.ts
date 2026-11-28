@@ -9,6 +9,7 @@ import { STUDIO_SCHEMA, StudioStore } from '../studio/store.ts'
 import { MemoryStore } from './memory-store.ts'
 import { ProjectArchiveStore } from './project-archive-store.ts'
 import { ProjectStore } from './project-store.ts'
+import { canonicalizeWorkspaceRoot, protectedHostRoots } from './workspace.ts'
 
 const SCHEMA = `
   CREATE TABLE studio_bot (
@@ -308,18 +309,22 @@ export class ManagedWorkerStore {
   #closed = false
   readonly studio: StudioStore
   readonly projects: ProjectStore
+  readonly protectedRoots: readonly string[]
   readonly memory: MemoryStore
   readonly projectArchive: ProjectArchiveStore
   readonly recoveredTasks: number
   readonly assistantBotId: string
 
-  constructor(path: string) {
+  constructor(path: string, stateDir?: string) {
     if (!path || path === ':memory:') throw new Error('Studio requires a persistent SQLite path')
     const file = resolve(path)
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
     privateFile(file, true)
     const dbPath = realpathSync(file)
-    for (const suffix of ['-wal', '-shm', '-journal']) privateFile(dbPath + suffix, false)
+    const sidecars = ['-wal', '-shm', '-journal'].map(suffix => dbPath + suffix)
+    for (const sidecar of sidecars) privateFile(sidecar, false)
+    // 宿主传入专用 stateDir；独立账本调用没有该配置，只保护数据库和伴随文件。
+    this.protectedRoots = protectedHostRoots(stateDir ?? dbPath, sidecars)
     this.#db = new DatabaseSync(dbPath)
     const db = this.#db
     try {
@@ -346,7 +351,7 @@ export class ManagedWorkerStore {
       this.assistantBotId = started.bot
       this.recoveredTasks = started.recovered
       const access = { db, write: <T>(fn: () => T) => this.write(fn), assertActive: () => this.assertActive() }
-      this.projects = new ProjectStore(access)
+      this.projects = new ProjectStore(access, this.protectedRoots)
       this.memory = new MemoryStore(access)
       this.projectArchive = new ProjectArchiveStore(access)
       this.studio = new StudioStore(db, access.assertActive, true)
@@ -448,10 +453,12 @@ export class ManagedWorkerStore {
         if (existing.source_message_id !== input.sourceMessageId || existing.request_text !== input.requestText) throw new Error('Studio task source conflict')
         return { taskId: String(existing.task_id), created: false }
       }
+      const workspace = input.workspacePath !== null && input.projectId === null
+        ? canonicalizeWorkspaceRoot(input.workspacePath, this.protectedRoots).root : input.workspacePath
       const taskId = randomUUID(), at = studioNow()
       this.#db.prepare(`INSERT INTO studio_task (task_id, project_id, source_message_id, request_key, requester_bot_id, workspace_path,
         permission, status, title, request_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`)
-        .run(taskId, input.projectId, input.sourceMessageId, key, input.requesterBotId, input.workspacePath,
+        .run(taskId, input.projectId, input.sourceMessageId, key, input.requesterBotId, workspace,
           input.permission, input.title ?? input.requestText.slice(0, 120).toWellFormed(), input.requestText, at, at)
       return { taskId, created: true }
     })

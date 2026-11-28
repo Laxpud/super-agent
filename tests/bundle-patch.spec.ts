@@ -34,10 +34,26 @@ it('defines the worker preset Executor Sessions run under, with a shell that mov
   expect(rows.filter(row => row.id?.startsWith('agent-studio-managed-worker') || row.id === 'agent-studio-assistant-preset'
     || row.id === 'agent-studio-leader-preset').map(row => row.disabled)).toEqual([true, true, true, true])
   for (const [id, name, description] of [
-    ['agent-studio-managed-worker', 'Agent Studio Worker', 'Runs a controlled Studio task distinct from the GitHub Ticket presets. This stage enables no shell, filesystem writes, or agent delegation.'],
+    ['agent-studio-managed-worker', 'Agent Studio Worker', 'Runs local workspace reads, writes and controlled checks as authorized by the Studio Host, independently of GitHub Ticket presets.'],
     ['agent-studio-assistant', 'Agent Studio Assistant', 'Answers owner questions, proposes projects, and delegates background tasks through the Studio host.'],
     ['agent-studio-leader', 'Agent Studio Leader', 'Organizes work for one Studio project, delegates controlled tasks, and retrieves results while assigned as its current Leader.'],
   ]) expect(presetOf(rows, id!)).toMatchObject({ name, description })
+  const studio = presetOf(rows, 'agent-studio-managed-worker')
+  expect(studio.order).toBe(92)
+  expect(studio.plugins.map(row => row.id)).toEqual(['tool-executor-native', 'time-context', 'shell', 'tool-fs', 'tool-fs-search', 'compaction'])
+  expect(studio.plugins.find(row => row.id === 'shell')).toMatchObject({ name: 'cordis:group', group: true, isolate: { shell: true }, config: [
+    { id: 'bash-sandbox', name: '@deepseek-ai/dsh-bash-sandbox', config: { timeoutMs: 120000, maxTimeoutMs: 120000 } },
+    { id: 'pwsh-sandbox', name: '@deepseek-ai/dsh-pwsh-sandbox', config: { timeoutMs: 120000, maxTimeoutMs: 120000 } },
+    { id: 'tool-bash', name: '@deepseek-ai/dsh-tool-bash', config: { enableRunInBackground: false, promoteOnTimeout: false } },
+    { id: 'tool-pwsh', name: '@deepseek-ai/dsh-tool-pwsh', config: { enableRunInBackground: false, promoteOnTimeout: false } },
+  ] })
+  expect(studio.plugins.find(row => row.id === 'tool-fs')?.config).toEqual({ applyPatch: false })
+  expect(studio.plugins.find(row => row.id === 'tool-fs-search')?.config).toEqual({ sampleOverCapGlobResults: false })
+  expect(studio.plugins.find(row => row.id === 'compaction')).toMatchObject({ name: 'cordis:group', group: true,
+    isolate: { compaction: true, toolResultPruner: true }, config: [
+      { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' },
+      { id: 'tool-result-pruner', name: '@deepseek-ai/dsh-compaction-tool-result-pruner', config: { thresholdChars: 8192, headChars: 4096, tailChars: 1024 } },
+    ] })
   const preset = presetOf(rows, WORKER_PRESET)
   expect(preset.id).toBe(WORKER_PRESET)
   const plugins = flat(preset.plugins)

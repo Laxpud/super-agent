@@ -2,11 +2,11 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
 import { PROPOSE_PROJECT } from '../studio/protocol.ts'
 import type { StudioSessions } from '../studio/sessions.ts'
-import { verifyWorkspace } from '../studio/settings-directory.ts'
 import { ownerRequest } from './assistant.ts'
 import { PROJECT_NAME_LIMIT } from './project-store.ts'
 import { projectText } from './project.ts'
 import type { ManagedWorkerStore } from './store.ts'
+import { verifyWorkspaceIdentity } from './workspace.ts'
 
 const TIMEOUT_MS = 120_000
 const plain = (limit: number) => z.string().min(1).max(limit).refine(value => value.isWellFormed() && !value.includes('\0') && !!value.trim())
@@ -33,16 +33,17 @@ export class StudioProjectIntake {
           || this.sessions.isExistingTaskReply(agent) || !source.requestText.includes(fields.intentQuote)
           || (fields.workspacePath && !source.requestText.includes(fields.workspacePath))
           || (fields.leaderBotId && !source.requestText.includes(fields.leaderBotId))) throw new Error('Project proposal requires the exact current owner input')
-        if (fields.workspacePath) verifyWorkspace(fields.workspacePath)
+        const workspace = fields.workspacePath === undefined ? null : this.store.projects.workspaceBinding(fields.workspacePath)
         const approved = await this.sessions.confirmWithOwner(agent, { title: `Create the ongoing project “${fields.name}”?`, approve: 'Create project',
-          detail: `Owner's words: ${fields.intentQuote}\n\nObjective: ${fields.objective}\nWorkspace: ${fields.workspacePath ?? 'not set'}\nLeader Bot: ${fields.leaderBotId ?? 'new'}\nNo work is dispatched.` }, signal)
+          detail: `Owner's words: ${fields.intentQuote}\n\nObjective: ${fields.objective}\nWorkspace: ${workspace?.root ?? 'not set'}\nLeader Bot: ${fields.leaderBotId ?? 'new'}\nNo work is dispatched.` }, signal)
         if (!approved) return { text: 'Project not created: the owner declined.' }
         signal.throwIfAborted()
         if (!this.sessions.matchesOwnerRequest(agent, source)) throw new Error('Project proposal is no longer current')
         const leaderSessionId = await this.sessions.prepareLeader(signal)
         signal.throwIfAborted()
         if (!this.sessions.matchesOwnerRequest(agent, source)) throw new Error('Project proposal is no longer current')
-        const project = this.store.projects.create({ ...fields, leaderSessionId })
+        if (workspace && !verifyWorkspaceIdentity(workspace.root, workspace)) throw new Error('The approved workspace changed while preparing the project.')
+        const project = this.store.projects.create({ ...fields, workspacePath: workspace?.root ?? null, leaderSessionId })
         return { text: `Project created. No Worker started.\n${projectText(project)}` }
       },
     })

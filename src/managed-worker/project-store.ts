@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { studioProject, studioProjects, type StudioProjectRoute } from '../studio/domain.ts'
-import { verifyWorkspace } from '../studio/settings-directory.ts'
 import { studioNow, type StudioStoreAccess } from './store.ts'
+import { canonicalizeWorkspaceRoot } from './workspace.ts'
 
 export const PROJECT_NAME_LIMIT = 120
 export interface ProjectCreate {
@@ -12,8 +12,11 @@ export interface ProjectChange { project: StudioProjectRoute; invalidatedTaskIds
 
 /** 每个管理 epoch 只绑定一个 Leader；归档、换任与工作区变更会在同一事务撤销旧任务。 */
 export class ProjectStore {
-  constructor(private readonly access: StudioStoreAccess) {}
+  constructor(private readonly access: StudioStoreAccess, private readonly protectedRoots: readonly string[]) {}
   private get db() { return this.access.db }
+
+  /** 在分配 Leader 或征询所有者之前也使用与存储层相同的绑定校验。 */
+  workspaceBinding(path: string) { return canonicalizeWorkspaceRoot(path, this.protectedRoots) }
 
   list() { this.access.assertActive(); return studioProjects(this.db) }
   get(id: string) { this.access.assertActive(); return studioProject(this.db, id) }
@@ -30,8 +33,7 @@ export class ProjectStore {
   create(input: ProjectCreate): StudioProjectRoute {
     const name = projectField(input.name, PROJECT_NAME_LIMIT)
     const objective = projectField(input.objective, 2_000)
-    const workspace = input.workspacePath ?? null
-    if (workspace !== null) verifyWorkspace(workspace)
+    const workspace = input.workspacePath == null ? null : this.workspaceBinding(input.workspacePath).root
     return this.access.write(() => {
       const id = randomUUID(), at = studioNow()
       this.db.prepare(`INSERT INTO studio_project (project_id, name, objective, workspace_path, management_epoch, created_at, updated_at)
@@ -44,8 +46,8 @@ export class ProjectStore {
   update(id: string, expectedEpoch: number, changes: ProjectUpdate): ProjectChange {
     return this.access.write(() => {
       const current = this.#require(id, expectedEpoch, 'active')
-      const workspace = changes.workspacePath === undefined ? current.workspacePath : changes.workspacePath
-      if (workspace !== null && changes.workspacePath !== undefined) verifyWorkspace(workspace)
+      const workspace = changes.workspacePath === undefined ? current.workspacePath
+        : changes.workspacePath === null ? null : this.workspaceBinding(changes.workspacePath).root
       const changedScope = workspace !== current.workspacePath
       const now = studioNow()
       const epoch = expectedEpoch + Number(changedScope)
