@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
+import { studioRecordRole, studioRecords, studioSession } from './domain.ts'
 import {
   ASSISTANT_CONVERSATION, STUDIO_PAGE_SIZE, STUDIO_TEXT_LIMIT,
   type StudioArtifact, type StudioMessage, type StudioModel, type StudioPage, type StudioPending,
@@ -44,7 +45,7 @@ type PendingDecision = 'resolved' | 'expired'
 type DeliveryState = 'queued' | 'claimed' | 'sent' | 'unconfirmed'
 
 // The prefix separates the conversation ledger from existing managed work and Feishu route ledgers on the same connection.
-const SCHEMA = `
+export const STUDIO_SCHEMA = `
   CREATE TABLE IF NOT EXISTS agent_studio_assistant (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1), session_id TEXT NOT NULL
   ) STRICT;
@@ -235,7 +236,7 @@ function decodePending(row: PendingRow): StudioPending {
 }
 
 function decodeSession(row: SessionRow): StudioSessionRecord {
-  return { id: row.id, conversationId: row.conversation_id, role: row.role, createdAt: row.created_at }
+  return { id: row.id, conversationId: row.conversation_id, role: studioRecordRole(row.role), createdAt: row.created_at }
 }
 
 function page<Row, Item>(rows: Row[], decode: (row: Row) => Item, cursor: (row: Row) => number, ascending = false): StudioPage<Item> {
@@ -269,8 +270,8 @@ function confirmationNotice(item: StudioPending): string {
 
 /** Conversations and their outbox share the caller's connection, but own their synchronous write transactions. */
 export class StudioStore {
-  constructor(private readonly db: DatabaseSync, private readonly assertActive: () => void) {
-    this.write(() => db.exec(SCHEMA))
+  constructor(private readonly db: DatabaseSync, private readonly assertActive: () => void, private readonly unifiedSessions = false) {
+    if (!unifiedSessions) this.write(() => db.exec(STUDIO_SCHEMA))
   }
 
   private write<T>(operation: () => T): T {
@@ -512,12 +513,14 @@ export class StudioStore {
 
   session(id: string): StudioSessionRecord | undefined {
     this.assertActive()
+    if (this.unifiedSessions) return studioSession(this.db, id)
     const row = this.sessionRow(id)
     return row && decodeSession(row)
   }
 
   records(query?: string, before?: number): StudioPage<StudioSessionRecord> {
     this.assertActive()
+    if (this.unifiedSessions) return studioRecords(this.db, query, before)
     const match = query?.trim().toLowerCase() ?? ''
     const rows = this.db.prepare(`SELECT * FROM agent_studio_session WHERE
       (? = '' OR instr(lower(id), ?) > 0 OR instr(lower(conversation_id), ?) > 0 OR instr(lower(role), ?) > 0)

@@ -6,25 +6,14 @@ import type { en } from './locales.ts'
 import { configurationEn as settingsErrorKeys } from './settings-locales.ts'
 import { Button, useStudio } from './ui.tsx'
 
-export const SETTINGS_SECTIONS = ['models', 'workers', 'feishu', 'documents', 'oversight', 'advanced'] as const
+export const SETTINGS_SECTIONS = ['models', 'workers', 'feishu', 'advanced'] as const
 export type SettingsSection = typeof SETTINGS_SECTIONS[number]
 export type ModelCatalog = StudioModelOption[]
 export const blankModel: StudioModel = { provider: '', model: '' }
 
-export function SettingToggle({ label, hint, checked, disabled, change }: {
-  label: string; hint: string; checked: boolean; disabled?: boolean; change: (enabled: boolean) => void
-}) {
-  const id = useId()
-  return <div className="as-setting-toggle">
-    <input id={id} type="checkbox" checked={checked} disabled={disabled} aria-describedby={`${id}-help`}
-      onChange={event => change(event.currentTarget.checked)} />
-    <label htmlFor={id}>{label}</label><p id={`${id}-help`} className="as-muted">{hint}</p>
-  </div>
-}
-
 export function SettingText({ label, hint, value, change, ...props }: {
   label: string; hint?: string; value: string; change: (value: string) => void; placeholder?: string;
-  type?: 'text' | 'password'; inputMode?: 'text' | 'numeric'; autoComplete?: string; maxLength?: number
+  type?: 'text' | 'password'; autoComplete?: string; maxLength?: number
 }) {
   const id = useId()
   return <div className="as-setting-field">
@@ -44,9 +33,9 @@ export function SettingSelect({ label, value, change, children }: {
 }
 
 /** 不按提供方列表顺序替用户选模型；已有但不再列出的值仍可读。 */
-export function ModelEditor({ title, value, options, change, disableLabel, exact = false }: {
+export function ModelEditor({ title, value, options, change, disableLabel }: {
   title: string; value: StudioModel | null; options?: ModelCatalog; change: (model: StudioModel | null) => void;
-  disableLabel?: string; exact?: boolean
+  disableLabel?: string
 }) {
   const { t } = useStudio()
   const provider = value?.provider ?? ''
@@ -73,7 +62,7 @@ export function ModelEditor({ title, value, options, change, disableLabel, exact
       <label className="as-setting-field"><span>{t('effort')}</span>
         <select value={effort} disabled={!model} onChange={event => change({ provider, model,
           ...(event.currentTarget.value ? { reasoningEffort: event.currentTarget.value } : {}) })}>
-          <option value="">{t(exact ? 'effortChoice' : 'optionalEffort')}</option>
+          <option value="">{t('optionalEffort')}</option>
           {effort && !efforts.includes(effort) && <option value={effort}>{options ? t('unavailableOption', { name: effort }) : effort}</option>}
           {efforts.map(item => <option key={item} value={item}>{item}</option>)}
         </select>

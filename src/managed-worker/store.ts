@@ -1,1926 +1,509 @@
-/** Durable execution authority and records for managed document Workers and Studio. */
 import { randomUUID } from 'node:crypto'
-import { chmodSync, closeSync, fchmodSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
+import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { backup, DatabaseSync, type SQLOutputValue } from 'node:sqlite'
-import { types } from 'node:util'
-import { studioArtifacts, studioBlockingItems, studioHiddenIds, studioPendingRecord, studioProject, studioProjects, studioRelatedWork, studioSession } from '../studio/domain.ts'
-import { StudioStore } from '../studio/store.ts'
-import { StudioRevisionStore } from '../studio/revision-store.ts'
-import { ADVISOR_SCHEMA, AdvisorStore, interruptAdvice } from './advisor-store.js'
-import { BOT_EXPERIENCE_SCHEMA, BotExperienceStore } from './bot-experience-store.js'
-import { DOCUMENT_CONTINUATION_SCHEMA, appendDocumentContinuationClaim, feishuDocumentContinuationLate, feishuDocumentContinuationSeen,
-  readDocumentContinuationSource, type DocumentContinuationSelection, type DocumentContinuationSource } from './document-continuation-store.js'
-import { DOCUMENT_FAILURE_NOTICE_SCHEMA, DocumentFailureNoticeStore, type DocumentFailureNotice } from './document-failure-notice-store.js'
-import { DOCUMENT_GUARD_REVIEW_SCHEMA, appendDocumentGuardReview, documentGuardReviewUsed, readDocumentGuardReviewReceipt,
-  readDocumentGuardReviewSource, type DocumentGuardReviewReceipt, type DocumentGuardReviewSource } from './document-guard-review-store.js'
-import { DOCUMENT_GUARD_SCHEMA, documentGuardCategory, isDocumentGuardToolCallId, matchesDocumentGuardNativeCall,
-  readDocumentGuardEvidence, readDocumentGuardEvidenceById, readDocumentGuardNativeCall, retainDocumentGuard,
-  type DocumentGuardCapture, type DocumentGuardEvidence, type DocumentGuardNativeCall, type DocumentGuardScope } from './document-guard-store.js'
-import { DOCUMENT_RECOVERY_SCHEMA, DocumentRecoveryStore, type DocumentFailure, type DocumentFailureInput } from './document-recovery-store.js'
-import { parseDraftPreference } from './draft-preference-request.js'
-import { DRAFT_PREFERENCE_SCHEMA, appendDraftPreference, currentDraftCitation, draftPreferenceText, pinnedDraftPreference,
-  type StudioDraftPreference } from './draft-preference-store.js'
-import { FEISHU_DELIVERY_SCHEMA, FeishuDeliveryStore, feishuDeliveryCoordinates } from './feishu-delivery-store.js'
-import { FEISHU_DRAFT_SCHEMA, FeishuDraftStore, feishuDraftSource, type StudioFeishuDraftHeader, type StudioFeishuDraftTask } from './feishu-draft-store.js'
-import { INSTRUCTION_SCHEMA, InstructionStore, type InstructionDecision, type StudioDocumentInstruction,
-  type StudioFeishuInstruction, type StudioInstructionInput } from './instruction-store.js'
-import { MEMORY_CITATION_SCHEMA } from './memory-citation-store.js'
-import { MEMORY_SCHEMA, MemoryStore } from './memory-store.js'
-import { PREFERENCE_CORRECTION_SCHEMA, closePreviousPreferenceCorrections } from './preference-correction-store.js'
-import { PREFERENCE_PROPOSAL_SCHEMA, closePreviousPreferenceProposals } from './preference-proposal-store.js'
-import { PREFERENCE_SCOPE_CHANGE_SCHEMA, SCOPE_CHANGE_ASSISTANT_SOURCE_GUARDS, SCOPE_CHANGE_SOURCE_CONFLICT,
-  closePreviousPreferenceScopeChanges } from './preference-scope-change-store.js'
-import { PROJECT_ARCHIVE_SCHEMA, ProjectArchiveStore } from './project-archive-store.js'
-import { PROJECT_DOCUMENT_SCHEMA, projectDocumentCommandUsed } from './project-document-store.js'
-import { PROJECT_FACT_USE_SCHEMA } from './project-fact-use-store.js'
-import { PROJECT_HANDOFF_SCHEMA } from './project-handoff-store.js'
-import { PROJECT_JOB_AUTO_SCHEMA } from './project-job-auto-store.js'
-import { PROJECT_JOB_CANDIDATE_SCHEMA, jobCandidateCommandUsed } from './project-job-candidate-store.js'
-import { PROJECT_JOB_START_SCHEMA } from './project-job-start-store.js'
-import { PROJECT_JOB_SCHEMA } from './project-job-store.js'
-import { PROJECT_RESULT_USE_SCHEMA, projectResultCommandUsed } from './project-result-use-store.js'
-import { PROJECT_SCHEMA, ProjectStore } from './project-store.js'
-import { PROJECT_WORK_BLOCK_SCHEMA, projectWorkBlockCommandUsed } from './project-work-block-store.js'
-import { PROJECT_WORK_MODEL_SCHEMA, projectWorkModelCommandUsed } from './project-work-model-store.js'
-import { PROJECT_WORK_TERMINATION_SCHEMA } from './project-work-termination-store.js'
-import { QUOTA_NOTICE_SCHEMA, QuotaNoticeStore, isQuotaNoticeMessageId, type StudioQuotaNotice } from './quota-notice-store.js'
-import { QUOTA_SCHEMA, QuotaStore, type StudioQuotaIncident } from './quota-store.js'
-import { SHARED_DOCUMENT_SCHEMA, appendSharedRevision, readSharedRevision,
-  type SharedDocumentRevision, type SharedDocumentTask } from './shared-document-store.js'
-import { STUDY_SCHEMA, StudyStore, assistantSourceUsed, interruptStudies } from './study-store.js'
-import { WATCHDOG_INDEXES, readWatchdogEntries, readWatchdogTarget,
-  type WatchdogQuota, type WatchdogSnapshot, type WatchdogTarget } from './watchdog-store.js'
+import { studioArtifacts, studioBlockingItems, studioHiddenIds, studioPendingRecord, studioProject, studioProjects, studioSession, studioTask, studioTasks } from '../studio/domain.ts'
+import { ASSISTANT_CONVERSATION, type StudioRecordRole, type StudioRole, type StudioTaskStatus, type StudioWorkerPermission } from '../studio/protocol.ts'
+import { STUDIO_SCHEMA, StudioStore } from '../studio/store.ts'
+import { MemoryStore } from './memory-store.ts'
+import { ProjectArchiveStore } from './project-archive-store.ts'
+import { ProjectStore } from './project-store.ts'
 
-export { EXPERIENCE_TEXT_LIMIT, isExperienceText, type BotExperience } from './bot-experience-store.js'
-export type { DocumentContinuationSelection, DocumentContinuationSource } from './document-continuation-store.js'
-export type { DocumentFailureNotice } from './document-failure-notice-store.js'
-export type { DocumentGuardReviewReceipt, DocumentGuardReviewSource } from './document-guard-review-store.js'
-export { documentGuardCategory, type DocumentGuardCapture, type DocumentGuardEvidence, type DocumentGuardNativeCall } from './document-guard-store.js'
-export type { DocumentFailure, DocumentFailureInput } from './document-recovery-store.js'
-export type { StudioDraftPreference } from './draft-preference-store.js'
-export type { StudioFeishuDraftTask } from './feishu-draft-store.js'
-export type { StudioFeishuInstruction } from './instruction-store.js'
-export { MEMORY_TEXT_LIMIT, PREFERENCE_CORRECTION_RECEIPT_PREFIX, PREFERENCE_PROPOSAL_INTENT_LIMIT,
-  PREFERENCE_PROPOSAL_RECEIPT_PREFIX, PREFERENCE_SCOPE_CHANGE_RECEIPT_PREFIX, isMemoryKey, isPreferenceText,
-  preferenceCorrectionReceiptId, preferenceProposalReceiptId, preferenceScopeChangeReceiptId,
-  type MemoryChange, type MemorySource, type PreferenceCitation, type PreferenceCorrectionInput, type PreferenceCorrectionReceipt,
-  type PreferenceProposal, type PreferenceProposalInput, type PreferenceScopeChangeInput, type PreferenceScopeChangeReceipt,
-  type StudioPreference } from './memory-store.js'
-export { PROJECT_FACT_QUOTE_LIMIT, isProjectFactKey, isProjectFactQuote, type ProjectFact } from './project-archive-store.js'
-export { PROJECT_WORK_BLOCK_TEXT_LIMIT, type ProjectWorkBlockView } from './project-work-block-store.js'
-export type { ProjectWorkFactUse } from './project-fact-use-store.js'
-export type { ProjectWorkTermination, ProjectWorkTerminationInput } from './project-work-termination-store.js'
-export type { StudioQuotaNotice } from './quota-notice-store.js'
-export type { StudioQuotaIncident, StudioQuotaReason } from './quota-store.js'
-export type { SharedDocumentRevision } from './shared-document-store.js'
-
-/** A failure does not confirm a write. Use the reason to block the action or guide the user through a retry. */
-export type ManagedResult<T> = { ok: true; value: T } | { ok: false; reason: string }
-
-/** Durable task state. The execution epoch, authorization version, and document version are checked separately. */
-export interface ManagedTask {
-  taskId: string
-  workerSessionId: string
-  executionEpoch: number
-  authorizationVersion: number
-  paused: boolean
-  documentVersion: number
-  sharedDocument?: SharedDocumentTask
-}
-
-/** The host retains the original permit for its associated tool call. A structurally identical copy is invalid. */
-export interface ManagedWritePermit {
-  readonly taskId: string
-  readonly workerSessionId: string
-  readonly executionEpoch: number
-  readonly authorizationVersion: number
-  readonly toolCallId: string
-  readonly expectedVersion: number
-  readonly documentId?: string
-  readonly text: string
-}
-
-/** Maximum request and result length in UTF-16 code units. */
-export const DRAFT_TEXT_LIMIT = 32_000
-
-/** Snapshot of the Worker's final text message and its event coordinates. */
-export interface StudioDraftResult {
-  text: string
-  messageId: string
-  eventSeq: number
-  turn: number
-}
-
-export interface StudioDraftTask {
-  taskId: string
-  assistantBotId: string
-  assistantSessionId: string
-  sourceMessageId: string
-  sourceRequestId: string
-  workerBotId: string
-  workerSessionId: string
-  executionEpoch: number
-  state: 'running' | 'completed' | 'failed' | 'interrupted'
-  preference?: StudioDraftPreference
-  result?: StudioDraftResult
-  failure?: string
-}
-
-/** Source coordinates describe the GUI request; they are not a permit for any action. */
-export interface StudioDraftInput {
-  assistantSessionId: string
-  sourceMessageId: string
-  sourceRequestId: string
-  workerSessionId: string
-  requestText: string
-}
-
-export interface StudioDraftExecution {
-  taskId: string
-  workerSessionId: string
-  executionEpoch: number
-}
-
-type InstructionInbox = { task: ManagedTask; pending?: StudioDocumentInstruction; remaining: number; narrowableLines?: number[] }
-
-type FeishuInstructionReceipt = {
-  disposition: 'recorded' | 'duplicate' | 'unbound' | 'finished'
-  taskId?: string
-  late?: boolean
-}
-
-type Rejection = Extract<ManagedResult<never>, { ok: false }>
-const accept = <T>(value: T): ManagedResult<T> => ({ ok: true, value })
-const deny = (reason: string): Rejection => ({ ok: false, reason })
-
-/** The task never changes its shared base when another actor advances the document. */
-function sharedDocumentConflict(task: ManagedTask): boolean {
-  const shared = task.sharedDocument
-  return !!shared && shared.headVersion !== shared.baseVersion
-}
-
-// Each epoch points to a Session binding that cannot be reused. Keep old bindings to distinguish unmanaged Sessions from replaced ones.
 const SCHEMA = `
-  CREATE TABLE IF NOT EXISTS managed_task (
-    task_id TEXT PRIMARY KEY,
-    execution_epoch INTEGER NOT NULL CHECK (execution_epoch BETWEEN 1 AND 9007199254740991),
-    authorization_version INTEGER NOT NULL CHECK (authorization_version BETWEEN 1 AND 9007199254740991),
-    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
-    approved_text TEXT NOT NULL,
-    FOREIGN KEY (task_id, execution_epoch) REFERENCES managed_session_binding (task_id, execution_epoch)
-      DEFERRABLE INITIALLY DEFERRED
+  CREATE TABLE studio_bot (
+    bot_id TEXT PRIMARY KEY, role TEXT NOT NULL CHECK (role IN ('assistant', 'leader')), created_at TEXT NOT NULL
   ) STRICT;
-  CREATE TABLE IF NOT EXISTS managed_session_binding (
-    session_id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL REFERENCES managed_task (task_id),
-    execution_epoch INTEGER NOT NULL CHECK (execution_epoch BETWEEN 1 AND 9007199254740991),
-    UNIQUE (task_id, execution_epoch)
+  CREATE TABLE studio_project (
+    project_id TEXT PRIMARY KEY, name TEXT NOT NULL, objective TEXT NOT NULL, workspace_path TEXT,
+    state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'archived')),
+    management_epoch INTEGER NOT NULL CHECK (management_epoch > 0), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   ) STRICT;
-  CREATE TABLE IF NOT EXISTS managed_document (
-    task_id TEXT PRIMARY KEY REFERENCES managed_task (task_id),
-    document_version INTEGER NOT NULL CHECK (document_version IN (1, 2)),
-    text TEXT NOT NULL
+  CREATE TABLE studio_project_leader (
+    project_id TEXT NOT NULL REFERENCES studio_project(project_id), management_epoch INTEGER NOT NULL CHECK (management_epoch > 0),
+    leader_bot_id TEXT NOT NULL REFERENCES studio_bot(bot_id), session_id TEXT NOT NULL, bound_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, management_epoch)
   ) STRICT;
-  CREATE TABLE IF NOT EXISTS managed_audit (
-    seq INTEGER PRIMARY KEY,
-    kind TEXT NOT NULL CHECK (kind IN ('create', 'pause', 'transfer', 'resume', 'commit')),
-    task_id TEXT NOT NULL,
-    session_id TEXT NOT NULL REFERENCES managed_session_binding (session_id),
-    execution_epoch INTEGER NOT NULL,
-    authorization_version INTEGER NOT NULL,
-    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
-    document_version INTEGER NOT NULL CHECK (document_version IN (1, 2)),
-    command_id TEXT UNIQUE,
-    tool_call_id TEXT,
-    at TEXT NOT NULL,
-    FOREIGN KEY (task_id, execution_epoch) REFERENCES managed_session_binding (task_id, execution_epoch),
-    UNIQUE (session_id, tool_call_id),
-    CHECK ((kind = 'commit' AND command_id IS NULL AND tool_call_id IS NOT NULL AND document_version = 2)
-      OR (kind <> 'commit' AND command_id IS NOT NULL AND tool_call_id IS NULL))
+  CREATE TABLE studio_session (
+    session_id TEXT PRIMARY KEY, bot_id TEXT, project_id TEXT, role TEXT NOT NULL,
+    readonly_legacy INTEGER NOT NULL DEFAULT 0 CHECK (readonly_legacy IN (0, 1)), created_at TEXT NOT NULL
   ) STRICT;
-  CREATE TABLE IF NOT EXISTS studio_document_scope_control (
-    request_id TEXT PRIMARY KEY REFERENCES agent_studio_message(id), task_id TEXT NOT NULL,
-    execution_epoch INTEGER NOT NULL, previous_authorization INTEGER NOT NULL, next_authorization INTEGER NOT NULL, kept_lines TEXT NOT NULL,
-    FOREIGN KEY (task_id, execution_epoch) REFERENCES managed_session_binding (task_id, execution_epoch)
+  CREATE TABLE studio_task (
+    task_id TEXT PRIMARY KEY, project_id TEXT REFERENCES studio_project(project_id), source_message_id TEXT, request_key TEXT UNIQUE,
+    requester_bot_id TEXT, assignee_bot_id TEXT, workspace_path TEXT,
+    permission TEXT NOT NULL DEFAULT 'read-only' CHECK (permission IN ('read-only', 'workspace-write')),
+    authorization_version INTEGER NOT NULL DEFAULT 1 CHECK (authorization_version > 0),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'waiting_approval', 'blocked', 'interrupted', 'cancelled', 'delivered')),
+    title TEXT NOT NULL DEFAULT '', request_text TEXT NOT NULL DEFAULT '', result_summary TEXT, check_result TEXT,
+    artifacts TEXT NOT NULL DEFAULT '[]', external_job TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   ) STRICT;
-  CREATE TABLE IF NOT EXISTS managed_host_run (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    run_id TEXT NOT NULL,
-    clean INTEGER NOT NULL CHECK (clean IN (0, 1))
+  CREATE INDEX studio_task_source ON studio_task(source_message_id, project_id);
+  CREATE TABLE studio_task_execution (
+    task_id TEXT NOT NULL REFERENCES studio_task(task_id), execution_epoch INTEGER NOT NULL CHECK (execution_epoch > 0),
+    session_id TEXT NOT NULL, bot_id TEXT, run_id TEXT NOT NULL, captured_management_epoch INTEGER, model_route TEXT,
+    started_at TEXT NOT NULL, ended_at TEXT, result_event_seq INTEGER, outcome TEXT,
+    PRIMARY KEY (task_id, execution_epoch)
   ) STRICT;
-  CREATE TABLE IF NOT EXISTS managed_recovery_pause (
-    task_id TEXT NOT NULL,
-    execution_epoch INTEGER NOT NULL,
-    authorization_version INTEGER NOT NULL,
-    run_id TEXT NOT NULL,
-    at TEXT NOT NULL,
-    PRIMARY KEY (task_id, authorization_version),
-    FOREIGN KEY (task_id, execution_epoch) REFERENCES managed_session_binding (task_id, execution_epoch)
+  CREATE UNIQUE INDEX studio_task_active_execution ON studio_task_execution(task_id) WHERE ended_at IS NULL;
+  CREATE UNIQUE INDEX studio_task_active_session ON studio_task_execution(session_id) WHERE ended_at IS NULL;
+  CREATE TABLE studio_project_archive (
+    project_id TEXT PRIMARY KEY REFERENCES studio_project(project_id), decisions TEXT NOT NULL DEFAULT '',
+    progress TEXT NOT NULL DEFAULT '', open_issues TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
   ) STRICT;
-  CREATE TABLE IF NOT EXISTS studio_assistant_bot (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    bot_id TEXT NOT NULL UNIQUE
+  CREATE TABLE studio_preference (
+    preference_id TEXT PRIMARY KEY, pref_key TEXT NOT NULL, project_id TEXT REFERENCES studio_project(project_id),
+    text TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'forgotten')),
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0), updated_at TEXT NOT NULL
   ) STRICT;
-  CREATE TABLE IF NOT EXISTS studio_assistant_binding (
-    session_id TEXT PRIMARY KEY,
-    bot_id TEXT NOT NULL REFERENCES studio_assistant_bot (bot_id),
-    UNIQUE (session_id, bot_id)
+  CREATE UNIQUE INDEX studio_preference_global ON studio_preference(pref_key) WHERE project_id IS NULL;
+  CREATE UNIQUE INDEX studio_preference_project ON studio_preference(project_id, pref_key) WHERE project_id IS NOT NULL;
+  CREATE TABLE studio_host_run (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1), run_id TEXT NOT NULL, clean INTEGER NOT NULL CHECK (clean IN (0, 1))
   ) STRICT;
-  CREATE TABLE IF NOT EXISTS studio_draft_task (
-    seq INTEGER PRIMARY KEY,
-    task_id TEXT NOT NULL UNIQUE,
-    assistant_bot_id TEXT NOT NULL,
-    assistant_session_id TEXT NOT NULL,
-    source_message_id TEXT NOT NULL,
-    source_request_id TEXT NOT NULL,
-    request_text TEXT NOT NULL,
-    worker_bot_id TEXT NOT NULL UNIQUE,
-    worker_session_id TEXT NOT NULL UNIQUE,
-    execution_epoch INTEGER NOT NULL CHECK (execution_epoch BETWEEN 1 AND 9007199254740991),
-    run_id TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('running', 'completed', 'failed', 'interrupted')),
-    result_text TEXT,
-    result_message_id TEXT,
-    result_event_seq INTEGER CHECK (result_event_seq BETWEEN 0 AND 9007199254740991),
-    result_turn INTEGER CHECK (result_turn BETWEEN 1 AND 9007199254740991),
-    failure TEXT,
-    FOREIGN KEY (assistant_session_id, assistant_bot_id) REFERENCES studio_assistant_binding (session_id, bot_id),
-    UNIQUE (assistant_session_id, source_request_id),
-    CHECK (assistant_session_id <> worker_session_id),
-    CHECK ((state = 'completed' AND result_text IS NOT NULL AND result_message_id IS NOT NULL
-      AND result_event_seq IS NOT NULL AND result_turn IS NOT NULL AND failure IS NULL)
-      OR (state <> 'completed' AND result_text IS NULL AND result_message_id IS NULL
-        AND result_event_seq IS NULL AND result_turn IS NULL AND (failure IS NULL) = (state = 'running')))
-  ) STRICT;
-  CREATE INDEX IF NOT EXISTS studio_draft_session_latest ON studio_draft_task (assistant_session_id, seq DESC);
-  CREATE INDEX IF NOT EXISTS studio_draft_source_message ON studio_draft_task (assistant_session_id, source_message_id);
 `
 
-const isText = (value: unknown): value is string => typeof value === 'string' && value.isWellFormed()
-const isId = (value: unknown): value is string => isText(value) && value.length > 0 && !value.includes('\0')
-const isVersion = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 1
-const isDraftText = (value: unknown): value is string => isText(value) && value.length > 0 && value.length <= DRAFT_TEXT_LIMIT
-const isEventSeq = (value: unknown): value is number => value === 0 || isVersion(value)
+const MIGRATED_AT = new Date(0).toISOString()
+export const studioNow = () => new Date().toISOString()
+type Row = Record<string, SQLOutputValue>
+const string = (row: Row | undefined, ...keys: string[]): string | null => {
+  for (const key of keys) if (typeof row?.[key] === 'string' && row[key] !== '') return row[key] as string
+  return null
+}
+const positive = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : 1
+const timestamp = (value: unknown): string => typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= 8.64e15
+  ? new Date(value).toISOString() : typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : MIGRATED_AT
+const quote = (name: string) => `"${name.replaceAll('"', '""')}"`
 
-const DRAFT_METADATA = `task_id, assistant_bot_id, assistant_session_id, source_message_id, source_request_id,
-  worker_bot_id, worker_session_id, execution_epoch, state, failure`
-
-/** Decode task metadata without selecting or requiring a completed result. */
-function readDraftRow(row: Record<string, SQLOutputValue>): StudioDraftTask {
-  const { task_id: taskId, assistant_bot_id: assistantBotId, assistant_session_id: assistantSessionId,
-    source_message_id: sourceMessageId, source_request_id: sourceRequestId, worker_bot_id: workerBotId,
-    worker_session_id: workerSessionId, execution_epoch: executionEpoch, state, failure } = row
-  if (!isId(taskId) || !isId(assistantBotId) || !isId(assistantSessionId) || !isId(sourceMessageId) || !isId(sourceRequestId)
-    || !isId(workerBotId) || !isId(workerSessionId) || !isVersion(executionEpoch)
-    || (state !== 'running' && state !== 'completed' && state !== 'failed' && state !== 'interrupted')) {
-    throw new Error('Invalid Studio draft task')
+/** 将旧表留作快照，只把显式白名单中的身份、索引和无保护结果复制到现役表。 */
+function migrateV1(db: DatabaseSync): void {
+  const old = new Set(db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table'").all().map(row => String(row.name)))
+  if (old.delete('studio_project')) {
+    db.exec('ALTER TABLE studio_project RENAME TO legacy_studio_project')
+    old.add('legacy_studio_project')
   }
-  const task: StudioDraftTask = { taskId, assistantBotId, assistantSessionId, sourceMessageId, sourceRequestId,
-    workerBotId, workerSessionId, executionEpoch, state }
-  if (state === 'failed' || state === 'interrupted') {
-    if (!isDraftText(failure)) throw new Error('Invalid Studio draft failure')
-    task.failure = failure
+  db.exec(SCHEMA)
+  db.exec(STUDIO_SCHEMA)
+  const rows = (table: string): Row[] => old.has(table) ? db.prepare(`SELECT * FROM ${quote(table)}`).all() : []
+  const botInsert = db.prepare('INSERT INTO studio_bot VALUES (?, ?, ?) ON CONFLICT(bot_id) DO NOTHING')
+  const ensureBot = (id: string, role: 'assistant' | 'leader', at: string) => {
+    const existing = db.prepare('SELECT role FROM studio_bot WHERE bot_id = ?').get(id)
+    const target = existing && existing.role !== role ? `${role}:${id}` : id
+    botInsert.run(target, role, at)
+    return target
   }
-  return task
+  for (const [table, role] of [['studio_assistant_bot', 'assistant'], ['studio_leader_bot', 'leader']] as const) {
+    for (const row of rows(table)) {
+      const id = string(row, 'bot_id', 'id')
+      if (id) ensureBot(id, role, timestamp(row.created_at))
+    }
+  }
+  const bindings = rows('studio_project_binding')
+  const projectIds = new Set<string>()
+  const projectInsert = db.prepare('INSERT INTO studio_project VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+  for (const row of rows('legacy_studio_project')) {
+    const id = string(row, 'project_id', 'id')
+    if (!id) continue
+    const related = bindings.filter(binding => binding.project_id === id)
+    const epoch = row.management_epoch == null ? Math.max(1, ...related.map(item => positive(item.management_epoch))) : positive(row.management_epoch)
+    const bound = related.find(item => positive(item.management_epoch) === epoch)
+    projectInsert.run(id, string(row, 'name', 'title') ?? id, string(row, 'objective', 'goal') ?? '',
+      string(row, 'workspace_path', 'workspace', 'cwd'), row.state === 'archived' ? 'archived' : 'active', epoch,
+      timestamp(row.created_at ?? bound?.bound_at), timestamp(row.updated_at ?? bound?.bound_at))
+    projectIds.add(id)
+  }
+  const register = db.prepare(`INSERT INTO studio_session VALUES (?, ?, ?, ?, 1, ?) ON CONFLICT(session_id) DO UPDATE SET
+    created_at = CASE WHEN studio_session.created_at = ? THEN excluded.created_at ELSE studio_session.created_at END`)
+  const addSession = (id: string | null, role: StudioRecordRole | 'legacy-protected', bot: string | null, project: string | null, time: unknown) => {
+    if (!id) return
+    register.run(id, bot, project === ASSISTANT_CONVERSATION ? null : project, role, timestamp(time), MIGRATED_AT)
+    if (role === 'legacy-protected') db.prepare("UPDATE studio_session SET role = 'legacy-protected' WHERE session_id = ?").run(id)
+  }
+  const byLeader = new Map<string, { project: string; bot: string }>()
+  for (const row of bindings) {
+    const project = string(row, 'project_id'), session = string(row, 'leader_session_id', 'session_id'), leader = string(row, 'leader_bot_id', 'bot_id')
+    const boundAt = timestamp(row.bound_at ?? row.created_at)
+    const bot = leader && ensureBot(leader, 'leader', boundAt)
+    addSession(session, 'leader', bot, project, boundAt)
+    if (!project || !projectIds.has(project) || !session || !bot) continue
+    db.prepare('INSERT INTO studio_project_leader VALUES (?, ?, ?, ?, ?)').run(project, positive(row.management_epoch), bot, session, boundAt)
+    byLeader.set(session, { project, bot })
+  }
+  for (const row of rows('studio_assistant_binding')) {
+    const bot = string(row, 'bot_id', 'assistant_bot_id')
+    addSession(string(row, 'session_id', 'assistant_session_id'), 'assistant', bot && ensureBot(bot, 'assistant', timestamp(row.created_at)), null, row.created_at)
+  }
+  const protectedDrafts = new Set(rows('studio_draft_preference').map(row => string(row, 'task_id')))
+  const protectedWork = new Set(['studio_project_work_fact', 'studio_project_work_result_use', 'studio_project_document']
+    .flatMap(table => rows(table).map(row => string(row, 'work_id', 'task_id'))))
+  const protectedSessions = new Set<string>()
+  const dispatches = rows('studio_project_dispatch')
+  const byWork = new Map<string, Row[]>()
+  for (const row of dispatches) {
+    const workId = string(row, 'work_id', 'task_id')
+    if (workId) byWork.set(workId, [...(byWork.get(workId) ?? []), row])
+  }
+  const addTask = db.prepare(`INSERT INTO studio_task (task_id, project_id, source_message_id, request_key, requester_bot_id,
+    assignee_bot_id, status, title, request_text, result_summary, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+  const addExecution = db.prepare(`INSERT INTO studio_task_execution (task_id, execution_epoch, session_id, bot_id, run_id,
+    captured_management_epoch, started_at, ended_at, result_event_seq, outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+  const usedKeys = new Set<string>()
+  for (const [table, draft] of [['studio_draft_task', true], ['studio_project_work', false]] as const) {
+    for (const row of rows(table)) {
+      const id = string(row, 'task_id', 'work_id')
+      if (!id) continue
+      const leader = byLeader.get(string(row, 'leader_session_id') ?? '')
+      const configuredProject = leader?.project ?? string(row, 'project_id')
+      const project = configuredProject && projectIds.has(configuredProject) ? configuredProject : null
+      const executions = draft ? [row] : byWork.get(id) ?? []
+      const protectedResult = (draft ? protectedDrafts : protectedWork).has(id)
+      for (const exec of executions) {
+        const session = string(exec, 'worker_session_id', 'session_id')
+        if (protectedResult && session) protectedSessions.add(session)
+        addSession(session, protectedResult ? 'legacy-protected' : 'draft-worker', string(exec, 'worker_bot_id'), project, exec.created_at)
+      }
+      // 受保护的工作连请求和执行坐标也不进入任务视图，避免通过新结果入口重新取回旧证据。
+      if (protectedResult || (!draft && !project) || db.prepare('SELECT 1 FROM studio_task WHERE task_id = ?').get(id)) continue
+      const completed = executions.filter(exec => (exec.state ?? exec.status) === 'completed')
+        .sort((a, b) => positive(b.execution_epoch) - positive(a.execution_epoch))[0]
+      let text = string(completed, 'result_text'), seq: unknown = completed?.result_event_seq
+      if (completed && !draft && !text) {
+        const json = string(completed, 'result_json')
+        if (json && json.length <= 208_384) try {
+          const result = JSON.parse(json) as { text?: unknown; eventSeq?: unknown } | null
+          text = typeof result?.text === 'string' ? result.text : null
+          seq = result?.eventSeq
+        } catch { /* 无法验证旧结果时只保留中断记录。 */ }
+      }
+      const resultSession = string(completed, 'worker_session_id', 'session_id')
+      const delivered = !!(text?.trim() && resultSession && typeof seq === 'number' && Number.isSafeInteger(seq) && seq >= 0)
+      const request = string(row, 'request_text') ?? ''
+      const source = string(row, 'source_message_id')
+      const requestId = string(row, 'source_request_id', 'request_key')
+      const key = requestId && studioRequestKey(project, requestId)
+      const uniqueKey = key && !usedKeys.has(key) ? key : null
+      if (key) usedKeys.add(key)
+      const time = timestamp(row.created_at)
+      addTask.run(id, project, source, uniqueKey, leader?.bot ?? string(row, 'assistant_bot_id', 'requester_bot_id'),
+        string(completed ?? executions.at(-1), 'worker_bot_id'), delivered ? 'delivered' : 'interrupted', request.slice(0, 120).toWellFormed(),
+        request, delivered ? text : null, time, timestamp(row.updated_at ?? row.created_at))
+      for (const exec of executions) {
+        const session = string(exec, 'worker_session_id', 'session_id')
+        if (!session) continue
+        const success = exec === completed && delivered
+        const started = timestamp(exec.started_at ?? row.created_at)
+        addExecution.run(id, positive(exec.execution_epoch), session, string(exec, 'worker_bot_id'), string(exec, 'run_id') ?? 'legacy',
+          draft ? null : positive(exec.management_epoch), started, timestamp(exec.ended_at ?? exec.started_at ?? row.created_at),
+          success ? seq as number : null, success ? 'delivered' : 'interrupted')
+      }
+    }
+  }
+  const sessionColumns: ReadonlyArray<[string, StudioRecordRole, ...string[]]> = [
+    ['managed_session_binding', 'document-worker', 'session_id', 'worker_session_id'],
+    ['studio_assistant_binding', 'assistant', 'session_id', 'assistant_session_id'],
+    ['studio_project_binding', 'leader', 'leader_session_id', 'session_id'],
+    ['studio_draft_task', 'assistant', 'assistant_session_id'], ['studio_draft_task', 'draft-worker', 'worker_session_id', 'session_id'],
+    ['studio_project_work', 'leader', 'leader_session_id'], ['studio_project_dispatch', 'leader', 'leader_session_id'], ['studio_project_dispatch', 'draft-worker', 'worker_session_id', 'session_id'],
+    ['studio_study_task', 'assistant', 'assistant_session_id', 'owner_session_id'],
+    ['studio_study_task', 'study-worker', 'session_id', 'worker_session_id', 'study_session_id'], ['studio_study', 'assistant', 'assistant_session_id'],
+    ['studio_study_step', 'study-worker', 'worker_session_id', 'session_id'], ['studio_feishu_draft', 'draft-worker', 'worker_session_id', 'session_id'],
+    ['studio_advisor_run', 'advisor', 'advisor_session_id', 'worker_session_id', 'session_id'],
+    ['studio_advisor_run', 'legacy', 'owner_session_id', 'requester_session_id'],
+    ['studio_advice', 'advisor', 'advisor_session_id', 'session_id'], ['studio_advice', 'legacy', 'requester_session_id'],
+    ['agent_studio_revision', 'draft-worker', 'worker_session_id', 'session_id'], ['agent_studio_revision', 'legacy', 'owner_session_id'],
+    ['agent_studio_assistant', 'assistant', 'session_id'], ['agent_studio_parallel_turn', 'assistant', 'session_id'],
+    ['agent_studio_session', 'legacy', 'id', 'session_id'], ['agent_studio_message', 'legacy', 'run_session_id', 'source_session_id'],
+  ]
+  for (const [table, fallback, ...columns] of sessionColumns) {
+    for (const row of rows(table)) {
+      const project = string(row, 'project_id', 'conversation_id')
+      const role = table === 'agent_studio_session' ? String(row.role ?? fallback) as StudioRecordRole : fallback
+      for (const column of columns) addSession(string(row, column), role, string(row, 'bot_id'), project, row.created_at ?? row.bound_at)
+      if (table === 'agent_studio_revision' && ((row.work_type === 'draft' && protectedDrafts.has(string(row, 'work_id')))
+        || (row.work_type === 'work' && protectedWork.has(string(row, 'work_id'))))) {
+        const session = string(row, 'worker_session_id')
+        if (session) protectedSessions.add(session)
+      }
+    }
+  }
+  for (const id of protectedSessions) addSession(id, 'legacy-protected', null, null, undefined)
+  const revisionByKey = new Map<string, Row>()
+  for (const row of rows('studio_memory_revision')) {
+    const key = string(row, 'key', 'pref_key')
+    if (key && (!revisionByKey.has(key) || positive(row.revision) > positive(revisionByKey.get(key)?.revision))) revisionByKey.set(key, row)
+  }
+  for (const head of rows('studio_memory_head')) {
+    const key = string(head, 'key', 'pref_key')
+    if (!key) continue
+    const journal = revisionByKey.get(key)
+    const project = string(head, 'project_id')
+    const { state } = head
+    const text = string(journal ?? head, 'text')
+    if (journal && (journal.revision !== head.revision || journal.state !== state || string(journal, 'project_id') !== project)) continue
+    if (project && !projectIds.has(project) || (state !== 'active' && state !== 'forgotten') || (state === 'active' && !text?.trim())) continue
+    const version = head.revision ?? head.version
+    if (typeof version !== 'number' || !Number.isSafeInteger(version) || version < 1) continue
+    db.prepare('INSERT INTO studio_preference VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(string(head, 'preference_id') ?? randomUUID(), key, project, state === 'forgotten' ? '' : text!, state,
+        version, timestamp(journal?.at ?? head.updated_at))
+  }
+  // 禁止 V1 写回旧账本，同时保留旧表、外键和历史查询；已发布的对话、设置和通道表仍可正常写入。
+  for (const table of old) {
+    if (!/^(?:studio_|managed_|legacy_studio_)/u.test(table) && table !== 'agent_studio_revision') continue
+    for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
+      db.exec(`CREATE TRIGGER ${quote(`legacy_readonly_${table}_${op}`)} BEFORE ${op} ON ${quote(table)}
+        BEGIN SELECT RAISE(ABORT, 'Legacy Studio snapshot is read-only'); END`)
+    }
+  }
+  if (db.prepare('PRAGMA foreign_key_check').get()) throw new Error('Studio V1 migration failed foreign key validation')
+  db.exec('PRAGMA user_version=1')
 }
 
-/** Copy validated execution coordinates before entering the run fence. */
-function draftExecution(execution: StudioDraftExecution): StudioDraftExecution | undefined {
-  if (!execution) return
-  const { taskId, workerSessionId, executionEpoch } = execution
-  if (isId(taskId) && isId(workerSessionId) && isVersion(executionEpoch)) return { taskId, workerSessionId, executionEpoch }
-}
-
-/** Restrict file permissions in the trusted host directory before SQLite opens the files. Reject symlinks and other non-regular files. */
 function privateFile(path: string, create: boolean): void {
   const existing = lstatSync(path, { throwIfNoEntry: false })
   if (existing) {
-    if (!existing.isFile()) throw new Error('Managed Worker database requires regular files')
-    // Do not open and close an existing file: on POSIX, closing it may release locks held by SQLite connections in this process.
+    if (!existing.isFile()) throw new Error('Studio database requires regular files')
     if ((existing.mode & 0o7777) !== 0o600) chmodSync(path, 0o600)
-  } else if (create) {
-    const fd = openSync(path, 'wx', 0o600)
-    try { fchmodSync(fd, 0o600) } finally { closeSync(fd) }
-  }
+  } else if (create) closeSync(openSync(path, 'wx', 0o600))
 }
 
-/** Read only two own data properties. Reject getters and extra fields so callers cannot select another resource or write method. */
-function documentAction(action: unknown): { expectedVersion: number; text: string } | undefined {
-  if (typeof action !== 'object' || action === null || types.isProxy(action)) return
-  const prototype: unknown = Object.getPrototypeOf(action)
-  if ((prototype !== Object.prototype && prototype !== null) || Reflect.ownKeys(action).length !== 2) return
-  const version = Object.getOwnPropertyDescriptor(action, 'expectedVersion')
-  const text = Object.getOwnPropertyDescriptor(action, 'text')
-  if (version?.enumerable && text?.enumerable && Object.hasOwn(version, 'value') && Object.hasOwn(text, 'value')
-    && isVersion(version.value) && isText(text.value)) return { expectedVersion: version.value, text: text.value }
+export const studioRequestKey = (projectId: string | null, requestId: string) => JSON.stringify([projectId, requestId])
+export interface StudioTaskInput {
+  projectId: string | null; sourceMessageId: string; requestId: string; requesterBotId: string;
+  workspacePath: string | null; permission: StudioWorkerPermission; requestText: string; title?: string
+  /** 项目派工必须在登记事务内再次核验当时的 Leader。 */
+  leader?: { sessionId: string; managementEpoch: number }
+}
+export interface StudioExecution {
+  taskId: string; executionEpoch: number; authorizationVersion: number; sessionId: string; runId: string; managementEpoch: number | null
 }
 
-/** Copy the caller's line numbers without invoking accessors or allowing sparse or duplicate entries. */
-function readKeptLines(value: unknown): Set<number> | undefined {
-  if (types.isProxy(value) || !Array.isArray(value)) return
-  const lines = new Set<number>()
-  for (let index = 0; index < value.length; index++) {
-    const entry = Object.getOwnPropertyDescriptor(value, index)
-    if (!entry || !Object.hasOwn(entry, 'value') || !isVersion(entry.value) || lines.has(entry.value)) return
-    lines.add(entry.value)
-  }
-  return lines
-}
-
-/** Split content and EOLs losslessly. Only content at even offsets can participate in a narrowing. */
-function documentLineChanges(baselineText: string, approvedText: string):
-  { baseline: string[]; approved: string[]; changedLines: number[] } | undefined {
-  const eol = /(\r\n|\r|\n)/
-  const baseline = baselineText.split(eol)
-  const approved = approvedText.split(eol)
-  if (baseline.length !== approved.length) return
-  const changedLines: number[] = []
-  for (let offset = 0; offset < baseline.length; offset++) {
-    if (baseline[offset] === approved[offset]) continue
-    if (offset % 2 !== 0) return
-    changedLines.push(offset / 2 + 1)
-  }
-  // Fewer than two changes cannot yield a strict, nonempty subset.
-  if (changedLines.length < 2) return
-  return { baseline, approved, changedLines }
-}
-
-/** A Feishu source without a confirmed non-late ordering cannot narrow the document. */
-function instructionOrderKnown(instruction: StudioDocumentInstruction): boolean {
-  return instruction.source.channel !== 'feishu' || instruction.feishu?.late === false
-}
-
-/** Do not treat writes ignored by SQLite as successful. This applies to task state, document text, and any audit insert skipped by a trigger. */
-function requireWrite(changes: number | bigint): void {
-  if (changes !== 1 && changes !== 1n) throw new Error('Managed Worker write did not affect exactly one row')
-}
-
-/** Single-host SQLite Store. State, recovery fences, and audit records are durable; tool permits belong only to this Store. */
+/** 统一任务、项目和对话账本共用连接和运行栅栏。所有状态更新必须属于当前宿主。 */
 export class ManagedWorkerStore {
   readonly #db: DatabaseSync
-  readonly #permits = new WeakMap<ManagedWritePermit, boolean>()
   readonly #runId = randomUUID()
-  private readonly frozenTasks = new Set<string>()
-  private readonly frozenSessions = new Set<string>()
-  private readonly feishuDrafts = new FeishuDraftStore(() => this.db, this.#runId, isDraftText)
-  private readonly feishuDeliveries = new FeishuDeliveryStore(() => this.db, this.#runId)
-  // Only the configured text chat can claim a draft. Its synchronous start grant expires, but the SQLite claim remains.
-  private readonly pendingFeishuDraftClaims = new Map<string, number>()
-  private readonly feishuCombinedScope?: string
-  private readonly instructions = new InstructionStore(() => this.db)
-  private readonly documentRecovery = new DocumentRecoveryStore({
-    db: () => this.db,
-    runId: this.#runId,
-    write: operation => this.write(operation),
-    snapshot: operation => this.snapshot(operation),
-    task: taskId => this.task(taskId),
-    hold: task => this.documentRecoveryHold(task),
-    replacementHold: sessionId => this.sessionBound(sessionId) ? 'SESSION_ALREADY_BOUND'
-      : this.frozenSessions.has(sessionId) ? 'PAUSE_UNCONFIRMED' : undefined,
-    transfer: (task, sessionId, commandId) => this.transferTask(task, sessionId, commandId, true),
-  })
-  private readonly documentFailureNotices = new DocumentFailureNoticeStore(() => this.db, this.#runId, evidenceId => {
-    const current = this.documentRecovery.eligible(evidenceId)
-    return current.ok ? accept(current.value.failure) : current
-  })
-  private readonly quota: QuotaStore
-  private readonly quotaNotices = new QuotaNoticeStore(() => this.db, this.#runId)
-  // The failed capture may not identify a task. Keep this document-wide fence until a new run recovers the dirty marker.
-  private captureFault = false
-  private closed = false
-  readonly recoveredTasks: number
-  /** Internal Studio facets share this Store's connection and run fence. */
-  readonly projects: ProjectStore
-  readonly projectArchive: ProjectArchiveStore
-  readonly botExperience: BotExperienceStore
-  readonly studies: StudyStore
-  readonly advice: AdvisorStore
-  readonly memory: MemoryStore
+  #closed = false
   readonly studio: StudioStore
-  readonly revisions: StudioRevisionStore
+  readonly projects: ProjectStore
+  readonly memory: MemoryStore
+  readonly projectArchive: ProjectArchiveStore
+  readonly recoveredTasks: number
+  readonly assistantBotId: string
 
-  /** Open the database under the host directory lock. Do not enable actions until the recovery transaction has committed. */
-  constructor(path: string, quotaPoolIds: readonly string[] = [], private readonly quotaNoticeScope?: string,
-    private readonly feishuText?: Readonly<{ scope: string; documentCorrections: boolean }>, private readonly documentFailureNoticeScope?: string) {
-    if (!isId(path) || path === ':memory:') throw new Error('Managed Worker requires a persistent SQLite path')
-    if (quotaNoticeScope !== undefined && !isId(quotaNoticeScope)) throw new Error('Invalid Studio quota notice scope')
-    if (feishuText !== undefined && !isId(feishuText.scope)) throw new Error('Invalid Studio Feishu text scope')
-    this.feishuCombinedScope = feishuText?.documentCorrections === true ? feishuText.scope : undefined
-    if (documentFailureNoticeScope !== undefined && !isId(documentFailureNoticeScope)) throw new Error('Invalid Studio document failure notice scope')
-    this.quota = new QuotaStore(quotaPoolIds, () => this.db, operation => this.write(operation), operation => this.snapshot(operation))
+  constructor(path: string) {
+    if (!path || path === ':memory:') throw new Error('Studio requires a persistent SQLite path')
     const file = resolve(path)
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
     privateFile(file, true)
     const dbPath = realpathSync(file)
-    // New WAL and SHM files inherit database permissions. Tighten permissions on existing auxiliary files before reopening the database.
     for (const suffix of ['-wal', '-shm', '-journal']) privateFile(dbPath + suffix, false)
     this.#db = new DatabaseSync(dbPath)
+    const db = this.#db
     try {
-      if (this.db.prepare('PRAGMA journal_mode=WAL').get()?.journal_mode !== 'wal') throw new Error('Cannot enable WAL for Managed Worker')
-      this.db.exec('PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON')
-      const started = this.transaction(() => {
-        this.db.exec(SCHEMA)
-        this.db.exec(PROJECT_SCHEMA)
-        this.db.exec(PROJECT_HANDOFF_SCHEMA)
-        this.db.exec(PROJECT_ARCHIVE_SCHEMA)
-        this.db.exec(BOT_EXPERIENCE_SCHEMA)
-        this.db.exec(MEMORY_SCHEMA)
-        this.db.exec(MEMORY_CITATION_SCHEMA)
-        this.db.exec(DRAFT_PREFERENCE_SCHEMA)
-        this.db.exec(PREFERENCE_PROPOSAL_SCHEMA)
-        this.db.exec(PREFERENCE_CORRECTION_SCHEMA)
-        this.db.exec(PREFERENCE_SCOPE_CHANGE_SCHEMA)
-        this.db.exec(STUDY_SCHEMA)
-        this.db.exec(ADVISOR_SCHEMA)
-        this.db.exec(SCOPE_CHANGE_ASSISTANT_SOURCE_GUARDS)
-        this.db.exec(PROJECT_DOCUMENT_SCHEMA)
-        this.db.exec(PROJECT_JOB_SCHEMA)
-        this.db.exec(PROJECT_JOB_AUTO_SCHEMA)
-        this.db.exec(PROJECT_JOB_START_SCHEMA)
-        this.db.exec(PROJECT_FACT_USE_SCHEMA)
-        this.db.exec(PROJECT_RESULT_USE_SCHEMA)
-        this.db.exec(PROJECT_WORK_MODEL_SCHEMA)
-        this.db.exec(PROJECT_WORK_BLOCK_SCHEMA)
-        this.db.exec(PROJECT_JOB_CANDIDATE_SCHEMA)
-        this.db.exec(PROJECT_WORK_TERMINATION_SCHEMA)
-        this.db.exec(INSTRUCTION_SCHEMA)
-        this.db.exec(FEISHU_DRAFT_SCHEMA)
-        this.db.exec(FEISHU_DELIVERY_SCHEMA)
-        this.db.exec(SHARED_DOCUMENT_SCHEMA)
-        this.db.exec(DOCUMENT_CONTINUATION_SCHEMA)
-        this.db.exec(DOCUMENT_RECOVERY_SCHEMA)
-        this.db.exec(DOCUMENT_GUARD_SCHEMA)
-        this.db.exec(DOCUMENT_GUARD_REVIEW_SCHEMA)
-        this.db.exec(DOCUMENT_FAILURE_NOTICE_SCHEMA)
-        this.documentFailureNotices.recoverSending()
-        this.db.exec(QUOTA_SCHEMA)
-        this.db.exec(QUOTA_NOTICE_SCHEMA)
-        this.db.exec(WATCHDOG_INDEXES)
-        this.quotaNotices.recoverSending()
-        const previous = this.db.prepare('SELECT clean FROM managed_host_run WHERE singleton = 1').get()
-        // Unlike document recovery, a previously unrecorded Host run is not evidence of an unconfirmed quota stop.
-        this.quota.start(previous !== undefined && previous.clean !== 1)
-        // A failed pause may have left no task ID in durable storage. A dirty run (or a pre-fence database) cannot carry forward any pending write authorization.
-        const recoveredTasks = previous?.clean === 1 ? 0 : this.pauseUnfinishedTasks()
-        // A draft can never be resumed by a new host run, even after a clean stop.
-        this.db.exec(`UPDATE studio_draft_task SET state = 'interrupted', failure = 'HOST_RESTARTED' WHERE state = 'running'`)
-        if (this.db.prepare("SELECT 1 FROM studio_draft_task WHERE state = 'running' LIMIT 1").get()) {
-          throw new Error('Cannot interrupt previous Studio drafts')
-        }
-        this.feishuDrafts.interruptRunning()
-        interruptStudies(this.db)
-        interruptAdvice(this.db)
-        // A restart frees only reservations that never entered the model. Running attempts remain terminal.
-        // Releasing a reservation never unspends a grant or model selection; unspent choices survive the restart.
-        this.db.exec(`UPDATE studio_project_dispatch SET
-          state = CASE state WHEN 'reserved' THEN 'released' ELSE 'interrupted' END,
-          failure = 'HOST_RESTARTED' WHERE state IN ('reserved', 'running')`)
-        if (this.db.prepare("SELECT 1 FROM studio_project_dispatch WHERE state IN ('reserved', 'running') LIMIT 1").get()) {
-          throw new Error('Cannot recover previous Studio project dispatches')
-        }
-        // Native confirmation prompts belong to the previous run. Retain their evidence but do not recover consent.
-        this.db.prepare(`UPDATE studio_project_proposal SET state = 'closed', decided_at = ? WHERE state = 'pending'`)
-          .run(new Date().toISOString())
-        if (this.db.prepare("SELECT 1 FROM studio_project_proposal WHERE state = 'pending' LIMIT 1").get()) {
-          throw new Error('Cannot close previous Studio project proposals')
-        }
-        closePreviousPreferenceProposals(this.db)
-        closePreviousPreferenceCorrections(this.db)
-        closePreviousPreferenceScopeChanges(this.db)
-        requireWrite(this.db.prepare(`INSERT INTO managed_host_run VALUES (1, ?, 0)
-          ON CONFLICT (singleton) DO UPDATE SET run_id = excluded.run_id, clean = 0`).run(this.#runId).changes)
-        return accept(recoveredTasks)
+      // 未知版本在写入数据库前即拒绝；锁内再检查一次，避免并发打开重复执行迁移。
+      const checkVersion = () => {
+        const version = db.prepare('PRAGMA user_version').get()?.user_version
+        if (version !== 0 && version !== 1) throw new Error(`Unsupported Studio SQLite user_version: ${String(version)}`)
+        return version
+      }
+      checkVersion()
+      if (db.prepare('PRAGMA journal_mode=WAL').get()?.journal_mode !== 'wal') throw new Error('Cannot enable Studio WAL')
+      db.exec('PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON')
+      const started = this.#transaction(() => {
+        if (checkVersion() === 0) migrateV1(db)
+        const now = studioNow()
+        const recovered = this.#interruptAll(now, 'host-restarted')
+        db.prepare(`INSERT INTO studio_host_run VALUES (1, ?, 0)
+          ON CONFLICT(singleton) DO UPDATE SET run_id = excluded.run_id, clean = 0`).run(this.#runId)
+        const existing = db.prepare("SELECT bot_id FROM studio_bot WHERE role = 'assistant' ORDER BY created_at, bot_id LIMIT 1").get()
+        const bot = string(existing, 'bot_id') ?? randomUUID()
+        if (!existing) db.prepare("INSERT INTO studio_bot VALUES (?, 'assistant', ?)").run(bot, now)
+        return { recovered, bot }
       })
-      if (!started.ok) throw new Error('Cannot establish Managed Worker run')
-      this.recoveredTasks = started.value
-      this.projects = new ProjectStore({
-        db: () => this.db,
-        write: operation => this.write(operation),
-        snapshot: operation => this.snapshot(operation),
-        ownsRun: () => this.ownsRun(),
-        runId: this.#runId,
-        assistantBinding: sessionId => this.assistantBinding(sessionId),
-        nonProjectSessionBound: sessionId => this.nonProjectSessionBound(sessionId),
-        documentTask: taskId => this.task(taskId),
-        documentHold: task => this.projectDocumentHold(task),
-        documentCommandUsed: commandId => this.commandUsed(commandId),
-        // Resolve the verified archive head within the calling project transaction, not a nested snapshot.
-        exactFactQuote: (projectId, key, revision) => this.projectArchive.exactQuote(projectId, key, revision),
-      })
-      this.projectArchive = new ProjectArchiveStore({
-        db: () => this.db,
-        write: operation => this.write(operation),
-        snapshot: operation => this.snapshot(operation),
-        authority: sessionId => this.projects.adviceAuthority(sessionId),
-        workEvidence: (projectId, workId) => this.projects.workEvidence(projectId, workId),
-      })
-      this.botExperience = new BotExperienceStore({
-        db: () => this.db,
-        write: operation => this.write(operation),
-        snapshot: operation => this.snapshot(operation),
-        authority: sessionId => this.projects.adviceAuthority(sessionId),
-        sourceCurrent: (projectId, key, revision) => this.projectArchive.sourceCurrent(projectId, key, revision),
-      })
-      this.memory = new MemoryStore({
-        db: () => this.db,
-        write: operation => this.write(operation),
-        snapshot: operation => this.snapshot(operation),
-        assistantBinding: sessionId => this.assistantBinding(sessionId),
-        ordinaryAssistantBinding: sessionId => this.ordinaryAssistantBinding(sessionId),
-        runId: this.#runId,
-      })
-      this.studies = new StudyStore({
-        db: () => this.db,
-        write: operation => this.write(operation),
-        snapshot: operation => this.snapshot(operation),
-        runId: this.#runId,
-        assistantBinding: sessionId => this.assistantBinding(sessionId),
-        sessionBound: sessionId => this.sessionBound(sessionId),
-      })
-      this.advice = new AdvisorStore({
-        db: () => this.db,
-        write: operation => this.write(operation),
-        snapshot: operation => this.snapshot(operation),
-        runId: this.#runId,
-        sessionBound: sessionId => this.sessionBound(sessionId),
-        assistantBinding: sessionId => this.ordinaryAssistantBinding(sessionId),
-        leaderBinding: sessionId => this.nonProjectSessionBound(sessionId) ? undefined : this.projects.binding(sessionId),
-        adviceAuthority: sessionId => this.projects.adviceAuthority(sessionId),
-        workEvidence: (projectId, workId) => this.projects.workEvidence(projectId, workId),
-      })
-      // Studio's UI ledger shares this connection, but owns its transactions after the host run has been established.
-      const assertStudioRun = () => this.assertStudioRun()
-      this.studio = new StudioStore(this.db, assertStudioRun)
-      this.revisions = new StudioRevisionStore(this.db, assertStudioRun)
+      this.assistantBotId = started.bot
+      this.recoveredTasks = started.recovered
+      const access = { db, write: <T>(fn: () => T) => this.write(fn), assertActive: () => this.assertActive() }
+      this.projects = new ProjectStore(access)
+      this.memory = new MemoryStore(access)
+      this.projectArchive = new ProjectArchiveStore(access)
+      this.studio = new StudioStore(db, access.assertActive, true)
       this.studio.recover()
-      this.revisions.recover()
     } catch (error) {
-      try { this.close() } catch { /* Preserve the initialization error. */ }
+      try { this.close() } catch { /* 保留启动错误。 */ }
       throw error
     }
   }
 
-  /** Audit each system pause separately from user commands. Leave committed documents and already paused tasks unchanged. */
-  private pauseUnfinishedTasks(): number {
-    const rows = this.db.prepare(`SELECT task_id, execution_epoch, authorization_version FROM managed_task
-      JOIN managed_document USING (task_id) WHERE paused = 0 AND document_version = 1`).all()
-    const update = this.db.prepare('UPDATE managed_task SET paused = 1, authorization_version = authorization_version + 1 WHERE task_id = ?')
-    const audit = this.db.prepare(`INSERT INTO managed_recovery_pause (task_id, execution_epoch, authorization_version, run_id, at)
-      VALUES (?, ?, ?, ?, ?)`)
-    for (const { task_id: taskId, execution_epoch: epoch, authorization_version: revision } of rows) {
-      if (!isId(taskId) || !isVersion(epoch) || !isVersion(revision)) throw new Error('Invalid Managed Worker recovery state')
-      requireWrite(update.run(taskId).changes)
-      requireWrite(audit.run(taskId, epoch, revision + 1, this.#runId, new Date().toISOString()).changes)
+  #transaction<T>(fn: () => T): T {
+    const db = this.#db
+    db.exec('BEGIN IMMEDIATE')
+    try { const result = fn(); db.exec('COMMIT'); return result }
+    catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error }
+  }
+
+  assertActive(): void {
+    if (this.#closed || !this.#db.prepare('SELECT 1 FROM studio_host_run WHERE singleton = 1 AND run_id = ? AND clean = 0').get(this.#runId)) {
+      throw new Error('Studio host run is no longer active')
     }
-    return rows.length
   }
 
-  private get db(): DatabaseSync {
-    if (this.closed) throw new Error('Managed Worker store is closed')
-    return this.#db
+  write<T>(operation: () => T): T {
+    return this.#transaction(() => { this.assertActive(); return operation() })
   }
 
-  /** Mark a normal stop only after admission is disabled and all pause, capture, and quota fences are confirmed. */
+  #interruptAll(at: string, reason: string): number {
+    const db = this.#db
+    const { changes } = db.prepare(`UPDATE studio_task SET status = 'interrupted', authorization_version = authorization_version + 1,
+      updated_at = ? WHERE status IN ('queued', 'running', 'waiting_approval')`).run(at)
+    db.prepare('UPDATE studio_task_execution SET ended_at = ?, outcome = ? WHERE ended_at IS NULL').run(at, reason)
+    return Number(changes)
+  }
+
+  /** 宿主先撤销活动执行，再通知原生执行结束。 */
+  interruptActiveTasks(): number { return this.write(() => this.#interruptAll(studioNow(), 'host-stopped')) }
+
+  /** 在停止接收新操作、排空所有运行句柄后关闭本次写栅栏。 */
   finishRun(): void {
-    if (this.closed || this.captureFault || this.frozenTasks.size || this.frozenSessions.size) return
-    this.transaction(() => {
-      if (!this.ownsRun()) return deny('STALE_HOST_RUN')
-      if (!this.quota.canFinishRun()) return deny('QUOTA_UNCONFIRMED')
-      requireWrite(this.db.prepare('UPDATE managed_host_run SET clean = 1 WHERE singleton = 1 AND run_id = ?')
-        .run(this.#runId).changes)
-      return accept(undefined)
+    if (this.#closed || this.#db.prepare('SELECT clean FROM studio_host_run WHERE singleton = 1 AND run_id = ?').get(this.#runId)?.clean === 1) return
+    this.write(() => {
+      this.#interruptAll(studioNow(), 'host-stopped')
+      this.#db.prepare('UPDATE studio_host_run SET clean = 1 WHERE singleton = 1 AND run_id = ?').run(this.#runId)
     })
   }
 
-  /** 请求切换目录时，只有已关闭所有写入口并确认写入账本结束标记，才可使用新目录。 */
   assertStateSealed(): void {
-    const clean = this.db.prepare('SELECT clean FROM managed_host_run WHERE singleton = 1 AND run_id = ?').get(this.#runId)
-    if (clean?.clean !== 1) throw new Error('Cannot switch Studio state before a confirmed clean stop')
-  }
-
-  /** 在旧进程仍持有目录锁时复制包括 WAL 在内的完整 SQLite 快照。 */
-  async copySettingsState(target: string): Promise<void> {
-    this.assertStateSealed()
-    await backup(this.db, target, { rate: 256 })
-  }
-
-  /** Close without attesting that the run was safe to resume. Used on both normal teardown and storage failure. */
-  close(): void {
-    if (this.closed) return
-    this.closed = true
-    this.#db.close()
-  }
-
-  /** Read bounded evidence and local fences together without observing a live Session, systemd, or a model. */
-  watchdog(target?: WatchdogTarget): ManagedResult<WatchdogSnapshot> {
-    let exact: WatchdogTarget | undefined
-    if (target !== undefined) {
-      if (!target || typeof target !== 'object' || types.isProxy(target)) return deny('INVALID_INPUT')
-      exact = readWatchdogTarget(target)
-      if (!exact) return deny('INVALID_INPUT')
+    if (this.#db.prepare('SELECT clean FROM studio_host_run WHERE singleton = 1 AND run_id = ?').get(this.#runId)?.clean !== 1) {
+      throw new Error('Cannot switch Studio state before a confirmed clean stop')
     }
-    return this.snapshot(() => {
-      const page = readWatchdogEntries(this.db, {
-        captureUnconfirmed: this.captureFault,
-        task: id => this.task(id),
-        pendingReview: id => this.instructions.hasPending(id),
-        frozen: task => this.isFrozen(task),
-        recovery: task => this.documentRecovery.watchdog(task),
-        failureNotice: id => this.documentFailureNotices.latestForTask(id),
-      }, exact)
-      if (exact && page.entries.length === 0) return deny('NOT_FOUND')
-      const quotas = this.quota.observePools().map(({ poolId, current }): WatchdogQuota => {
-        if (!current.ok) return { poolId, state: 'unconfirmed' }
-        const incident = current.value
-        if (!incident) return { poolId, state: 'clear' }
-        const notice = this.quotaNotices.status(incident.incidentId)?.state
-        return { poolId, state: 'held', incident, ...(notice === undefined ? {} : { notice }) }
-      })
-      // These fences can outlive or fail to identify a specific row, so surface them even on an empty overview.
-      return accept({ ...page, quotas, captureUnconfirmed: this.captureFault,
-        pauseUnconfirmed: this.frozenTasks.size > 0 || this.frozenSessions.size > 0 })
+  }
+
+  async copySettingsState(target: string): Promise<void> { this.assertStateSealed(); await backup(this.#db, target, { rate: 256 }) }
+  close(): void { if (!this.#closed) { this.#closed = true; this.#db.close() } }
+
+  registerSession(id: string, role: StudioRole, botId: string | null, projectId: string | null): void {
+    this.write(() => {
+      this.#db.prepare('INSERT INTO studio_session VALUES (?, ?, ?, ?, 0, ?) ON CONFLICT(session_id) DO NOTHING')
+        .run(id, botId, projectId, role, studioNow())
+      const row = this.#db.prepare('SELECT * FROM studio_session WHERE session_id = ?').get(id)
+      if (row?.readonly_legacy !== 0 || row.role !== role || row.project_id !== projectId || row.bot_id !== botId) {
+        throw new Error('Studio Session already belongs to a different binding')
+      }
     })
   }
 
-  /** Read only the active hold for a Host-configured pool. Treat a failure as unavailable, not as a clear pool. */
-  quotaStatus(poolId: string): ManagedResult<StudioQuotaIncident | undefined> {
-    return this.quota.status(poolId)
+  isProtectedLog(id: string): boolean {
+    return this.#db.prepare('SELECT role FROM studio_session WHERE session_id = ?').get(id)?.role === 'legacy-protected'
   }
 
-  /** Stop a Host-configured pool, preserving the first observed incident until explicit restoration. */
-  tripQuota(poolId: string, provider: string, model: string, sessionId?: string):
-    ManagedResult<{ incident: StudioQuotaIncident; created: boolean }> {
-    return this.quota.trip(poolId, provider, model, sessionId)
+  studioProjects() { return studioProjects(this.#db) }
+  studioProject(id: string) { return studioProject(this.#db, id) }
+  studioHiddenIds() { return studioHiddenIds(this.#db) }
+  studioSession(id: string) { return studioSession(this.#db, id) }
+  studioArtifacts(room: string, messageId: string) { return studioArtifacts(this.#db, room, messageId) }
+  studioBlockingItems() { return studioBlockingItems(this.#db) }
+  studioPendingRecord(id: string) { return studioPendingRecord(this.#db, id) }
+  task(taskId: string) { return studioTask(this.#db, taskId) }
+  tasks(room?: string, before?: number) { return studioTasks(this.#db, room, before) }
+  taskFromMessage(room: string, requestId: string, sourceMessageId: string) {
+    const project = room === ASSISTANT_CONVERSATION ? null : room
+    const row = this.#db.prepare('SELECT task_id FROM studio_task WHERE project_id IS ? AND request_key = ? AND source_message_id = ?')
+      .get(project, studioRequestKey(project, requestId), sourceMessageId)
+    return typeof row?.task_id === 'string' ? this.task(row.task_id) : undefined
   }
 
-  /** Persist the Host-authenticated owner's confirmation for exactly this active incident. This does not resume any task. */
-  restoreQuota(poolId: string, incidentId: string, sessionId: string, commandId: string, evidence: string): ManagedResult<StudioQuotaIncident> {
-    return this.quota.restore(poolId, incidentId, sessionId, commandId, evidence)
-  }
-
-  /** Allow a send only after committing the sole attempt for this exact active, confirmed quota incident. */
-  claimQuotaNotice(poolId: string, incidentId: string, scope: string): ManagedResult<{ claimed: boolean }> {
-    if (!isId(incidentId) || !isId(scope)) return deny('INVALID_INPUT')
-    if (this.quotaNoticeScope !== scope) return deny('QUOTA_NOTICE_SCOPE_NOT_CONFIGURED')
-    // Read the quota store's memory and SQLite fences before opening the notice write transaction.
-    const current = this.quotaStatus(poolId)
-    if (!current.ok) return current
-    if (current.value?.incidentId !== incidentId || current.value.reason !== 'ACCOUNT_QUOTA') return deny('STALE_QUOTA_INCIDENT')
-    return this.write(() => this.quotaNotices.claim(poolId, incidentId, scope))
-  }
-
-  /** Keep the confirmed receipt, or record an unknown outcome without authorizing another attempt. */
-  settleQuotaNotice(incidentId: string, scope: string, messageId?: string): ManagedResult<StudioQuotaNotice> {
-    if (!isId(incidentId) || !isId(scope) || (messageId !== undefined && !isQuotaNoticeMessageId(messageId))) return deny('INVALID_INPUT')
-    if (this.quotaNoticeScope !== scope) return deny('QUOTA_NOTICE_SCOPE_NOT_CONFIGURED')
-    return this.write(() => this.quotaNotices.settle(incidentId, scope, messageId))
-  }
-
-  /** Read retained notice state in this profile without exposing the destination or limiting visibility to the current scope. */
-  quotaNoticeStatus(incidentId: string): ManagedResult<StudioQuotaNotice | undefined> {
-    if (!isId(incidentId)) return deny('INVALID_INPUT')
-    return this.snapshot(() => accept(this.quotaNotices.status(incidentId)))
-  }
-
-  /** Read the durable Session binding. Return undefined only for an unbound Session; throw on storage errors so callers cannot treat the Session as unmanaged. */
-  binding(sessionId: string): { taskId: string; executionEpoch: number } | undefined {
-    if (!isId(sessionId)) throw new Error('Invalid Managed Worker session ID')
-    const row = this.db.prepare('SELECT task_id, execution_epoch FROM managed_session_binding WHERE session_id = ?').get(sessionId)
-    if (!row) return
-    if (!isId(row.task_id) || !isVersion(row.execution_epoch)) throw new Error('Invalid Managed Worker binding')
-    return { taskId: row.task_id, executionEpoch: row.execution_epoch }
-  }
-
-  /** Give each Assistant Session the same durable Bot identity without changing an existing Session role. */
-  bindAssistant(sessionId: string): ManagedResult<string> {
-    if (!isId(sessionId)) return deny('INVALID_INPUT')
+  registerTask(input: StudioTaskInput): { taskId: string; created: boolean } {
     return this.write(() => {
-      const existing = this.assistantBinding(sessionId)
-      if (existing) return accept(existing)
-      if (this.sessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
-      const bot = this.db.prepare('SELECT bot_id FROM studio_assistant_bot WHERE singleton = 1').get()
-      const botId = bot ? bot.bot_id : randomUUID()
-      if (!isId(botId)) throw new Error('Invalid Studio Assistant Bot ID')
-      if (!bot) requireWrite(this.db.prepare('INSERT INTO studio_assistant_bot VALUES (1, ?)').run(botId).changes)
-      requireWrite(this.db.prepare('INSERT INTO studio_assistant_binding VALUES (?, ?)').run(sessionId, botId).changes)
-      return accept(botId)
-    })
-  }
-
-  /** Read the persisted Assistant role. Invalid input or storage errors are not an unbound result. */
-  assistantBinding(sessionId: string): string | undefined {
-    if (!isId(sessionId)) throw new Error('Invalid Studio Assistant session ID')
-    const row = this.db.prepare('SELECT bot_id FROM studio_assistant_binding WHERE session_id = ?').get(sessionId)
-    if (!row) return
-    if (!isId(row.bot_id)) throw new Error('Invalid Studio Assistant binding')
-    return row.bot_id
-  }
-
-  /** Keep classifying a draft Worker after its task ends; a historical execution does not grant document tools. */
-  draftBinding(sessionId: string): StudioDraftExecution | undefined {
-    if (!isId(sessionId)) throw new Error('Invalid Studio draft Worker session ID')
-    const row = this.db.prepare('SELECT task_id, execution_epoch FROM studio_draft_task WHERE worker_session_id = ?').get(sessionId)
-    if (!row) return
-    const { task_id: taskId, execution_epoch: executionEpoch } = row
-    if (!isId(taskId) || !isVersion(executionEpoch)) throw new Error('Invalid Studio draft binding')
-    return { taskId, workerSessionId: sessionId, executionEpoch }
-  }
-
-  /** Classify a cited Worker even after completion or revocation. Storage failures must not look like uncited Sessions. */
-  hasDraftPreferenceWorker(workerSessionId: string): boolean {
-    if (!isId(workerSessionId)) throw new Error('Invalid Studio draft Worker session ID')
-    return !!this.db.prepare(`SELECT 1 FROM studio_draft_task d JOIN studio_draft_preference p ON p.task_id = d.task_id
-      WHERE d.worker_session_id = ?`).get(workerSessionId)
-  }
-
-  /** Reserve a Worker and pin any citation from the exact owner request before the caller can launch the Worker. */
-  startDraft(input: StudioDraftInput, allowPreference = false): ManagedResult<{ task: StudioDraftTask; created: boolean }> {
-    if (!input) return deny('INVALID_INPUT')
-    const { assistantSessionId, sourceMessageId, sourceRequestId, workerSessionId, requestText } = input
-    if (!isId(assistantSessionId) || !isId(sourceMessageId) || !isId(sourceRequestId) || !isId(workerSessionId)
-      || !isDraftText(requestText)) return deny('INVALID_INPUT')
-    const reference = parseDraftPreference(requestText)
-    if (reference.kind === 'invalid') return deny('INVALID_PREFERENCE_CITATION')
-    if (reference.kind === 'citation' && allowPreference !== true) return deny('MEMORY_DISABLED')
-    return this.write<{ task: StudioDraftTask; created: boolean }>(() => {
-      const assistantBotId = this.assistantBinding(assistantSessionId)
-      if (!assistantBotId) return deny('SESSION_NOT_BOUND')
-      // Check the original request before the proposed Worker so duplicate delivery cannot create another execution.
-      const existing = this.db.prepare(`SELECT ${DRAFT_METADATA} FROM studio_draft_task
-        WHERE assistant_session_id = ? AND source_request_id = ?`).get(assistantSessionId, sourceRequestId)
+      if (input.projectId !== null) {
+        const current = this.projects.currentLeader(input.leader?.sessionId ?? '')
+        if (!current || current.id !== input.projectId || current.managementEpoch !== input.leader?.managementEpoch
+          || current.leaderBotId !== input.requesterBotId || current.workspacePath !== input.workspacePath) throw new Error('Studio project authority changed')
+      } else if (input.requesterBotId !== this.assistantBotId || input.leader) throw new Error('Invalid Studio Assistant identity')
+      const key = studioRequestKey(input.projectId, input.requestId)
+      const existing = this.#db.prepare('SELECT task_id, source_message_id, request_text FROM studio_task WHERE request_key = ?').get(key)
       if (existing) {
-        const task = this.draftTask(existing)
-        if (task.preference || reference.kind === 'citation') {
-          // A cited replay must match the original message and request exactly and can only return metadata.
-          const matches = task.preference && reference.kind === 'citation' && task.preference.citationId === reference.citationId
-            && this.db.prepare('SELECT 1 FROM studio_draft_task WHERE task_id = ? AND source_message_id = ? AND request_text = ?')
-              .get(task.taskId, sourceMessageId, requestText)
-          if (!matches) return deny('SOURCE_ALREADY_USED')
-          if (!task.preference?.current) return deny('CITATION_NOT_CURRENT')
-        } else if (task.state === 'completed') task.result = this.draftResult(task.taskId)
-        return accept({ task, created: false })
+        if (existing.source_message_id !== input.sourceMessageId || existing.request_text !== input.requestText) throw new Error('Studio task source conflict')
+        return { taskId: String(existing.task_id), created: false }
       }
-      if (assistantSourceUsed(this.db, { assistantSessionId, sourceMessageId, sourceRequestId })) return deny('SOURCE_ALREADY_USED')
-      if (this.sessionBound(workerSessionId)) return deny('SESSION_ALREADY_BOUND')
-      const preference = reference.kind === 'citation' ? currentDraftCitation(this.db, reference.citationId) : undefined
-      if (reference.kind === 'citation' && !preference) return deny('CITATION_NOT_CURRENT')
-      const taskId = randomUUID()
-      const workerBotId = randomUUID()
-      requireWrite(this.db.prepare(`INSERT INTO studio_draft_task (task_id, assistant_bot_id, assistant_session_id, source_message_id,
-        source_request_id, request_text, worker_bot_id, worker_session_id, execution_epoch, run_id, state)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'running')`)
-        .run(taskId, assistantBotId, assistantSessionId, sourceMessageId, sourceRequestId, requestText, workerBotId, workerSessionId, this.#runId).changes)
-      // Either both rows commit or the reservation rolls back and the Worker remains unbound.
-      if (preference) appendDraftPreference(this.db, taskId, preference)
-      return accept({ task: { taskId, assistantBotId, assistantSessionId, sourceMessageId, sourceRequestId,
-        workerBotId, workerSessionId, executionEpoch: 1, state: 'running', ...(preference ? { preference } : {}) }, created: true })
+      const taskId = randomUUID(), at = studioNow()
+      this.#db.prepare(`INSERT INTO studio_task (task_id, project_id, source_message_id, request_key, requester_bot_id, workspace_path,
+        permission, status, title, request_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`)
+        .run(taskId, input.projectId, input.sourceMessageId, key, input.requesterBotId, input.workspacePath,
+          input.permission, input.title ?? input.requestText.slice(0, 120).toWellFormed(), input.requestText, at, at)
+      return { taskId, created: true }
     })
   }
 
-  /** Resolve the body at the relay boundary, only for the exact live execution with a current pinned citation. */
-  resolveDraftPreference(execution: StudioDraftExecution): ManagedResult<{ text: string }> {
-    return this.withDraftPreference(execution, preference => ({ text: draftPreferenceText(this.db, preference) }))
-  }
-
-  /** Recheck an exact cited execution before a model step or stream attempt without reading the preference body. */
-  checkDraftPreference(execution: StudioDraftExecution): ManagedResult<void> {
-    return this.withDraftPreference(execution, () => undefined)
-  }
-
-  private withDraftPreference<T>(execution: StudioDraftExecution, read: (preference: StudioDraftPreference) => T): ManagedResult<T> {
-    const exact = draftExecution(execution)
-    if (!exact) return deny('INVALID_INPUT')
-    return this.snapshot<T>(() => {
-      const task = this.runningDraft(exact)
-      if (!task.ok) return task
-      const preference = task.value.preference
-      return preference?.current ? accept(read(preference)) : deny('CITATION_NOT_CURRENT')
-    })
-  }
-
-  /** Persist the exact running execution's final message, or record a failure if its pinned citation has expired. */
-  completeDraft(execution: StudioDraftExecution, result: StudioDraftResult): ManagedResult<StudioDraftTask> {
-    if (!result) return deny('INVALID_INPUT')
-    const { text, messageId, eventSeq, turn } = result
-    if (!isDraftText(text) || !isId(messageId) || !isEventSeq(eventSeq) || !isVersion(turn)) return deny('INVALID_INPUT')
-    return this.finishDraft(execution, { text, messageId, eventSeq, turn })
-  }
-
-  /** Stop the exact execution without replacing any previously recorded outcome. */
-  failDraft(execution: StudioDraftExecution, reason: string): ManagedResult<StudioDraftTask> {
-    if (!isDraftText(reason)) return deny('INVALID_INPUT')
-    return this.finishDraft(execution, reason)
-  }
-
-  private finishDraft(execution: StudioDraftExecution, outcome: StudioDraftResult | string): ManagedResult<StudioDraftTask> {
-    const exact = draftExecution(execution)
-    if (!exact) return deny('INVALID_INPUT')
-    const { taskId, workerSessionId, executionEpoch } = exact
+  beginExecution(taskId: string, sessionId: string, managementEpoch: number | null, modelRoute: object): StudioExecution | undefined {
     return this.write(() => {
-      const running = this.runningDraft(exact)
-      if (!running.ok) return running
-      const task = running.value
-      // The write fence covers both the citation check and publication. An explicit failure keeps its original reason.
-      const final = typeof outcome !== 'string' && task.preference?.current === false ? 'CITATION_NOT_CURRENT' : outcome
-      const failed = typeof final === 'string'
-      const state = failed ? 'failed' : 'completed'
-      requireWrite(this.db.prepare(`UPDATE studio_draft_task SET state = ?, result_text = ?, result_message_id = ?,
-        result_event_seq = ?, result_turn = ?, failure = ?
-        WHERE task_id = ? AND worker_session_id = ? AND execution_epoch = ? AND run_id = ? AND state = 'running'`)
-        .run(state, failed ? null : final.text, failed ? null : final.messageId, failed ? null : final.eventSeq,
-          failed ? null : final.turn, failed ? final : null, taskId, workerSessionId, executionEpoch, this.#runId).changes)
-      return accept(failed ? { ...task, state: 'failed', failure: final } : { ...task, state: 'completed', result: final })
-    })
-  }
-
-  /** Load the exact running execution within the caller's fence, never selecting any result body. */
-  private runningDraft({ taskId, workerSessionId, executionEpoch }: StudioDraftExecution): ManagedResult<StudioDraftTask> {
-    const row = this.db.prepare(`SELECT ${DRAFT_METADATA} FROM studio_draft_task
-      WHERE task_id = ? AND worker_session_id = ? AND execution_epoch = ? AND run_id = ?`)
-      .get(taskId, workerSessionId, executionEpoch, this.#runId)
-    if (!row) return deny('STALE_EXECUTION')
-    const task = readDraftRow(row)
-    if (task.state !== 'running') return deny('TASK_NOT_RUNNING')
-    const preference = pinnedDraftPreference(this.db, task.taskId)
-    if (preference) task.preference = preference
-    return accept(task)
-  }
-
-  /** An explicit ID can follow the Assistant Bot across Sessions; an implicit lookup stays in this Session.
-   * Cited result bodies require both caller permission and a current citation in the same fenced snapshot.
-   */
-  readDraft(assistantSessionId: string, taskId?: string, includePreferenceResult = false): ManagedResult<StudioDraftTask> {
-    if (!isId(assistantSessionId) || (taskId !== undefined && !isId(taskId))) return deny('INVALID_INPUT')
-    return this.snapshot(() => {
-      const assistantBotId = this.assistantBinding(assistantSessionId)
-      if (!assistantBotId) return deny('SESSION_NOT_BOUND')
-      const row = taskId === undefined
-        ? this.db.prepare(`SELECT ${DRAFT_METADATA} FROM studio_draft_task WHERE assistant_session_id = ? AND assistant_bot_id = ?
-          ORDER BY seq DESC LIMIT 1`).get(assistantSessionId, assistantBotId)
-        : this.db.prepare(`SELECT ${DRAFT_METADATA} FROM studio_draft_task WHERE task_id = ? AND assistant_bot_id = ?`)
-          .get(taskId, assistantBotId)
-      if (!row) return deny('TASK_NOT_FOUND')
-      const task = this.draftTask(row)
-      if (task.state === 'completed' && (!task.preference || (includePreferenceResult === true && task.preference.current))) {
-        task.result = this.draftResult(task.taskId)
-      }
-      return accept(task)
-    })
-  }
-
-  /** Combine task and citation metadata without reading either body. The caller owns the transaction. */
-  private draftTask(row: Record<string, SQLOutputValue>): StudioDraftTask {
-    const task = readDraftRow(row)
-    const preference = pinnedDraftPreference(this.db, task.taskId)
-    if (preference) task.preference = preference
-    return task
-  }
-
-  /** Select the result only after the caller has authorized it in the same transaction. */
-  private draftResult(taskId: string): StudioDraftResult {
-    const row = this.db.prepare(`SELECT result_text AS text, result_message_id AS messageId, result_event_seq AS eventSeq, result_turn AS turn
-      FROM studio_draft_task WHERE task_id = ? AND state = 'completed'`).get(taskId)
-    if (!row) throw new Error('Missing Studio draft result')
-    const { text, messageId, eventSeq, turn } = row
-    if (!isDraftText(text) || !isId(messageId) || !isEventSeq(eventSeq) || !isVersion(turn)) throw new Error('Invalid Studio draft result')
-    return { text, messageId, eventSeq, turn }
-  }
-
-  /** Claim the text route before checking its body, quota, or Worker availability. A refusal does not free the message ID. */
-  claimFeishuTextDelivery(source: StudioFeishuInstruction, route: 'draft' | 'result'): ManagedResult<{ claimed: boolean }> {
-    const result = this.write<ReturnType<typeof feishuDeliveryCoordinates>>(() => {
-      const delivery = feishuDeliveryCoordinates(source)
-      if (!delivery || (route !== 'draft' && route !== 'result')) return deny('INVALID_INPUT')
-      const { sourceScope, requestId } = delivery
-      if (sourceScope !== this.feishuText?.scope) return deny('FEISHU_TEXT_SCOPE_REQUIRED')
-      if (this.hasExclusiveFeishuDocument(sourceScope)) return deny('FEISHU_DOCUMENT_BOUND')
-      if (this.feishuDeliverySeen(sourceScope, requestId)) return accept(undefined)
-      this.feishuDeliveries.insert(delivery, route)
-      return accept(delivery)
-    })
-    if (!result.ok) return result
-    if (result.value && route === 'draft') {
-      // Grant a start only after the claim commits, and only to the synchronous dispatch that won it.
-      const { requestId, sourceTimeMs } = result.value
-      this.pendingFeishuDraftClaims.set(requestId, sourceTimeMs)
-      queueMicrotask(() => { this.pendingFeishuDraftClaims.delete(requestId) })
-    }
-    return accept({ claimed: result.value !== undefined })
-  }
-
-  /** Reserve one execution for an authenticated Feishu text delivery before launching a Worker. */
-  startFeishuDraft(input: StudioFeishuInstruction, requestText: string, workerSessionId: string):
-    ManagedResult<{ task: StudioFeishuDraftTask; created: boolean }> {
-    const delivery = feishuDeliveryCoordinates(input)
-    if (!delivery) return deny('INVALID_INPUT')
-    if (delivery.sourceScope !== this.feishuText?.scope) return deny('FEISHU_TEXT_SCOPE_REQUIRED')
-    // Consume the opportunity before checking the body, busy state, or Worker binding; a refusal must not be retryable.
-    const freshClaim = this.pendingFeishuDraftClaims.get(delivery.requestId) === delivery.sourceTimeMs
-    if (freshClaim) this.pendingFeishuDraftClaims.delete(delivery.requestId)
-    const source = feishuDraftSource(input, isDraftText)
-    if (!source || delivery.sourceScope !== source.sourceScope || delivery.requestId !== source.requestId
-      || delivery.sourceTimeMs !== source.sourceTimeMs) return deny('INVALID_INPUT')
-    return this.write<{ task: StudioFeishuDraftTask; created: boolean }>(() => {
-      const scope = source.sourceScope
-      // A redelivery can return its original task without starting anything, even after a routing change.
-      const existing = this.feishuDrafts.duplicate(scope, source.requestId)
-      if (existing) return accept({ task: existing, created: false })
-      if (!freshClaim || !this.feishuDeliveries.currentDraft(source)) return deny('FEISHU_DELIVERY_ALREADY_ROUTED')
-      if (this.hasExclusiveFeishuDocument(scope)) return deny('FEISHU_DOCUMENT_BOUND')
-      // Only the combined inbox orders a draft against other claimed actions, not just saved text tasks.
-      if (scope === this.feishuCombinedScope
-        && (this.instructions.feishuLate(scope, source.sourceTimeMs) || this.feishuDeliveries.actionLate(scope, source.sourceTimeMs))) {
-        return deny('FEISHU_MESSAGE_LATE')
-      }
-      if (this.feishuDrafts.late(scope, source.sourceTimeMs)) return deny('FEISHU_MESSAGE_LATE')
-      if (this.feishuDrafts.busy(scope)) return deny('FEISHU_TEXT_BUSY')
-      if (!isId(workerSessionId) || !isDraftText(requestText) || requestText.includes('\0')) return deny('INVALID_INPUT')
-      if (this.sessionBound(workerSessionId)) return deny('SESSION_ALREADY_BOUND')
-      const task = this.feishuDrafts.insert(randomUUID(), randomUUID(), workerSessionId, source, requestText)
-      return accept({ task, created: true })
-    })
-  }
-
-  /** The Host authorizes the caller; Feishu replies must pass the exact scope, and Web must supply an exact task ID. */
-  readFeishuDraft(taskId: string, scope?: string): ManagedResult<StudioFeishuDraftTask> {
-    if (!isId(taskId) || (scope !== undefined && !isId(scope))) return deny('INVALID_INPUT')
-    return this.snapshot(() => {
-      const task = this.feishuDrafts.read(taskId, scope)
-      return task ? accept(task) : deny('TASK_NOT_FOUND')
-    })
-  }
-
-  /** The owner can recover a lost task ID from the configured chat's saved headers, even while the bot is offline. */
-  recentFeishuDrafts(): ManagedResult<StudioFeishuDraftHeader[]> {
-    return this.snapshot(() => {
-      const scope = this.feishuText?.scope
-      return scope === undefined ? deny('FEISHU_TEXT_SCOPE_REQUIRED') : accept(this.feishuDrafts.recent(scope))
-    })
-  }
-
-  /** Retain the verified final message, or a failure when there is no result, only for the exact running origin. */
-  settleFeishuDraft(execution: StudioDraftExecution, result: StudioDraftResult | undefined, failure: string): ManagedResult<StudioFeishuDraftTask> {
-    if (!execution) return deny('INVALID_INPUT')
-    const { taskId, workerSessionId, executionEpoch } = execution
-    if (!isId(taskId) || !isId(workerSessionId) || !isVersion(executionEpoch)) return deny('INVALID_INPUT')
-    let outcome: StudioDraftResult | undefined
-    if (result === undefined) {
-      if (!isDraftText(failure) || failure.includes('\0')) return deny('INVALID_INPUT')
-    } else {
-      if (!result) return deny('INVALID_INPUT')
-      const { text, messageId, eventSeq, turn } = result
-      if (!isDraftText(text) || text.includes('\0') || !isId(messageId) || !isEventSeq(eventSeq) || !isVersion(turn)) return deny('INVALID_INPUT')
-      outcome = { text, messageId, eventSeq, turn }
-    }
-    return this.write(() => {
-      const task = this.feishuDrafts.execution({ taskId, workerSessionId, executionEpoch })
-      if (!task) return deny('STALE_EXECUTION')
-      if (task.state !== 'running') return deny('TASK_NOT_RUNNING')
-      return accept(this.feishuDrafts.settle(task, outcome, failure))
-    })
-  }
-
-  /** Recheck the run and reservation before creating the Session and again before sending its request. */
-  feishuDraftCurrent(execution: StudioDraftExecution): boolean {
-    if (!execution) return false
-    const { taskId, workerSessionId, executionEpoch } = execution
-    if (!isId(taskId) || !isId(workerSessionId) || !isVersion(executionEpoch)) return false
-    const result = this.snapshot(() => accept(this.feishuDrafts.current({ taskId, workerSessionId, executionEpoch })))
-    return result.ok && result.value
-  }
-
-  /** A Feishu Worker Session keeps its own role, including past runs and terminal tasks. */
-  feishuDraftBinding(sessionId: string): StudioDraftExecution | undefined {
-    if (!isId(sessionId)) throw new Error('Invalid Studio Feishu draft Worker session ID')
-    return this.feishuDrafts.binding(sessionId)
-  }
-
-  /** Check that the configured text chat can start listening. Recheck the binding when claiming or starting work. */
-  feishuDraftScopeAvailable(scope: string): boolean {
-    if (this.feishuText?.scope !== scope) return false
-    const result = this.snapshot(() => accept(!this.hasExclusiveFeishuDocument(scope)))
-    return result.ok && result.value
-  }
-
-  /** 配置变更时只核对目标私聊是否与已登记的文档冲突，不以当前是否启用文字入口为前提。 */
-  canConfigureFeishuText(scope: string, combined: boolean): boolean {
-    const result = this.snapshot(() => accept(combined || this.instructions.feishuTask(scope) === undefined))
-    return result.ok && result.value
-  }
-
-  /** Only the explicitly combined chat can route text while bound to a document. */
-  private hasExclusiveFeishuDocument(scope: string): boolean {
-    return scope !== this.feishuCombinedScope && this.instructions.feishuTask(scope) !== undefined
-  }
-
-  /** Check permanent secondary roles without reentering any facade's transaction. */
-  private studioExecutionSessionBound(sessionId: string): boolean {
-    return !!(this.draftBinding(sessionId) || this.feishuDraftBinding(sessionId) || this.studies.binding(sessionId)
-      || this.advice.binding(sessionId) || this.projects.workerBound(sessionId) || this.revisions.sourceBinding(sessionId))
-  }
-
-  /** Advice and preference proposals require an Assistant binding without any other permanent Session role. */
-  private ordinaryAssistantBinding(sessionId: string): string | undefined {
-    const bot = this.assistantBinding(sessionId)
-    return bot && !this.binding(sessionId) && !this.projects.binding(sessionId) && !this.studioExecutionSessionBound(sessionId)
-      ? bot : undefined
-  }
-
-  /** Check roles other than the permanent project Leader binding. */
-  private nonProjectSessionBound(sessionId: string): boolean {
-    return !!(this.binding(sessionId) || this.assistantBinding(sessionId) || this.studioExecutionSessionBound(sessionId))
-  }
-
-  private studioSessionBound(sessionId: string): boolean {
-    return !!(this.assistantBinding(sessionId) || this.projects.binding(sessionId) || this.studioExecutionSessionBound(sessionId))
-  }
-
-  private sessionBound(sessionId: string): boolean {
-    return !!this.binding(sessionId) || this.studioSessionBound(sessionId)
-  }
-
-  /** Capture a GUI delivery only for the current writable document binding. A failed capture cannot be cleared in this run. */
-  receiveGuiInstruction(sessionId: string, input: StudioInstructionInput): ManagedResult<{ recorded: boolean }> {
-    if (!isId(sessionId)) return deny('INVALID_INPUT')
-    try {
-      const { channel, sourceScope } = input ?? {}
-      if (channel !== 'gui' || sourceScope !== sessionId) return deny('INVALID_INPUT')
-      const { requestId, messageId, eventSeq, sourceTimeMs, text } = input
-      const source: StudioInstructionInput = { channel, sourceScope, requestId, messageId, eventSeq, sourceTimeMs, text }
-      return this.captureInstruction<{ recorded: boolean }>(() => {
-        const current = this.currentTask(sessionId)
-        if (!current.ok || current.value.documentVersion !== 1) return accept({ recorded: false })
-        const task = current.value
-        if (!this.instructions.record(task.taskId, task.executionEpoch, source)) return accept({ recorded: false })
-        this.invalidatePriorPermits(task)
-        return accept({ recorded: true })
-      })
-    } catch {
-      // Source fields could not be read safely, even before opening the transaction.
-      return this.unconfirmedCapture()
-    }
-  }
-
-  /** Link this current version 1 document to one host-validated scope, without changing its authorization. */
-  linkFeishuDocument(sessionId: string, sourceScope: string, commandId: string): ManagedResult<ManagedTask> {
-    if (!isId(sessionId) || !isId(sourceScope) || !isId(commandId)) return deny('INVALID_INPUT')
-    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-    return this.write(() => {
-      const current = this.currentTask(sessionId)
-      if (!current.ok) return current
-      const task = current.value
-      if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
-      // Outside the exact configured combined scope, a past text task still bars a document binding.
-      if (sourceScope !== this.feishuCombinedScope && this.feishuDrafts.scopeBound(sourceScope)) return deny('FEISHU_TEXT_BOUND')
-      const boundTask = this.instructions.feishuTask(sourceScope)
-      // The first binding remains the audit record, even if the current session has since changed.
-      if (boundTask === task.taskId) return current
-      if (boundTask !== undefined) return deny('FEISHU_SCOPE_ALREADY_BOUND')
-      if (this.instructions.hasFeishuScope(task.taskId)) return deny('TASK_ALREADY_BOUND')
-      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
-      this.instructions.linkFeishu(task.taskId, sessionId, sourceScope, commandId)
-      return current
-    })
-  }
-
-  /** Suppress the text-only usage hint for a delivery already owned by the continuation route. */
-  feishuDocumentContinuationSeen(scope: string, requestId: string): ManagedResult<boolean> {
-    if (!isId(scope) || !isId(requestId)) return deny('INVALID_INPUT')
-    return this.snapshot(() => accept(feishuDocumentContinuationSeen(this.db, scope, requestId)))
-  }
-
-  /** Check both legacy ledgers as well as route claims without rewriting historic records. */
-  private feishuDeliverySeen(scope: string, requestId: string): boolean {
-    return feishuDocumentContinuationSeen(this.db, scope, requestId)
-      || this.feishuDeliveries.has(scope, requestId) || this.instructions.feishuDuplicate(scope, requestId)
-      || this.feishuDrafts.duplicate(scope, requestId) !== undefined
-  }
-
-  /** Capture an authenticated Feishu delivery at the fixed target's current epoch, including while paused. */
-  receiveFeishuInstruction(input: StudioFeishuInstruction): ManagedResult<FeishuInstructionReceipt> {
-    return this.captureInstruction<FeishuInstructionReceipt>(() => {
-      const { channel, sourceScope } = input
-      if (channel !== 'feishu' || !isId(sourceScope)) throw new Error('Invalid Studio Feishu scope')
-      const { requestId, messageId, eventSeq, sourceTimeMs } = input
-      const coordinates = { channel, sourceScope, requestId, messageId, eventSeq, sourceTimeMs }
-      const combined = sourceScope === this.feishuCombinedScope
-      const delivery = combined ? feishuDeliveryCoordinates(coordinates) : undefined
-      if (combined && !delivery) throw new Error('Invalid Studio Feishu source coordinates')
-      const taskId = this.instructions.feishuTask(sourceScope)
-      if (isId(requestId) && messageId === requestId && eventSeq === null && this.feishuDeliverySeen(sourceScope, requestId)) {
-        return accept({ disposition: 'duplicate', ...(taskId === undefined ? {} : { taskId }) })
-      }
-      // Fix the document route even with no writable target. On a capture failure, the claim rolls back with the other writes.
-      if (delivery) this.feishuDeliveries.insert(delivery, 'document')
-      if (taskId === undefined) return accept({ disposition: 'unbound' })
+      const db = this.#db
       const task = this.task(taskId)
-      if (!task) throw new Error('Missing task or document for Studio Feishu binding')
-      if (task.documentVersion !== 1) return accept({ disposition: 'finished', taskId })
-      const { text, senderId, parentId, rootId, threadId } = input
-      const recorded = this.instructions.recordFeishu(taskId, task.executionEpoch,
-        { ...coordinates, text, senderId, parentId, rootId, threadId })
-      if (!recorded) return accept({ disposition: 'duplicate', taskId })
-      this.invalidatePriorPermits(task)
-      return accept({ disposition: 'recorded', taskId, late: recorded.late })
+      if (!task || task.status !== 'queued') return
+      if (task.projectId === null ? managementEpoch !== null :
+        !db.prepare("SELECT 1 FROM studio_project WHERE project_id = ? AND state = 'active' AND management_epoch = ?")
+          .get(task.projectId, managementEpoch)) return
+      const executionEpoch = Number(db.prepare('SELECT coalesce(max(execution_epoch), 0) + 1 AS epoch FROM studio_task_execution WHERE task_id = ?')
+        .get(taskId)?.epoch)
+      const at = studioNow()
+      db.prepare('INSERT INTO studio_session VALUES (?, NULL, ?, ?, 0, ?)').run(sessionId, task.projectId, 'worker', at)
+      db.prepare(`INSERT INTO studio_task_execution (task_id, execution_epoch, session_id, run_id, captured_management_epoch, model_route, started_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(taskId, executionEpoch, sessionId, this.#runId, managementEpoch, JSON.stringify(modelRoute), at)
+      db.prepare("UPDATE studio_task SET status = 'running', updated_at = ? WHERE task_id = ?").run(at, taskId)
+      return { taskId, executionEpoch, authorizationVersion: task.authorizationVersion, sessionId, runId: this.#runId, managementEpoch }
     })
   }
 
-  /** Use the document write fence for every capture; any unconfirmed outcome keeps this run blocked. */
-  private captureInstruction<T>(operation: () => ManagedResult<T>): ManagedResult<T> {
-    const result = this.write(operation)
-    return result.ok ? result : this.unconfirmedCapture()
+  executionCurrent(execution: StudioExecution): boolean {
+    this.assertActive()
+    return !!this.#db.prepare(`SELECT 1 FROM studio_task t JOIN studio_task_execution e USING (task_id)
+      JOIN studio_session s ON s.session_id = e.session_id LEFT JOIN studio_project p ON p.project_id = t.project_id
+      WHERE t.task_id = ? AND t.authorization_version = ? AND t.status = 'running' AND e.execution_epoch = ?
+      AND e.session_id = ? AND e.run_id = ? AND e.ended_at IS NULL AND e.captured_management_epoch IS ?
+      AND s.readonly_legacy = 0 AND s.role = 'worker'
+      AND (t.project_id IS NULL OR (p.state = 'active' AND p.management_epoch = e.captured_management_epoch))`)
+      .get(execution.taskId, execution.authorizationVersion, execution.executionEpoch, execution.sessionId, this.#runId, execution.managementEpoch)
+      && execution.runId === this.#runId
   }
 
-  private unconfirmedCapture(): Rejection {
-    this.captureFault = true
-    return deny('INSTRUCTION_UNCONFIRMED')
-  }
-
-  /** In the capture transaction, invalidate old permits without clearing a pause or changing approved text. */
-  private invalidatePriorPermits(task: ManagedTask): void {
-    requireWrite(this.db.prepare(`UPDATE managed_task SET authorization_version = authorization_version + 1
-      WHERE task_id = ? AND execution_epoch = ? AND authorization_version = ?`)
-      .run(task.taskId, task.executionEpoch, task.authorizationVersion).changes)
-  }
-
-  /** Read the oldest pending item and any eligible line numbers from the same authorization snapshot. */
-  instructionInbox(sessionId: string): ManagedResult<InstructionInbox> {
-    if (!isId(sessionId)) return deny('INVALID_INPUT')
-    return this.snapshot<InstructionInbox>(() => {
-      if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-      const current = this.currentTask(sessionId)
-      if (!current.ok) return current
-      const task = current.value
-      if (this.isFrozen(task)) return deny('PAUSE_UNCONFIRMED')
-      const { pending, observedEpoch, remaining } = this.instructions.inbox(task.taskId)
-      if (!pending) return accept({ task, remaining })
-      if (task.documentVersion === 1 && !sharedDocumentConflict(task)
-        && observedEpoch === task.executionEpoch && instructionOrderKnown(pending)) {
-        const { baselineText, approvedText } = this.documentTargets(task.taskId)
-        const changes = documentLineChanges(baselineText, approvedText)
-        if (changes) return accept({ task, pending, remaining, narrowableLines: changes.changedLines })
-      }
-      return accept({ task, pending, remaining })
-    })
-  }
-
-  /** Review one source by retaining only a strict, nonempty subset of the current approved content changes. */
-  narrowInstruction(sessionId: string, instructionId: string, expectedEpoch: number, expectedAuthorizationVersion: number,
-    expectedDocumentVersion: number, keepLines: readonly number[], commandId: string):
-    ManagedResult<{ task: ManagedTask; remaining: number; keptLines: number[] }> {
-    if (!isId(sessionId) || !isId(instructionId) || !isVersion(expectedEpoch) || !isVersion(expectedAuthorizationVersion)
-      || !isVersion(expectedDocumentVersion) || !isId(commandId)) return deny('INVALID_INPUT')
-    const requested = readKeptLines(keepLines)
-    if (!requested) return deny('INVALID_INPUT')
+  finishExecution(execution: StudioExecution, result: { text: string; eventSeq: number } | undefined, outcome: string): boolean {
     return this.write(() => {
-      if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-      const current = this.currentTask(sessionId)
-      if (!current.ok) return current
-      const task = current.value
-      if (this.isFrozen(task)) return deny('PAUSE_UNCONFIRMED')
-      if (task.executionEpoch !== expectedEpoch) return deny('STALE_EXECUTION')
-      if (task.documentVersion !== 1 || expectedDocumentVersion !== 1) return deny('VERSION_CONFLICT')
-      if (sharedDocumentConflict(task)) return deny('SHARED_DOCUMENT_CONFLICT')
-      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
-      if (task.authorizationVersion !== expectedAuthorizationVersion) return deny('STALE_AUTHORIZATION')
-      const { pending, observedEpoch, remaining } = this.instructions.inbox(task.taskId)
-      if (pending?.instructionId !== instructionId) return deny('INSTRUCTION_NOT_PENDING')
-      if (observedEpoch !== expectedEpoch) return deny('STALE_EXECUTION')
-      if (!instructionOrderKnown(pending)) return deny('INSTRUCTION_ORDER_UNCLEAR')
-
-      // Derive the exact text under the write lock; unselected content and every EOL come from the version 1 baseline.
-      const { baselineText, approvedText } = this.documentTargets(task.taskId)
-      const changes = documentLineChanges(baselineText, approvedText)
-      if (!changes) return deny('INSTRUCTION_NOT_NARROWABLE')
-      const keptLines = changes.changedLines.filter(line => requested.has(line))
-      if (keptLines.length === 0 || keptLines.length !== requested.size || keptLines.length === changes.changedLines.length) {
-        return deny('INVALID_KEEP_LINES')
-      }
-      const { baseline, approved } = changes
-      for (const line of keptLines) {
-        const offset = (line - 1) * 2
-        baseline[offset] = approved[offset]!
-      }
-      const revisedText = baseline.join('')
-      const authorizationVersion = expectedAuthorizationVersion + 1
-
-      // Advance authorization and close the effective pending item together, without changing the pause or document version.
-      requireWrite(this.db.prepare(`UPDATE managed_task SET approved_text = ?, authorization_version = ?
-        WHERE task_id = ? AND execution_epoch = ? AND authorization_version = ?`)
-        .run(revisedText, authorizationVersion, task.taskId, expectedEpoch, expectedAuthorizationVersion).changes)
-      this.instructions.recordNarrowing({ instructionId, taskId: task.taskId, executionEpoch: expectedEpoch,
-        previousAuthorizationVersion: expectedAuthorizationVersion, nextAuthorizationVersion: authorizationVersion, keptLines,
-        reviewSessionId: sessionId, commandId, previousText: approvedText, nextText: revisedText })
-      return accept({ task: { ...task, authorizationVersion }, remaining: remaining - 1, keptLines })
+      if (!this.executionCurrent(execution)) return false
+      const db = this.#db, at = studioNow()
+      db.prepare(`UPDATE studio_task SET status = ?, authorization_version = authorization_version + 1, result_summary = ?, updated_at = ?
+        WHERE task_id = ?`).run(result ? 'delivered' : 'interrupted', result?.text ?? null, at, execution.taskId)
+      db.prepare(`UPDATE studio_task_execution SET ended_at = ?, result_event_seq = ?, outcome = ? WHERE task_id = ? AND execution_epoch = ?`)
+        .run(at, result?.eventSeq ?? null, outcome, execution.taskId, execution.executionEpoch)
+      return true
     })
   }
 
-  /** Claim a Host-verified source and fix its outcome in the same write fence. Only the first selection may reach Host dispatch. */
-  claimDocumentContinuation(source: DocumentContinuationSource, taskId?: string): ManagedResult<DocumentContinuationSelection> {
-    const exact = readDocumentContinuationSource(source)
-    if (!exact || (taskId !== undefined && (typeof taskId !== 'string' || taskId.length !== 36
-      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(taskId)))) return deny('INVALID_INPUT')
-    return this.write<DocumentContinuationSelection>(() => {
-      const { channel, sourceScope, requestId } = exact
-      if (channel === 'gui') {
-        if (!this.ordinaryAssistantBinding(sourceScope)) return deny('SESSION_NOT_BOUND')
-        if (this.guiContinuationSourceUsed(exact)) return accept({ kind: 'duplicate' })
-      } else if (this.feishuDeliverySeen(sourceScope, requestId)) return accept({ kind: 'duplicate' })
-
-      // Blocked and ambiguous requests still own this delivery. Only a storage or run failure rolls back the claim.
-      const outcome = this.selectDocumentContinuation(exact, taskId)
-      appendDocumentContinuationClaim(this.db, this.#runId, exact, taskId, outcome)
-      return accept(outcome)
-    })
-  }
-
-  /** Check prior Assistant work and memory evidence without reading any original request or preference body. */
-  private guiContinuationSourceUsed({ sourceScope, requestId, messageId, eventSeq }: DocumentContinuationSource): boolean {
-    const source = { assistantSessionId: sourceScope, sourceMessageId: messageId, sourceRequestId: requestId,
-      ...(eventSeq === null ? {} : { sourceEventSeq: eventSeq }) }
-    return assistantSourceUsed(this.db, source)
-      || ['studio_memory_proposal', 'studio_memory_correction', 'studio_memory_scope_change'].some(table =>
-        !!this.db.prepare(`SELECT 1 FROM ${table} WHERE assistant_session_id = ?
-          AND (source_request_id = ? OR source_message_id = ? OR source_event_seq = ?) LIMIT 1`)
-          .get(sourceScope, requestId, messageId, eventSeq))
-      || !!this.db.prepare(`SELECT 1 FROM studio_memory_revision WHERE source_session_id = ? AND source_event_seq = ?
-        UNION ALL SELECT 1 FROM studio_memory_citation WHERE source_session_id = ? AND source_event_seq = ? LIMIT 1`)
-        .get(sourceScope, eventSeq, sourceScope, eventSeq)
-  }
-
-  /** Resolve the target under the claim's write lock. Neither an explicit ID nor a binding bypasses execution checks. */
-  private selectDocumentContinuation(source: DocumentContinuationSource, taskId: string | undefined):
-    Exclude<DocumentContinuationSelection, { kind: 'duplicate' }> {
-    let task: ManagedTask | undefined
-    if (source.channel === 'feishu') {
-      const { sourceScope, sourceTimeMs } = source
-      const boundTaskId = this.instructions.feishuTask(sourceScope)
-      if (boundTaskId === undefined) return { kind: 'blocked', reason: 'FEISHU_DOCUMENT_NOT_BOUND' }
-      if (taskId !== undefined && taskId !== boundTaskId) return { kind: 'blocked', reason: 'TASK_SCOPE_MISMATCH' }
-      task = this.task(boundTaskId)
-      if (sourceTimeMs === null || !task) throw new Error('Invalid Studio Feishu continuation binding or source time')
-      if (this.instructions.feishuLate(sourceScope, sourceTimeMs) || this.feishuDeliveries.actionLate(sourceScope, sourceTimeMs)
-        || this.feishuDrafts.late(sourceScope, sourceTimeMs) || feishuDocumentContinuationLate(this.db, sourceScope, sourceTimeMs)) {
-        return { kind: 'blocked', reason: 'FEISHU_MESSAGE_LATE', task }
-      }
-    } else if (taskId !== undefined) {
-      task = this.task(taskId)
-      if (!task) return { kind: 'blocked', reason: 'TASK_NOT_FOUND' }
-    } else {
-      // Count unfinished documents, not runnable Sessions. Fetch one extra ID to detect truncation without a second query.
-      const limit = 8
-      const rows = this.db.prepare('SELECT task_id FROM managed_document WHERE document_version = 1 ORDER BY task_id LIMIT ?').all(limit + 1)
-      if (!rows.length) return { kind: 'blocked', reason: 'NO_UNFINISHED_DOCUMENT_TASK' }
-      const candidates = rows.slice(0, limit).map(({ task_id: id }) => {
-        const entry = isId(id) ? this.task(id) : undefined
-        if (!entry) throw new Error('Missing Studio continuation candidate')
-        return entry
-      })
-      if (rows.length > 1) return { kind: 'ambiguous', candidates, more: rows.length > limit }
-      task = candidates[0]!
-    }
-
-    const current = this.documentContinuationTask(task.workerSessionId, task.authorizationVersion)
-    return current.ok ? { kind: 'selected', task: current.value } : { kind: 'blocked', reason: current.reason, task }
-  }
-
-  /** Read the exact current target for Host dispatch to this Worker; do not issue a permit or change the task. */
-  documentContinuation(sessionId: string, expectedAuthorizationVersion: number): ManagedResult<{ task: ManagedTask; text: string }> {
-    if (!isId(sessionId) || !isVersion(expectedAuthorizationVersion)) return deny('INVALID_INPUT')
-    return this.snapshot(() => {
-      const current = this.documentContinuationTask(sessionId, expectedAuthorizationVersion)
-      return current.ok ? accept({ task: current.value, text: this.documentTargets(current.value.taskId).approvedText }) : current
-    })
-  }
-
-  /** Use the same eligibility checks for route selection and dispatch without opening a nested transaction or reading text. */
-  private documentContinuationTask(sessionId: string, expectedAuthorizationVersion: number): ManagedResult<ManagedTask> {
-    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-    const current = this.currentTask(sessionId)
-    if (!current.ok) return current
-    const task = current.value
-    if (this.studioSessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
-    if (task.documentVersion === 1 && sharedDocumentConflict(task)) return deny('SHARED_DOCUMENT_CONFLICT')
-    const blocked = this.executionBlocked(task)
-    if (blocked) return blocked
-    if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
-    if (task.authorizationVersion !== expectedAuthorizationVersion) return deny('STALE_AUTHORIZATION')
-    return current
-  }
-
-  /** Review exactly the oldest pending item without changing the approved text or lifting any prior pause. */
-  reviewInstruction(sessionId: string, instructionId: string, expectedAuthorizationVersion: number,
-    decision: InstructionDecision, commandId: string): ManagedResult<{ task: ManagedTask; remaining: number }> {
-    if (!isId(sessionId) || !isId(instructionId) || !isVersion(expectedAuthorizationVersion) || !isId(commandId)
-      || (decision !== 'unchanged' && decision !== 'pause')) return deny('INVALID_INPUT')
-    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
+  /** 标记需要人工核实的条件，先结束旧执行，解除后也不自动重派。 */
+  markTaskBlocked(taskId: string, expectedVersion: number, detail: string): boolean {
     return this.write(() => {
-      const current = this.currentTask(sessionId)
-      if (!current.ok) return current
-      const task = current.value
-      if (this.isFrozen(task)) return deny('PAUSE_UNCONFIRMED')
-      if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
-      if (task.authorizationVersion !== expectedAuthorizationVersion) return deny('STALE_AUTHORIZATION')
-      const { pending, remaining } = this.instructions.inbox(task.taskId)
-      if (pending?.instructionId !== instructionId) return deny('INSTRUCTION_NOT_PENDING')
-      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
-      const next = { ...task, paused: task.paused || decision === 'pause', authorizationVersion: expectedAuthorizationVersion + 1 }
-      // Updating both rows under the write lock binds the disposition to this authorization version and epoch.
-      requireWrite(this.db.prepare(`UPDATE managed_task SET paused = ?, authorization_version = ?
-        WHERE task_id = ? AND execution_epoch = ? AND authorization_version = ?`)
-        .run(next.paused ? 1 : 0, next.authorizationVersion, task.taskId, task.executionEpoch, expectedAuthorizationVersion).changes)
-      this.instructions.review(task.taskId, task.executionEpoch, instructionId, sessionId, next.authorizationVersion, decision, commandId)
-      return accept({ task: next, remaining: remaining - 1 })
+      const at = studioNow()
+      const { changes } = this.#db.prepare(`UPDATE studio_task SET status = 'blocked', check_result = ?,
+        authorization_version = authorization_version + 1, updated_at = ? WHERE task_id = ? AND authorization_version = ?
+        AND status IN ('queued', 'running', 'waiting_approval')`).run(detail, at, taskId, expectedVersion)
+      if (!changes) return false
+      this.#db.prepare("UPDATE studio_task_execution SET ended_at = ?, outcome = 'blocked' WHERE task_id = ? AND ended_at IS NULL").run(at, taskId)
+      return true
     })
   }
 
-  /** Show the current authorization version only if no unconfirmed instruction or pause blocks it. */
-  status(sessionId: string): ManagedResult<ManagedTask> {
-    if (!isId(sessionId)) return deny('INVALID_INPUT')
-    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-    return this.snapshot(() => {
-      const current = this.currentTask(sessionId)
-      if (!current.ok) return current
-      return this.authorizationBlocked(current.value) ?? current
-    })
-  }
-
-  /** Create the version 1 document for the current Session and record the only approved replacement text. */
-  create(sessionId: string, initialText: string, approvedText: string, commandId: string): ManagedResult<ManagedTask> {
-    if (!isId(sessionId) || !isText(initialText) || !isText(approvedText) || !isId(commandId)) return deny('INVALID_INPUT')
-    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
+  /** 停止或解除阻塞先作废旧授权与执行，再由调用方通知底层 Agent；解除不自动重派。 */
+  invalidateTask(taskId: string, status: Extract<StudioTaskStatus, 'cancelled' | 'interrupted'>, expectedVersion?: number): boolean {
     return this.write(() => {
-      if (this.sessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
-      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
-      return accept(this.createDocumentTask(sessionId, initialText, approvedText, commandId))
+      const at = studioNow(), db = this.#db
+      const changed = db.prepare(`UPDATE studio_task SET status = ?, authorization_version = authorization_version + 1, updated_at = ?
+        WHERE task_id = ? AND status IN ('queued', 'running', 'waiting_approval', 'blocked')
+        AND (? IS NULL OR (authorization_version = ? AND status = 'blocked'))`)
+        .run(status, at, taskId, expectedVersion ?? null, expectedVersion ?? null)
+      if (!changed.changes) return false
+      db.prepare('UPDATE studio_task_execution SET ended_at = ?, outcome = ? WHERE task_id = ? AND ended_at IS NULL').run(at, status, taskId)
+      return true
     })
   }
+}
 
-  /** Create an independent document and record the Host-authenticated owner command on version 1. */
-  createSharedDocument(sessionId: string, text: string, commandId: string): ManagedResult<SharedDocumentRevision> {
-    if (!isId(sessionId) || !isText(text) || !isId(commandId)) return deny('INVALID_INPUT')
-    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-    return this.write(() => {
-      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
-      const revision = { documentId: randomUUID(), version: 1, text }
-      requireWrite(appendSharedRevision(this.db, revision, { sessionId, commandId }))
-      return accept(revision)
-    })
-  }
-
-  /** Read any retained revision, defaulting to the global head rather than a task's local snapshot. */
-  readSharedDocument(documentId: string, version?: number): ManagedResult<SharedDocumentRevision> {
-    if (!isId(documentId) || (version !== undefined && !isVersion(version))) return deny('INVALID_INPUT')
-    return this.snapshot(() => {
-      const revision = readSharedRevision(this.db, documentId, version)
-      return revision ? accept(revision) : deny('DOCUMENT_NOT_FOUND')
-    })
-  }
-
-  /** Append a Host-authenticated edit at exactly the expected head, without changing any task authorization. */
-  editSharedDocument(sessionId: string, documentId: string, expectedVersion: number, text: string, commandId: string): ManagedResult<SharedDocumentRevision> {
-    if (!isId(sessionId) || !isId(documentId) || !isVersion(expectedVersion) || !isText(text) || !isId(commandId)) return deny('INVALID_INPUT')
-    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-    return this.write(() => {
-      const head = readSharedRevision(this.db, documentId)
-      if (!head) return deny('DOCUMENT_NOT_FOUND')
-      if (head.version !== expectedVersion) return deny('SHARED_DOCUMENT_CONFLICT')
-      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
-      const revision = { documentId, version: expectedVersion + 1, text }
-      requireWrite(appendSharedRevision(this.db, revision, { sessionId, commandId }))
-      return accept(revision)
-    })
-  }
-
-  /** Bind a new Worker to the expected shared head and copy that immutable baseline into its private version 1. */
-  createSharedTask(sessionId: string, documentId: string, expectedVersion: number, approvedText: string, commandId: string): ManagedResult<ManagedTask> {
-    if (!isId(sessionId) || !isId(documentId) || !isVersion(expectedVersion) || !isText(approvedText) || !isId(commandId)) return deny('INVALID_INPUT')
-    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-    return this.write(() => {
-      const head = readSharedRevision(this.db, documentId)
-      if (!head) return deny('DOCUMENT_NOT_FOUND')
-      if (head.version !== expectedVersion) return deny('SHARED_DOCUMENT_CONFLICT')
-      if (this.sessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
-      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
-      const task = this.createDocumentTask(sessionId, head.text, approvedText, commandId)
-      requireWrite(this.db.prepare('INSERT INTO studio_shared_document_task (task_id, document_id, base_version) VALUES (?, ?, ?)')
-        .run(task.taskId, documentId, expectedVersion).changes)
-      return accept({ ...task, sharedDocument: { documentId, baseVersion: expectedVersion, headVersion: expectedVersion } })
-    })
-  }
-
-  /** Insert the private document, its initial Session binding, and the existing create audit in one transaction. */
-  private createDocumentTask(sessionId: string, initialText: string, approvedText: string, commandId: string): ManagedTask {
-    const taskId = randomUUID()
-    requireWrite(this.db.prepare('INSERT INTO managed_task VALUES (?, 1, 1, 0, ?)').run(taskId, approvedText).changes)
-    requireWrite(this.db.prepare('INSERT INTO managed_session_binding VALUES (?, ?, 1)').run(sessionId, taskId).changes)
-    requireWrite(this.db.prepare('INSERT INTO managed_document VALUES (?, 1, ?)').run(taskId, initialText).changes)
-    const task: ManagedTask = { taskId, workerSessionId: sessionId, executionEpoch: 1, authorizationVersion: 1, paused: false, documentVersion: 1 }
-    this.audit('create', task, commandId, null)
-    return task
-  }
-
-  /** 已认证的较新对话指令只能收紧当前文档的原有行改动，不能新增写入权限或恢复暂停。 */
-  narrowStudioDocument(taskId: string, requestId: string, keepLines: readonly number[]): ManagedResult<ManagedTask> {
-    if (!isId(taskId) || !isId(requestId)) return deny('INVALID_INPUT')
-    const requested = readKeptLines(keepLines)
-    if (!requested) return deny('INVALID_INPUT')
-    return this.write(() => {
-      if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-      const source = this.db.prepare(`SELECT created_at FROM agent_studio_message WHERE id = ? AND role = 'user'
-        AND channel IN ('gui', 'feishu') AND status = 'queued'`).get(requestId)
-      if (!source || typeof source.created_at !== 'number') return deny('INVALID_INPUT')
-      if (this.db.prepare(`SELECT 1 FROM studio_document_scope_control c JOIN agent_studio_message m ON m.id = c.request_id
-        WHERE c.request_id = ? OR (c.task_id = ? AND m.created_at > ?) LIMIT 1`).get(requestId, taskId, source.created_at)) return deny('STALE_AUTHORIZATION')
-      const task = this.task(taskId)
-      if (!task) return deny('TASK_NOT_FOUND')
-      if (task.documentVersion !== 1 || sharedDocumentConflict(task)) return deny('VERSION_CONFLICT')
-      const blocked = this.authorizationBlocked(task)
-      if (blocked) return blocked
-      const { baselineText, approvedText } = this.documentTargets(taskId)
-      const changes = documentLineChanges(baselineText, approvedText)
-      if (!changes) return deny('INSTRUCTION_NOT_NARROWABLE')
-      const kept = changes.changedLines.filter(line => requested.has(line))
-      if (kept.length !== requested.size || kept.length === changes.changedLines.length) return deny('INVALID_KEEP_LINES')
-      for (const line of kept) changes.baseline[(line - 1) * 2] = changes.approved[(line - 1) * 2]!
-      const authorizationVersion = task.authorizationVersion + 1
-      requireWrite(this.db.prepare(`UPDATE managed_task SET approved_text = ?, authorization_version = ?
-        WHERE task_id = ? AND execution_epoch = ? AND authorization_version = ?`)
-        .run(changes.baseline.join(''), authorizationVersion, taskId, task.executionEpoch, task.authorizationVersion).changes)
-      this.db.prepare('INSERT INTO studio_document_scope_control VALUES (?, ?, ?, ?, ?, ?)')
-        .run(requestId, taskId, task.executionEpoch, task.authorizationVersion, authorizationVersion, JSON.stringify(kept))
-      return accept({ ...task, authorizationVersion })
-    })
-  }
-
-  /** Assistant 的已认证入口按确切任务暂停：从当前绑定取 Worker，沿用原有权限版本和写入围栏。 */
-  pauseStudioDocument(taskId: string, commandId: string): ManagedResult<ManagedTask> {
-    if (!isId(taskId) || !isId(commandId)) return deny('INVALID_INPUT')
-    const target = this.snapshot(() => {
-      const task = this.task(taskId)
-      return task ? accept(task) : deny('TASK_NOT_FOUND')
-    })
-    return target.ok ? this.pause(target.value.workerSessionId, commandId) : target
-  }
-
-  /** Block writes to the current task before persisting the pause. A failed state or audit write leaves the block in place and the pause can be retried. */
-  pause(sessionId: string, commandId: string): ManagedResult<ManagedTask> {
-    if (!isId(sessionId) || !isId(commandId)) return deny('INVALID_INPUT')
-    let task: ManagedTask | undefined
-    try {
-      if (!this.ownsRun()) return deny('STALE_HOST_RUN')
-      const current = this.currentTask(sessionId)
-      if (!current.ok) {
-        this.frozenSessions.delete(sessionId)
-        return current
-      }
-      // A committed command is not a new pause. Replaying it cannot block writes again after the task resumes.
-      task = current.value
-      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
-    } catch {
-      if (task) this.frozenTasks.add(task.taskId)
-      else this.frozenSessions.add(sessionId)
-      return deny('PAUSE_UNCONFIRMED')
-    }
-    // Block writes before taking the SQLite write lock. A failed transaction leaves the local block in place and prevents a clean-stop marker.
-    const { taskId, executionEpoch } = task
-    const wasFrozen = this.isFrozen(task)
-    this.frozenTasks.add(taskId)
-    this.frozenSessions.delete(sessionId)
-    const result = this.write(() => {
-      const current = this.currentTask(sessionId)
-      if (!current.ok || current.value.taskId !== taskId || current.value.executionEpoch !== executionEpoch) return deny('STALE_EXECUTION')
-      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
-      requireWrite(this.db.prepare('UPDATE managed_task SET paused = 1, authorization_version = authorization_version + 1 WHERE task_id = ? AND execution_epoch = ?')
-        .run(taskId, executionEpoch).changes)
-      const paused = { ...current.value, paused: true, authorizationVersion: current.value.authorizationVersion + 1 }
-      this.audit('pause', paused, commandId, null)
-      return accept(paused)
-    })
-    if (!result.ok) {
-      if (result.reason === 'STORAGE_ERROR') return deny('PAUSE_UNCONFIRMED')
-      // Known rejections did not attempt a pause. Keep only a fence from an earlier unconfirmed attempt.
-      if (!wasFrozen) this.frozenTasks.delete(taskId)
-      return result
-    }
-    // A confirmed COMMIT replaces the local block with a durable pause.
-    this.frozenTasks.delete(taskId)
-    return result
-  }
-
-  /** Transfer to a previously unbound Session only if the expected epoch matches. Preserve the pause and approved text, and invalidate permits from the old epoch. */
-  transfer(taskId: string, expectedEpoch: number, nextSessionId: string, commandId: string): ManagedResult<ManagedTask> {
-    if (!isId(taskId) || !isVersion(expectedEpoch) || !isId(nextSessionId) || !isId(commandId)) return deny('INVALID_INPUT')
-    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-    return this.write(() => {
-      const task = this.task(taskId)
-      if (!task) return deny('TASK_NOT_FOUND')
-      if (task.executionEpoch !== expectedEpoch) return deny('STALE_EXECUTION')
-      const blocked = this.authorizationBlocked(task)
-      if (blocked) return blocked
-      if (this.sessionBound(nextSessionId)) return deny('SESSION_ALREADY_BOUND')
-      return this.transferTask(task, nextSessionId, commandId, false)
-    })
-  }
-
-  /** Persist minimal coordinates verified by the Host's live continuation failure observer. */
-  recordDocumentFailure(input: DocumentFailureInput): ManagedResult<DocumentFailure> {
-    return this.documentRecovery.record(input)
-  }
-
-  /** List candidates in the configured Host scope without giving permission to send. */
-  pendingDocumentFailureNoticePage(scope: string, afterEvidenceId?: string): ManagedResult<{ evidenceIds: string[]; next?: string }> {
-    if (!isId(scope) || (afterEvidenceId !== undefined && !isId(afterEvidenceId))) return deny('INVALID_INPUT')
-    if (scope !== this.documentFailureNoticeScope) return deny('DOCUMENT_FAILURE_NOTICE_SCOPE_NOT_CONFIGURED')
-    return this.snapshot(() => accept(this.documentFailureNotices.page(afterEvidenceId)))
-  }
-
-  /** Check exact recovery eligibility and commit the sole send attempt in the same Host-owned transaction. */
-  claimDocumentFailureNotice(evidenceId: string, scope: string): ManagedResult<{ failure?: DocumentFailure }> {
-    if (!isId(evidenceId) || !isId(scope)) return deny('INVALID_INPUT')
-    if (scope !== this.documentFailureNoticeScope) return deny('DOCUMENT_FAILURE_NOTICE_SCOPE_NOT_CONFIGURED')
-    return this.write(() => this.documentFailureNotices.claim(evidenceId, scope))
-  }
-
-  /** Keep a verified Feishu receipt or finalize the attempt as unconfirmed; neither outcome permits a retry. */
-  settleDocumentFailureNotice(evidenceId: string, scope: string, messageId?: string): ManagedResult<DocumentFailureNotice> {
-    if (!isId(evidenceId) || !isId(scope)) return deny('INVALID_INPUT')
-    if (scope !== this.documentFailureNoticeScope) return deny('DOCUMENT_FAILURE_NOTICE_SCOPE_NOT_CONFIGURED')
-    return this.write(() => this.documentFailureNotices.settle(evidenceId, scope, messageId))
-  }
-
-  /** Preview an eligible replacement without spending evidence or authorizing it. */
-  previewDocumentRecovery(taskId: string, evidenceId: string, nextSessionId: string): ManagedResult<{ failure: DocumentFailure; task: ManagedTask }> {
-    return this.documentRecovery.preview(taskId, evidenceId, nextSessionId)
-  }
-
-  /** Apply one native owner confirmation for this exact recovery. The replacement cannot write until separately resumed. */
-  recoverDocument(taskId: string, evidenceId: string, nextSessionId: string, commandId: string, confirmationId: string): ManagedResult<ManagedTask> {
-    return this.documentRecovery.recover(taskId, evidenceId, nextSessionId, commandId, confirmationId)
-  }
-
-  /** Under the caller's write lock, advance the binding and authorization together and append the ordinary transfer audit. */
-  private transferTask(task: ManagedTask, nextSessionId: string, commandId: string, pauseForRecovery: boolean): ManagedResult<ManagedTask> {
-    if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
-    const next = { ...task, workerSessionId: nextSessionId, executionEpoch: task.executionEpoch + 1,
-      authorizationVersion: task.authorizationVersion + 1, paused: pauseForRecovery || task.paused }
-    requireWrite(this.db.prepare('INSERT INTO managed_session_binding VALUES (?, ?, ?)').run(nextSessionId, task.taskId, next.executionEpoch).changes)
-    // Manual transfer never updates the pause column. Recovery must durably pause the new binding before it becomes visible.
-    const pause = pauseForRecovery ? ', paused = 1' : ''
-    requireWrite(this.db.prepare(`UPDATE managed_task SET execution_epoch = ?, authorization_version = ?${pause}
-      WHERE task_id = ? AND execution_epoch = ?`).run(next.executionEpoch, next.authorizationVersion, task.taskId, task.executionEpoch).changes)
-    this.audit('transfer', next, commandId, null)
-    return accept(next)
-  }
-
-  /** Resume a durably paused task only when its authorization version matches and no unconfirmed pause remains. */
-  resume(sessionId: string, expectedAuthorizationVersion: number, commandId: string): ManagedResult<ManagedTask> {
-    if (!isId(sessionId) || !isVersion(expectedAuthorizationVersion) || !isId(commandId)) return deny('INVALID_INPUT')
-    if (this.captureFault) return deny('INSTRUCTION_UNCONFIRMED')
-    return this.write(() => {
-      const current = this.currentTask(sessionId)
-      if (!current.ok) return current
-      const task = current.value
-      if (task.documentVersion === 1 && sharedDocumentConflict(task)) return deny('SHARED_DOCUMENT_CONFLICT')
-      const blocked = this.authorizationBlocked(task)
-      if (blocked) return blocked
-      if (task.authorizationVersion !== expectedAuthorizationVersion) return deny('STALE_AUTHORIZATION')
-      if (!task.paused) return deny('TASK_NOT_PAUSED')
-      if (this.commandUsed(commandId)) return deny('DUPLICATE_COMMAND')
-      const next = { ...task, paused: false, authorizationVersion: expectedAuthorizationVersion + 1 }
-      requireWrite(this.db.prepare(`UPDATE managed_task SET paused = 0, authorization_version = ?
-        WHERE task_id = ? AND execution_epoch = ? AND paused = 1 AND authorization_version = ?`)
-        .run(next.authorizationVersion, task.taskId, task.executionEpoch, expectedAuthorizationVersion).changes)
-      this.audit('resume', next, commandId, null)
-      return accept(next)
-    })
-  }
-
-  /** Issue a permit for the current epoch, exact document version, and approved text without writing the document. */
-  authorize(sessionId: string, action: unknown, toolCallId: string, capture?: DocumentGuardCapture): ManagedResult<ManagedWritePermit> {
-    if (!isId(sessionId) || !isId(toolCallId)) return deny('INVALID_INPUT')
-    let scope: DocumentGuardScope | undefined
-    const result = this.captureFault ? deny('INSTRUCTION_UNCONFIRMED') : this.snapshot(() => {
-      const current = this.currentTask(sessionId)
-      if (!current.ok) return current
-      const task = current.value
-      // Observe only this snapshot's exact Worker and shared target, never the state found by the later audit write.
-      const { taskId, executionEpoch, authorizationVersion, sharedDocument } = task
-      if (capture) scope = { taskId, executionEpoch, authorizationVersion,
-        ...(sharedDocument ? { documentId: sharedDocument.documentId } : {}) }
-      // Even if conflicting role bindings exist, Studio Sessions cannot receive document permits.
-      if (this.studioSessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
-      if (task.documentVersion === 1 && sharedDocumentConflict(task)) return deny('SHARED_DOCUMENT_CONFLICT')
-      const blocked = this.executionBlocked(task)
-      if (blocked) return blocked
-      if (this.actionUsed(sessionId, toolCallId)) return deny('DUPLICATE_ACTION')
-      const input = documentAction(action)
-      if (!input) return deny('INVALID_ACTION')
-      // Report the actual requested version when reached, including a version that failed the comparison.
-      if (scope) scope.expectedVersion = input.expectedVersion
-      if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
-      const expectedVersion = sharedDocument?.baseVersion ?? 1
-      if (input.expectedVersion !== expectedVersion) return deny(sharedDocument ? 'SHARED_DOCUMENT_CONFLICT' : 'VERSION_CONFLICT')
-      if (!this.textApproved(taskId, input.text)) return deny('ACTION_NOT_APPROVED')
-      const permit: ManagedWritePermit = Object.freeze({ taskId, workerSessionId: sessionId, executionEpoch, authorizationVersion,
-        toolCallId, expectedVersion, text: input.text, ...(sharedDocument ? { documentId: sharedDocument.documentId } : {}) })
-      this.#permits.set(permit, false)
-      return accept(permit)
-    })
-    if (capture && !result.ok) this.captureDocumentGuard(capture, result.reason, action, 'authorize', sessionId, toolCallId, scope)
-    return result
-  }
-
-  /** With the write lock held, recheck ownership, the permit, the action, and the document. Commit the one allowed change from version 1 to 2 with its audit record. */
-  commit(permit: ManagedWritePermit, action: unknown, capture?: DocumentGuardCapture): ManagedResult<{ documentVersion: number; documentId?: string }> {
-    const spent = this.#permits.get(permit)
-    if (spent === undefined) return deny('INVALID_PERMIT')
-    const early = spent ? deny('DUPLICATE_ACTION') : this.captureFault ? deny('INSTRUCTION_UNCONFIRMED') : undefined
-    const result = early ?? this.write<{ documentVersion: number; documentId?: string }>(() => {
-      const current = this.currentTask(permit.workerSessionId)
-      if (!current.ok || current.value.taskId !== permit.taskId || current.value.executionEpoch !== permit.executionEpoch) return deny('STALE_EXECUTION')
-      if (this.studioSessionBound(permit.workerSessionId)) return deny('SESSION_ALREADY_BOUND')
-      const task = current.value
-      const shared = task.sharedDocument
-      if (task.documentVersion === 1 && sharedDocumentConflict(task)) return deny('SHARED_DOCUMENT_CONFLICT')
-      const blocked = this.executionBlocked(task)
-      if (blocked) return blocked
-      if (task.authorizationVersion !== permit.authorizationVersion) return deny('STALE_AUTHORIZATION')
-      if (this.actionUsed(permit.workerSessionId, permit.toolCallId)) return deny('DUPLICATE_ACTION')
-      const input = documentAction(action)
-      if (!input) return deny('INVALID_ACTION')
-      if (task.documentVersion !== 1) return deny('VERSION_CONFLICT')
-      if (permit.documentId !== shared?.documentId) return deny('INVALID_PERMIT')
-      if (input.expectedVersion !== permit.expectedVersion || permit.expectedVersion !== (shared?.baseVersion ?? 1)) {
-        return deny(shared ? 'SHARED_DOCUMENT_CONFLICT' : 'VERSION_CONFLICT')
-      }
-      if (input.text !== permit.text || !this.textApproved(task.taskId, input.text)) return deny('ACTION_NOT_APPROVED')
-      const committedVersion = shared ? shared.baseVersion + 1 : 2
-      if (shared) {
-        // Append before updating the private result. The trigger requires this exact revision as proof.
-        requireWrite(appendSharedRevision(this.db, { documentId: shared.documentId, version: committedVersion, text: input.text },
-          { sessionId: permit.workerSessionId, taskId: task.taskId, toolCallId: permit.toolCallId }))
-        requireWrite(this.db.prepare(`UPDATE studio_shared_document_task SET committed_version = ?
-          WHERE task_id = ? AND document_id = ? AND base_version = ? AND committed_version IS NULL`)
-          .run(committedVersion, task.taskId, shared.documentId, shared.baseVersion).changes)
-      }
-      requireWrite(this.db.prepare('UPDATE managed_document SET document_version = 2, text = ? WHERE task_id = ? AND document_version = 1')
-        .run(input.text, task.taskId).changes)
-      this.audit('commit', { ...task, documentVersion: 2 }, null, permit.toolCallId)
-      return accept(shared ? { documentVersion: committedVersion, documentId: shared.documentId } : { documentVersion: 2 })
-    })
-    if (result.ok) this.#permits.set(permit, true)
-    else if (capture) {
-      // A genuine frozen permit is the origin even after transfer or when the commit could not inspect current state.
-      const { workerSessionId, toolCallId, taskId, executionEpoch, authorizationVersion, documentId, expectedVersion } = permit
-      this.captureDocumentGuard(capture, result.reason, action, 'commit', workerSessionId, toolCallId,
-        { taskId, executionEpoch, authorizationVersion, expectedVersion, ...(documentId === undefined ? {} : { documentId }) })
-    }
-    return result
-  }
-
-  /** Read only the exact current document Worker's task, including evidence from its previous executions. */
-  readDocumentGuard(sessionId: string, evidenceId?: string): ManagedResult<{
-    task: ManagedTask; items: DocumentGuardEvidence[]; limited: boolean; more?: boolean
-  }> {
-    if (!isId(sessionId) || (evidenceId !== undefined && !isId(evidenceId))) return deny('INVALID_INPUT')
-    return this.snapshot(() => {
-      const current = this.currentTask(sessionId)
-      if (!current.ok) return current
-      if (this.studioSessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
-      const task = current.value
-      const evidence = readDocumentGuardEvidence(this.db, task.taskId, evidenceId)
-      return evidence ? accept({ task, ...evidence }) : deny('DOCUMENT_GUARD_EVIDENCE_NOT_FOUND')
-    })
-  }
-
-  /** Check the current review fence without loading either the approved text or the native action. */
-  previewDocumentGuardReview(sessionId: string, evidenceId: string, expectedAuthorizationVersion: number):
-  ManagedResult<DocumentGuardEvidence & { nativeCall: DocumentGuardNativeCall }> {
-    if (!isId(sessionId) || !isId(evidenceId) || !isVersion(expectedAuthorizationVersion)) return deny('INVALID_INPUT')
-    return this.snapshot(() => this.eligibleDocumentGuardReview(sessionId, evidenceId, expectedAuthorizationVersion))
-  }
-
-  /** Recheck eligibility under the write lock and compare the Host-verified original action without issuing a permit. */
-  reviewDocumentGuard(sessionId: string, evidenceId: string, expectedAuthorizationVersion: number, commandId: string,
-    source: DocumentGuardReviewSource): ManagedResult<DocumentGuardReviewReceipt> {
-    if (!isId(sessionId) || !isId(evidenceId) || !isVersion(expectedAuthorizationVersion) || !isId(commandId)) return deny('INVALID_INPUT')
-    return this.write(() => {
-      const result = this.eligibleDocumentGuardReview(sessionId, evidenceId, expectedAuthorizationVersion, commandId)
-      if (!result.ok) return result
-      const { taskId, workerSessionId, executionEpoch, toolCallId, nativeCall, expectedVersion } = result.value
-      const verified = readDocumentGuardReviewSource(source)
-      if (!verified || verified.toolCallId !== toolCallId || !matchesDocumentGuardNativeCall(nativeCall, verified)) {
-        return deny('GUARD_REVIEW_SOURCE_UNCONFIRMED')
-      }
-      const input = documentAction(verified.action)
-      if (!input || input.expectedVersion !== expectedVersion) return deny('GUARD_REVIEW_SOURCE_UNCONFIRMED')
-      // This is an independent UTF-16 comparison, not the SQLite equality used by authorize. Either outcome leaves the refusal in force.
-      const outcome = input.text === this.documentTargets(taskId).approvedText ? 'comparison-inconsistent' : 'refusal-confirmed'
-      return accept(appendDocumentGuardReview(this.db, { evidenceId, taskId, workerSessionId, executionEpoch,
-        authorizationVersion: expectedAuthorizationVersion, commandId, outcome }))
-    })
-  }
-
-  /** Read a past comparison from the current document Worker's task, even if authorization or execution has since changed. */
-  readDocumentGuardReview(sessionId: string, evidenceId: string): ManagedResult<DocumentGuardReviewReceipt | undefined> {
-    if (!isId(sessionId) || !isId(evidenceId)) return deny('INVALID_INPUT')
-    return this.snapshot(() => {
-      const current = this.currentTask(sessionId)
-      if (!current.ok) return current
-      if (this.studioSessionBound(sessionId)) return deny('SESSION_ALREADY_BOUND')
-      return accept(readDocumentGuardReviewReceipt(this.db, current.value.taskId, evidenceId))
-    })
-  }
-
-  /** Shared metadata-only checks for preview and execution. The caller already holds the appropriate transaction. */
-  private eligibleDocumentGuardReview(sessionId: string, evidenceId: string, expectedAuthorizationVersion: number, commandId?: string):
-  ManagedResult<DocumentGuardEvidence & { nativeCall: DocumentGuardNativeCall }> {
-    const current = this.documentContinuationTask(sessionId, expectedAuthorizationVersion)
-    if (!current.ok) return current
-    const { taskId, workerSessionId, executionEpoch, sharedDocument } = current.value
-    const evidence = readDocumentGuardEvidenceById(this.db, taskId, evidenceId)
-    if (!evidence?.nativeCall || evidence.phase !== 'authorize' || evidence.reason !== 'ACTION_NOT_APPROVED'
-      || evidence.workerSessionId !== workerSessionId || evidence.executionEpoch !== executionEpoch
-      || evidence.documentId !== sharedDocument?.documentId || evidence.expectedVersion !== (sharedDocument?.baseVersion ?? 1)) {
-      return deny('GUARD_REVIEW_NOT_ELIGIBLE')
-    }
-    if (evidence.authorizationVersion !== expectedAuthorizationVersion) return deny('STALE_AUTHORIZATION')
-    if (documentGuardReviewUsed(this.db, taskId, expectedAuthorizationVersion, evidenceId, commandId)) return deny('GUARD_REVIEW_LIMIT_REACHED')
-    return accept({ ...evidence, nativeCall: evidence.nativeCall })
-  }
-
-  /** Retain a known failure without changing the original outcome, even if auditing itself fails. */
-  private captureDocumentGuard(capture: DocumentGuardCapture, reason: string, action: unknown, phase: 'authorize' | 'commit',
-    workerSessionId: string, toolCallId: string, observed?: DocumentGuardScope): void {
-    if (!documentGuardCategory(reason) || types.isProxy(capture) || !documentAction(action)) return
-    // Only a completed authorization comparison can bind the Host's confirmed native coordinates.
-    const link = observed && phase === 'authorize' && reason === 'ACTION_NOT_APPROVED'
-      ? Object.getOwnPropertyDescriptor(capture, 'nativeCall') : undefined
-    const nativeCall = link && Object.hasOwn(link, 'value') ? readDocumentGuardNativeCall(link.value) : undefined
-    // The failing snapshot or write has ended. Resolve only the immutable binding if it could not observe a task.
-    const result: ManagedResult<NonNullable<DocumentGuardCapture['retention']>> = !isDocumentGuardToolCallId(toolCallId)
-      ? accept({ kind: 'not-retained', reason: 'origin-unconfirmed' }) : this.write(() => {
-        const scope = observed ?? this.binding(workerSessionId)
-        return accept(scope ? retainDocumentGuard(this.db, { ...scope, workerSessionId, toolCallId, phase, reason }, nativeCall)
-          : { kind: 'not-retained', reason: 'origin-unconfirmed' })
-      })
-    const retention = result.ok ? result.value : { kind: 'not-retained', reason: 'unavailable' } as const
-    // The capture is an output holder, not an opportunity to invoke a setter during the guard call.
-    try { Object.defineProperty(capture, 'retention', { value: retention, writable: true, enumerable: true, configurable: true }) }
-    catch { /* A read-only holder must not replace the guard result. */ }
-  }
-
-  /** Use a write lock for mutations and a deferred transaction for read-only snapshots. Roll back on rejection or error. */
-  private transaction<T>(operation: () => ManagedResult<T>, mode: 'write' | 'read' = 'write'): ManagedResult<T> {
-    const db = this.db
-    db.exec(mode === 'write' ? 'BEGIN IMMEDIATE' : 'BEGIN')
-    try {
-      const result = operation()
-      db.exec(result.ok ? 'COMMIT' : 'ROLLBACK')
-      return result
-    } catch (error) {
-      try { if (db.isTransaction) db.exec('ROLLBACK') }
-      catch { try { this.close() } catch { /* Disable the connection after a rollback failure so writes cannot continue. */ } }
-      throw error
-    }
-  }
-
-  /** Serialize writes with run replacement. A host overtaken after its directory lock expires cannot commit a previous run's action. */
-  private write<T>(operation: () => ManagedResult<T>): ManagedResult<T> {
-    try { return this.transaction(() => this.ownsRun() ? operation() : deny('STALE_HOST_RUN')) }
-    catch (error) {
-      // The Assistant work guards reject cross-route reuse after a scope change reserved the source.
-      return deny(error instanceof Error && error.message === SCOPE_CHANGE_SOURCE_CONFLICT ? 'SOURCE_ALREADY_USED' : 'STORAGE_ERROR')
-    }
-  }
-
-  /** Observe the run fence, binding, and document state together without taking a writer lock. */
-  private snapshot<T>(operation: () => ManagedResult<T>): ManagedResult<T> {
-    try { return this.transaction(() => this.ownsRun() ? operation() : deny('STALE_HOST_RUN'), 'read') }
-    catch { return deny('STORAGE_ERROR') }
-  }
-
-  private ownsRun(): boolean {
-    return !!this.db.prepare('SELECT 1 FROM managed_host_run WHERE singleton = 1 AND run_id = ? AND clean = 0').get(this.#runId)
-  }
-
-  /** These owner-facing projections read the same ledgers as the command handlers. */
-  studioProjects() { this.assertStudioRun(); return studioProjects(this.db) }
-  studioHiddenIds() { this.assertStudioRun(); return studioHiddenIds(this.db) }
-  studioProject(id: string) { this.assertStudioRun(); return studioProject(this.db, id) }
-  studioSession(id: string) { this.assertStudioRun(); return studioSession(this.db, id) }
-  studioRelatedWork(room: string, requestId: string, messageId: string) {
-    this.assertStudioRun()
-    return this.revisions.link(room, requestId, messageId) ?? studioRelatedWork(this.db, room, requestId, messageId)
-  }
-  studioArtifacts(room: string, requestId: string, messageId: string) {
-    this.assertStudioRun(); return studioArtifacts(this.db, room, requestId, messageId)
-  }
-  studioBlockingItems() { this.assertStudioRun(); return studioBlockingItems(this.db) }
-  studioPendingRecord(id: string) { this.assertStudioRun(); return studioPendingRecord(this.db, id) }
-
-  private assertStudioRun(): void {
-    if (!this.ownsRun()) throw new Error('Agent Studio no longer owns its state')
-  }
-
-  /** Historical bindings are readable but no longer grant execution authority. */
-  private currentTask(sessionId: string): ManagedResult<ManagedTask> {
-    const binding = this.binding(sessionId)
-    if (!binding) return deny('SESSION_NOT_BOUND')
-    const task = this.task(binding.taskId)
-    if (!task) throw new Error('Missing task or document for Managed Worker binding')
-    if (task.workerSessionId !== sessionId || task.executionEpoch !== binding.executionEpoch) return deny('STALE_EXECUTION')
-    return accept(task)
-  }
-
-  private task(taskId: string): ManagedTask | undefined {
-    const row: Record<string, SQLOutputValue> | undefined = this.db.prepare(`SELECT t.execution_epoch, t.authorization_version, t.paused,
-      b.session_id, d.document_version, shared.document_id, shared.base_version, shared.committed_version,
-      (SELECT MAX(version) FROM studio_shared_document_revision WHERE document_id = shared.document_id) AS head_version
-      FROM managed_task t
-      JOIN managed_session_binding b ON b.task_id = t.task_id AND b.execution_epoch = t.execution_epoch
-      JOIN managed_document d ON d.task_id = t.task_id
-      LEFT JOIN studio_shared_document_task shared ON shared.task_id = t.task_id WHERE t.task_id = ?`).get(taskId)
-    if (!row) return
-    const { session_id: workerSessionId, execution_epoch: executionEpoch, authorization_version: authorizationVersion,
-      paused, document_version: documentVersion } = row
-    if (!isId(workerSessionId) || !isVersion(executionEpoch) || !isVersion(authorizationVersion)
-      || (paused !== 0 && paused !== 1) || (documentVersion !== 1 && documentVersion !== 2)) throw new Error('Invalid Managed Worker task state')
-    const task: ManagedTask = { taskId, workerSessionId, executionEpoch, authorizationVersion, paused: paused === 1, documentVersion }
-    const { document_id: documentId, base_version: baseVersion, head_version: headVersion, committed_version: committedVersion } = row
-    if (documentId !== null) {
-      if (!isId(documentId) || !isVersion(baseVersion) || !isVersion(headVersion) || headVersion < baseVersion
-        || (documentVersion === 1 ? committedVersion !== null : committedVersion !== baseVersion + 1 || headVersion < committedVersion)) {
-        throw new Error('Invalid Studio shared document task state')
-      }
-      task.sharedDocument = { documentId, baseVersion, headVersion, ...(isVersion(committedVersion) ? { committedVersion } : {}) }
-    }
-    return task
-  }
-
-  /** Load the baseline and exact currently approved target from the same version 1 document. */
-  private documentTargets(taskId: string): { baselineText: string; approvedText: string } {
-    const row = this.db.prepare(`SELECT d.text AS baseline_text, t.approved_text FROM managed_task t
-      JOIN managed_document d USING (task_id) WHERE t.task_id = ? AND d.document_version = 1`).get(taskId)
-    if (!isText(row?.baseline_text) || !isText(row?.approved_text)) throw new Error('Invalid Managed Worker document targets')
-    return { baselineText: row.baseline_text, approvedText: row.approved_text }
-  }
-
-  /** Record each committed user command or tool action with the resulting state. Deduplicate commands and tool calls separately. */
-  private audit(kind: 'create' | 'pause' | 'transfer' | 'resume' | 'commit', task: ManagedTask, commandId: string | null, toolCallId: string | null): void {
-    requireWrite(this.db.prepare(`INSERT INTO managed_audit (kind, task_id, session_id, execution_epoch, authorization_version, paused,
-      document_version, command_id, tool_call_id, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(kind, task.taskId, task.workerSessionId, task.executionEpoch, task.authorizationVersion, task.paused ? 1 : 0,
-        task.documentVersion, commandId, toolCallId, new Date().toISOString()).changes)
-  }
-
-  private commandUsed(commandId: string): boolean {
-    return !!this.db.prepare('SELECT 1 FROM managed_audit WHERE command_id = ?').get(commandId)
-      || this.instructions.commandUsed(commandId)
-      || !!this.db.prepare('SELECT 1 FROM studio_shared_document_revision WHERE command_id = ?').get(commandId)
-      || projectDocumentCommandUsed(this.db, commandId)
-      || projectResultCommandUsed(this.db, commandId)
-      || projectWorkModelCommandUsed(this.db, commandId)
-      || projectWorkBlockCommandUsed(this.db, commandId)
-      || jobCandidateCommandUsed(this.db, commandId)
-  }
-
-  private actionUsed(sessionId: string, toolCallId: string): boolean {
-    return !!this.db.prepare('SELECT 1 FROM managed_audit WHERE session_id = ? AND tool_call_id = ?').get(sessionId, toolCallId)
-  }
-
-  /** Use SQLite binary text comparison without trimming whitespace, changing line endings, or normalizing Unicode. */
-  private textApproved(taskId: string, text: string): boolean {
-    return !!this.db.prepare('SELECT 1 FROM managed_task WHERE task_id = ? AND approved_text = ? COLLATE BINARY').get(taskId, text)
-  }
-
-  /** If the initial read fails before the task ID is known, block writes from the Session until the pause can be resolved and persisted. */
-  private isFrozen(task: ManagedTask): boolean {
-    return this.frozenTasks.has(task.taskId) || this.frozenSessions.has(task.workerSessionId)
-  }
-
-  /** Check the durable inbox before the pause so callers can route pending work to the owner review command. */
-  private authorizationBlocked(task: ManagedTask): Rejection | undefined {
-    if (this.instructions.hasPending(task.taskId)) return deny('INSTRUCTION_PENDING')
-    if (this.isFrozen(task)) return deny('PAUSE_UNCONFIRMED')
-  }
-
-  private executionBlocked(task: ManagedTask): Rejection | undefined {
-    return this.authorizationBlocked(task) ?? (task.paused ? deny('TASK_PAUSED') : undefined)
-  }
-
-  /** Recovery requires an unfinished, unblocked continuation and a Worker with no competing Studio role. */
-  private documentRecoveryHold(task: ManagedTask): string | undefined {
-    if (task.documentVersion !== 1) return 'VERSION_CONFLICT'
-    return this.projectDocumentHold(task) ?? (this.studioSessionBound(task.workerSessionId) ? 'SESSION_ALREADY_BOUND' : undefined)
-  }
-
-  /** Expose only the blocker code for an unfinished task, never its instructions or approved replacement. */
-  private projectDocumentHold(task: ManagedTask): string | undefined {
-    if (this.captureFault) return 'INSTRUCTION_UNCONFIRMED'
-    if (sharedDocumentConflict(task)) return 'SHARED_DOCUMENT_CONFLICT'
-    return this.executionBlocked(task)?.reason
-  }
+export interface StudioStoreAccess {
+  db: DatabaseSync
+  write<T>(operation: () => T): T
+  assertActive(): void
 }

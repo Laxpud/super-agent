@@ -34,7 +34,42 @@ export interface StudioMessage {
   feishuDelivery?: 'pending' | 'sent' | 'unconfirmed'
 }
 
-export interface StudioProjectSummary { id: string; name: string; objective: string }
+export const WORKER_DELEGATE = 'studio_delegate_task'
+export const WORKER_READ = 'studio_read_task'
+export const LIST_PROJECTS = 'studio_list_projects'
+export const PROPOSE_PROJECT = 'studio_propose_project'
+/** 仅供只读记录渲染旧 Worker 工具调用；宿主不再注册这些工具。 */
+export const DRAFT_DELEGATE = 'studio_delegate_draft'
+export const DRAFT_READ = 'studio_read_draft'
+
+export type StudioRole = 'assistant' | 'leader' | 'worker'
+export type StudioRecordRole = StudioRole | 'document-worker' | 'draft-worker' | 'study-worker' | 'advisor' | 'subagent' | 'legacy'
+export type StudioWorkerPermission = 'read-only' | 'workspace-write'
+export type StudioTaskStatus = 'queued' | 'running' | 'waiting_approval' | 'blocked' | 'interrupted' | 'cancelled' | 'delivered'
+export interface StudioTaskSummary {
+  taskId: string
+  projectId: string | null
+  sourceMessageId: string | null
+  requesterBotId: string | null
+  assigneeBotId: string | null
+  workspacePath: string | null
+  permission: StudioWorkerPermission
+  authorizationVersion: number
+  status: StudioTaskStatus
+  title: string
+  requestText: string
+  resultSummary: string | null
+  checkResult: string | null
+  artifacts: StudioArtifact[]
+  externalJob: unknown
+  createdAt: number
+  updatedAt: number
+  source?: StudioSource
+}
+
+export interface StudioProjectSummary {
+  id: string; name: string; objective: string; workspacePath: string | null; state: 'active' | 'archived'; managementEpoch: number
+}
 export interface StudioModel { provider: string; model: string; reasoningEffort?: string }
 export interface StudioModelOption { provider: string; model: string; label: string; reasoningEfforts: string[] }
 export interface StudioSettings {
@@ -78,7 +113,8 @@ export interface StudioPending {
 export interface StudioSessionRecord {
   id: string
   conversationId: string
-  role: 'assistant' | 'leader' | 'document-worker' | 'draft-worker' | 'advisor' | 'subagent'
+  role: StudioRecordRole
+  readonlyLegacy?: boolean
   createdAt: number
 }
 export interface StudioRecordEvent {
@@ -105,6 +141,9 @@ export interface StudioOperations {
   timeline: { input: { conversationId: string; topicId?: string; before?: number }; result: StudioPage<StudioMessage> }
   message: { input: { conversationId: string; id: string }; result: StudioMessage }
   send: { input: StudioSend; result: StudioMessage }
+  tasks: { input: { conversationId?: string; before?: number }; result: StudioPage<StudioTaskSummary> }
+  task: { input: { taskId: string }; result: StudioTaskSummary }
+  stopTask: { input: { taskId: string }; result: StudioTaskSummary }
   pending: { input: { before?: number }; result: StudioPage<StudioPending> }
   answer: { input: { id: string; value: string }; result: StudioPending }
   records: { input: { query?: string; before?: number }; result: StudioPage<StudioSessionRecord> }

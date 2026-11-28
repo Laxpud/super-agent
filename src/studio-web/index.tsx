@@ -6,8 +6,7 @@ import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type { SidebarPanelIconOwnerProps } from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
-import { ADVISOR_CONSULT, ADVISOR_READ, DRAFT_DELEGATE, DRAFT_READ, STUDY_DELEGATE, STUDY_READ } from '../managed-worker/result-tool-names.ts'
-import type { StudioState } from '../studio/protocol.ts'
+import { DRAFT_DELEGATE, DRAFT_READ, WORKER_DELEGATE, WORKER_READ, type StudioState } from '../studio/protocol.ts'
 import { callStudio } from './api.ts'
 import { createDrafts } from './drafts.ts'
 import { en, NS, zh } from './locales.ts'
@@ -111,7 +110,8 @@ export function apply(ctx: Context): void {
   ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: PANEL_ID, order: 10,
     label: () => t('studio'), locale: NS }, (props: SidebarPanelIconOwnerProps & PropsLocale<typeof NS>) => <StudioIcon {...props} stateQuery={stateQuery} />))
   ctx.slots.inject(SLOT, function* () {
-    for (const key of [DRAFT_DELEGATE, DRAFT_READ, STUDY_DELEGATE, STUDY_READ, ADVISOR_CONSULT, ADVISOR_READ]) {
+    // 旧草稿工具只保留历史卡片，不恢复宿主注册。
+    for (const key of [WORKER_DELEGATE, WORKER_READ, DRAFT_DELEGATE, DRAFT_READ]) {
       yield ctx.slots.register({ name: SLOT, key, locale: NS }, StudioResult)
     }
   })

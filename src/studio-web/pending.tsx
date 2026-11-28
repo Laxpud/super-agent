@@ -12,6 +12,7 @@ function PendingItem({ item, resolved, refresh }: { item: StudioPending; resolve
   const [busy, setBusy] = useState(false)
   const running = useRef(false)
   const inputId = useId()
+  const blocked = item.kind === 'blocked'
   const answer = async (value: string) => {
     if (running.current || item.state !== 'pending' || !value.trim()) return
     running.current = true
@@ -58,10 +59,11 @@ function PendingItem({ item, resolved, refresh }: { item: StudioPending; resolve
         {item.options.map(value => <Button key={value} disabled={busy} onClick={() => void answer(value)}>{value}</Button>)}
       </div>}
       {item.acceptsText && <form className="as-fields" onSubmit={event => { event.preventDefault(); void answer(text) }}>
-        <label htmlFor={inputId}>{t('answerLabel')}</label>
-        <textarea id={inputId} rows={2} value={text} disabled={busy} maxLength={item.kind === 'blocked' ? 1_000 : 4_000}
+        <label htmlFor={inputId}>{t(blocked ? 'unblockLabel' : 'answerLabel')}</label>
+        {blocked && <p id={`${inputId}-help`} className="as-muted">{t('unblockHint')}</p>}
+        <textarea id={inputId} rows={2} value={text} disabled={busy} maxLength={blocked ? 1_000 : 4_000} aria-describedby={blocked ? `${inputId}-help` : undefined}
           onChange={event => setText(event.currentTarget.value)} />
-        <div className="as-actions"><Button type="submit" primary disabled={busy || !text.trim()}>{t(busy ? 'answering' : 'answer')}</Button></div>
+        <div className="as-actions"><Button type="submit" primary disabled={busy || !text.trim()}>{t(busy ? 'answering' : blocked ? 'unblockAction' : 'answer')}</Button></div>
       </form>}
       {busy && !item.acceptsText && <p className="as-muted" role="status">{t('answering')}</p>}
     </> : item.state === 'resolved' && <div className="as-fields">

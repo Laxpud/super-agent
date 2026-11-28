@@ -125,13 +125,8 @@ export const styles = `
 .as-studio .as-config-view { display: grid; gap: 12px; min-width: 0; }
 .as-studio .as-config-view[hidden] { display: none; }
 .as-studio .as-setting-panel { padding: 0; border: 0; margin: 0; min-width: 0; }
-.as-studio .as-setting-panel:empty { display: none; }
 .as-studio .as-setting-field { display: grid; gap: 4px; min-width: 0; align-content: start; }
 .as-studio .as-setting-field select { width: 100%; }
-.as-studio .as-setting-toggle { display: grid; align-items: center; grid-template-columns: auto minmax(0, 1fr); gap: 4px 8px; min-width: 0; }
-.as-studio .as-setting-toggle input { inline-size: 16px; block-size: 16px; min-height: 0; padding: 0; margin: 3px 2px; accent-color: var(--dsw-alias-button-primary-fill); }
-.as-studio .as-setting-toggle label { line-height: 1.5; cursor: pointer; }
-.as-studio .as-setting-toggle p { grid-column: 2; }
 .as-studio .as-setting-row { display: grid; gap: 4px; min-width: 0; }
 .as-studio .as-settings-code { display: block; padding: 7px 9px; background: var(--dsw-alias-bg-layer-2); border-radius: 7px; overflow-wrap: anywhere; }
 .as-studio .as-settings a { color: var(--dsw-alias-label-primary); text-decoration: underline; text-underline-offset: 2px; }

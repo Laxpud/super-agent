@@ -1,9 +1,9 @@
 /** Studio 默认模型是带修订版本的单独设置，不改对话窗口或宿主配置。 */
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
-import type { FeishuState, StudioModel, StudioModelOption, StudioSettings } from '../studio/protocol.ts'
+import type { FeishuState, StudioModel, StudioSettings } from '../studio/protocol.ts'
 import { HostSettings } from './configuration.tsx'
 import { createQuery, useQuery, type QuerySnapshot } from './query.ts'
-import { SETTINGS_SECTIONS, type SettingsSection } from './settings-fields.tsx'
+import { SETTINGS_SECTIONS, type ModelCatalog, type SettingsSection } from './settings-fields.tsx'
 import { Button, FailureNotice, PageHeading, QueryStatus, useStudio } from './ui.tsx'
 
 const MODEL_ROLES = ['assistant', 'leader'] as const
@@ -13,7 +13,7 @@ interface Draft { base: StudioSettings; edits: Edits }
 const equal = (a: StudioModel | null, b: StudioModel | null) => a?.provider === b?.provider && a?.model === b?.model &&
   a?.reasoningEffort === b?.reasoningEffort
 
-function ModelFields({ role, value, options, change, disabled }: { role: ModelRole; value: StudioModel | null; options: StudioModelOption[];
+function ModelFields({ role, value, options, change, disabled }: { role: ModelRole; value: StudioModel | null; options: ModelCatalog;
   change: (value: StudioModel | null) => void; disabled: boolean }) {
   const { t } = useStudio()
   const id = useId()
@@ -62,7 +62,7 @@ export function feishuTone(state: FeishuState) {
 }
 
 function DialogueModels({ models, reload, locked, dirtyChange, busyChange }: {
-  models: QuerySnapshot<StudioModelOption[]>; reload: () => void; locked: boolean;
+  models: QuerySnapshot<ModelCatalog>; reload: () => void; locked: boolean;
   dirtyChange: (value: boolean) => void; busyChange: (value: boolean) => void
 }) {
   const { t, state, call, reloadState } = useStudio()

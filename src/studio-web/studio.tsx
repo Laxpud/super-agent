@@ -59,6 +59,7 @@ export function Studio({ t, locale, stateQuery, drafts, call = callStudio }: {
   }, [locale])
   const view = location.view
   const projectId = view.kind === 'chat' && view.conversationId !== ASSISTANT_CONVERSATION ? view.conversationId : ''
+  const projects = state?.projects.filter(project => project.state === 'active') ?? []
   const pending = state?.pendingCount ?? 0
   const on = (kind: 'pending' | 'records') => view.kind === kind ? undefined : () => open({ kind })
   const feishuPage = view.kind === 'settings' && view.section === 'feishu'
@@ -79,13 +80,13 @@ export function Studio({ t, locale, stateQuery, drafts, call = callStudio }: {
         <nav className="as-nav" aria-label={t('navigation')}>
           <Button aria-current={view.kind === 'chat' && view.conversationId === ASSISTANT_CONVERSATION ? 'page' : undefined}
             disabled={view.kind === 'settings' && settingsBusy} onClick={() => navigate(home)}>{t('assistant')}</Button>
-          <select aria-label={t('project')} value={projectId} disabled={!state?.projects.length || view.kind === 'settings' && settingsBusy} onChange={event => {
+          <select aria-label={t('project')} value={projectId} disabled={!projects.length || view.kind === 'settings' && settingsBusy} onChange={event => {
             const conversationId = event.currentTarget.value
             navigate(conversationId ? { view: { kind: 'chat', conversationId } } : home)
           }}>
             <option value="">{t('project')}</option>
-            {projectId && !state?.projects.some(project => project.id === projectId) && <option value={projectId}>{projectId}</option>}
-            {state?.projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}
+            {projectId && !projects.some(project => project.id === projectId) && <option value={projectId}>{projectId}</option>}
+            {projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}
           </select>
           <Button aria-current={view.kind === 'pending' ? 'page' : undefined}
             disabled={view.kind === 'settings' && settingsBusy} onClick={on('pending')}>

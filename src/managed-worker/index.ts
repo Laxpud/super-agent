@@ -1,737 +1,312 @@
-/** Opt-in Studio roles independent of GitHub setup. Only a bound document Worker can request a managed write. */
+/** 单所有者 Agent Studio 宿主；不加载 GitHub Ticket、旧文档或外部作业子系统。 */
 import { createHash } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { isLoopbackHost } from '@deepseek-ai/dsh-host-webserver'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import type { ToolExecution, ToolExecutionToken } from '@deepseek-ai/dsh-tools'
+import type { ToolExecution } from '@deepseek-ai/dsh-tools'
 import s from '@deepseek-ai/schemastery'
 import { lockSync } from 'proper-lockfile'
-import { z } from 'zod'
-import { AgentDelivery } from '../app/delivery.ts'
 import { currentPresetId } from '../infra/preset-names.ts'
 import { StudioConfigurationControl } from '../studio/configuration.ts'
-import { FeishuConversationConfig, feishuSourceScope, validateFeishuInbox } from '../studio/feishu-binding.ts'
+import { FeishuConversationConfig, feishuSourceScope, validateFeishuInbox, type FeishuBindingConfig } from '../studio/feishu-binding.ts'
 import { StudioFeishuSdk } from '../studio/feishu-sdk.ts'
 import { StudioFeishuConversation } from '../studio/feishu.ts'
 import { StudioFeishuSetup } from '../studio/feishu-setup.ts'
 import { registerStudioHttp } from '../studio/http.ts'
-import { ASK_STUDIO_OWNER, StudioError } from '../studio/pending.ts'
-import type { FeishuState, StudioModel } from '../studio/protocol.ts'
+import { StudioError } from '../studio/pending.ts'
+import { isStudioInternalSession, LIST_PROJECTS, PROPOSE_PROJECT, WORKER_DELEGATE, WORKER_READ, type FeishuState,
+  type StudioModel, type StudioRole, type StudioWorkerPermission } from '../studio/protocol.ts'
 import { StudioService } from '../studio/service.ts'
-import { REVISE_STUDIO_TASK } from '../studio/sessions.ts'
 import { StudioCredentials } from '../studio/settings-credentials.ts'
-import { confirmStudioDirectory, STUDIO_DB, type StudioDirectorySwitch } from '../studio/settings-directory.ts'
-import { DRAFT_DELEGATE, STUDY_DELEGATE } from './result-tool-names.ts'
-import type { AdvisorRoute } from './advisor-store.ts'
-import { AdvisorConfig, StudioAdvisor, advisorSelection, isAdvisorTool } from './advisor.ts'
-import { ASSISTANT_PRESET, StudioAssistant, draftOutput, isAssistantTool, type RestrictedTextRole } from './assistant.ts'
-import { BOT_EXPERIENCE_HINT } from './bot-experience.ts'
-import { documentStartArgs, sharedDocumentCommand, sharedDocumentCoordinates, sharedDocumentError } from './document-command.ts'
-import { StudioDocumentFailureNotices } from './document-failure-notices.ts'
-import { documentContinuationIntent } from './document-continuation-intent.ts'
-import { StudioDocumentContinuation } from './document-continuation.ts'
-import { DOCUMENT_WRITE_TOOL as TOOL, GUARD_REVIEW_HINT, documentGuardReviewCommand, documentWriteActionSchema, observeDocumentGuardCall } from './document-guard-review.ts'
-import type { DocumentGuardCapture } from './document-guard-store.ts'
-import { DOCUMENT_GUARD_HINT, documentGuardCommand, documentGuardFeedback } from './document-guard.ts'
-import { StudioDocumentRecovery } from './document-recovery.ts'
-import { FeishuDocumentInboxConfig, FeishuTextInboxConfig, StudioFeishuInbox } from './feishu-inbox.ts'
-import { StudioFeishuText, feishuDraftOutput, feishuDraftsCommand, validateFeishuTextRoute } from './feishu-text.ts'
-import { captureDocumentInstructions, continueDocument, documentHoldError, instructionCommand, reviewDocumentIntent, validateDocumentRelays } from './instructions.ts'
+import { confirmStudioDirectory, STUDIO_DB, verifyWorkspace, type StudioDirectorySwitch } from '../studio/settings-directory.ts'
+import { ASSISTANT_PRESET, StudioAssistant, WORKER_PRESET } from './assistant.ts'
 import { MEMORY_COMMAND, MEMORY_HINT, memoryCommand } from './memory.ts'
-import { currentOwnerInboxInput } from './owner-inbox-input.ts'
-import { StudioPreferenceChange } from './preference-correction.ts'
-import { PROPOSE_PREFERENCE, StudioPreferenceIntake } from './preference-intake.ts'
-import { answerPreferenceQuery } from './preference-query.ts'
-import { PROJECT_ARCHIVE_HINT } from './project-archive.ts'
-import { StudioProjectFactIntake } from './project-fact-intake.ts'
-import { parseProjectFactRequest } from './project-fact-request.ts'
-import { PROJECT_HANDOFF_HINT } from './project-handoff.ts'
-import { PROPOSE_PROJECT, StudioProjectIntake } from './project-intake.ts'
-import { StudioProjectJobMonitor } from './project-job-monitor.ts'
-import { STUDIO_JOB_HINT, StudioProjectJobControl } from './project-job.ts'
-import { LEADER_PRESET, PROJECT_MODEL_CLEAR_HINT, PROJECT_MODEL_USE_HINT, PROJECT_RESULT_USE_HINT, PROJECT_WORK_BLOCK_HINT,
-  RECORD_WORK, StudioProjectControl, isLeaderTool } from './project.ts'
-import { StudioQuotaNotices } from './quota-notices.ts'
-import { QuotaPoolConfig, StudioQuotaControl, quotaProviderMap } from './quota.ts'
-import { ManagedWorkerStore, type ManagedResult, type ManagedTask, type ManagedWritePermit } from './store.ts'
-import { StudioStudy, isStudyTool, studyOutput } from './study.ts'
-import { createTextWorkerModelPolicy, TextWorkerBoundsConfig, TextWorkerDefaultsConfig, TextWorkerRouteConfig } from './text-worker-model-policy.ts'
-import { watchdogCommand } from './watchdog.ts'
+import { StudioProjectIntake } from './project-intake.ts'
+import { LEADER_PRESET, PROJECT_COMMAND, PROJECT_HINT, StudioProjectControl } from './project.ts'
+import { ManagedWorkerStore } from './store.ts'
+import { LegacyWorkerDefaultsConfig, LegacyWorkerRouteConfig, migrateWorkerModels, WorkerModelDefaultsConfig, WorkerModelPolicy,
+  WorkerModelRouteConfig } from './text-worker-model-policy.ts'
 
 export const name = 'agent-studio-managed-worker'
 export const inject = ['agents', 'agentPresets', 'commands', 'connection', 'permissionPresets', 'sandboxPolicy', 'sessionPersistence', 'systemPrompt', 'tools', 'webServer', 'llm']
-const StudioRoleModel: s<StudioModel> = s.object({ provider: s.string().required(), model: s.string().required(), reasoningEffort: s.string() })
-export const Config = s.object({
-  stateDir: s.string().required().description('Absolute directory reserved for the Studio database.'),
-  studioCwd: s.string().default('').description('Workspace directory for new Assistant Sessions; defaults to the Host working directory.'),
-  assistantModel: s.union([s.const(null), StudioRoleModel]).default(null).description('Initial Assistant model selection for Agent Studio.'),
-  leaderModel: s.union([s.const(null), StudioRoleModel]).default(null).description('Initial Leader model selection for Agent Studio.'),
-  feishuConversation: s.union([s.const(null), FeishuConversationConfig]).default(null)
-    .description('Bind the unified Assistant conversation to an exact Feishu bot and owner private chat. Mutually exclusive with legacy inboxes.'),
-  guiDocumentInbox: s.boolean().default(false).description('Hold pending document writes for owner review when a new chat message arrives in the bound document Worker.'),
-  documentContinuations: s.boolean().default(false)
-    .description('Route standalone owner continuation requests in Studio Assistant and the linked Feishu document inbox to the current document Worker without changing authorization.'),
-  advisor: s.union([s.const(null), AdvisorConfig]).default(null)
-    .description('Opt-in route for independent, tool-free Advisor consultations; null disables new consultations.'),
-  memory: s.boolean().default(false)
-    .description('Enable owner preferences, explicit references in text work, project archives and Bot experiences. Saved preferences and project facts are never applied automatically.'),
-  textWorkerRoutes: s.array(TextWorkerRouteConfig).max(64).default([])
-    .description('Allowed provider/model/effort combinations for ordinary text dispatch. Order from lower to higher when using textWorkerBounds.'),
-  textWorkerDefaults: TextWorkerDefaultsConfig
-    .description('Optional Worker-only defaults for Assistant delegation and manual Leader text dispatch. Each must match an allowed tuple within that role’s bounds.'),
-  textWorkerBounds: TextWorkerBoundsConfig
-    .description('Optional inclusive bounds per dispatch role. Each endpoint must match one textWorkerRoutes row in all three fields. Omit or use null for an open side. Bounds never pick a model.'),
-  feishuDocumentInbox: s.union([s.const(null), FeishuDocumentInboxConfig]).default(null)
-    .description('Optional, separately configured single-owner Feishu inbox for a managed document.'),
-  feishuTextInbox: s.union([s.const(null), FeishuTextInboxConfig]).default(null)
-    .description('Optional single-owner Feishu inbox for explicit text tasks and opt-in document review. Do not enable a second inbox.'),
-  quotaPools: s.array(QuotaPoolConfig).default([])
-    .description('Explicit provider IDs that share each inference quota pool; empty disables the quota gate.'),
-  quotaFeishuAlerts: s.boolean().default(false)
-    .description('Send one system notice per confirmed quota incident to the configured Feishu owner as the verified bot.'),
-  watchdog: s.boolean().default(false)
-    .description('Expose an owner-only read-only health snapshot of recorded Studio state; no background recovery.'),
-  documentRecovery: s.boolean().default(false)
-    .description('With watchdog, record qualifying document turn failures and allow one owner-confirmed paused replacement.'),
-  documentFailureFeishuAlerts: s.boolean().default(false)
-    .description('With document recovery and a Feishu inbox, notify the configured owner once per eligible failure.'),
-  systemdJobInbox: s.boolean().default(false)
-    .description('Allow the owner to attach and check existing local systemd user jobs in a Studio project.'),
-  systemdJobPollSeconds: s.number().default(0)
-    .description('Seconds between bounded checks of attached jobs, 5–300. Zero disables the watcher and automatic post-processing.'),
-  // GUI 工作流的内部引用，不是额外的用户配置。只保存标识；密钥和目录准备证明各由专属存储提供。
-  studioFeishuCredentialId: s.string().default(''),
-  studioDirectoryToken: s.string().default(''),
-})
-export type StudioHostConfig = ReturnType<typeof Config>
-type Config = StudioHostConfig
 
-const PRESET = 'agent-studio-managed-worker'
-const TEXT_LIMIT = 32_000
-const version = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
-
-interface CommandResult { kind: 'success' | 'error'; text: string }
-interface CommandInput { agent: Agent; commandId: string; rawInput: string; signal: AbortSignal }
-type StudioRole = 'assistant' | 'leader' | 'document-worker' | RestrictedTextRole
-interface StudioScope { role: StudioRole; dispose(): void }
-
-/** Resolve the role declared by a preset before the Host installs that Session's scope. */
-function roleForPreset(preset: string | null): StudioRole | undefined {
-  if (preset === ASSISTANT_PRESET) return 'assistant'
-  if (preset === LEADER_PRESET) return 'leader'
-  if (preset === PRESET) return 'document-worker'
+export interface StudioHostConfig {
+  stateDir: string
+  studioCwd: string
+  assistantModel?: StudioModel
+  leaderModel?: StudioModel
+  workerModelRoutes: WorkerModelRouteConfig[]
+  workerModelDefaults: WorkerModelDefaultsConfig
+  defaultWorkerPermission: StudioWorkerPermission
+  feishuConversation?: FeishuBindingConfig | null
+  studioFeishuCredentialId?: string
+  studioDirectoryToken?: string
 }
 
-/** Only the rc.3 additions used here are declared. The running host provides the services; no second Cordis or DSH runtime is loaded. */
+const roleModel: s<StudioModel> = s.object({ provider: s.string().required(), model: s.string().required(), reasoningEffort: s.string() })
+const hostFields = s.object({
+  stateDir: s.string().required().description('Absolute directory reserved for the Studio database.'),
+  studioCwd: s.string().description('Absolute Studio working directory; defaults to the Host working directory.'),
+  assistantModel: s.union([s.const(null), roleModel]),
+  leaderModel: s.union([s.const(null), roleModel]),
+  workerModelRoutes: s.union([s.const(null), s.array(WorkerModelRouteConfig).max(64)]),
+  workerModelDefaults: s.union([s.const(null), WorkerModelDefaultsConfig]),
+  defaultWorkerPermission: s.union(['read-only' as const, 'workspace-write' as const]).default('read-only')
+    .description('Task permission recorded for future execution. This release does not enable file writes or shell.'),
+  feishuConversation: s.union([s.const(null), FeishuConversationConfig]),
+  studioFeishuCredentialId: s.string(),
+  studioDirectoryToken: s.string(),
+  textWorkerRoutes: s.array(LegacyWorkerRouteConfig).max(64).description('Legacy input alias; new writes use workerModelRoutes.'),
+  textWorkerDefaults: LegacyWorkerDefaultsConfig.description('Legacy input alias; new writes use workerModelDefaults.'),
+  feishuDocumentInbox: s.const(null),
+  feishuTextInbox: s.const(null),
+})
+
+/** 解析旧模型配置只为读兼容；不会继承任何已退役飞书通道。 */
+export const Config: s<Record<string, unknown>, StudioHostConfig> = s.transform(hostFields, (value): StudioHostConfig => {
+  if (!value.stateDir) throw new Error('Agent Studio stateDir is required')
+  return {
+    stateDir: value.stateDir, studioCwd: value.studioCwd ?? process.cwd(), defaultWorkerPermission: value.defaultWorkerPermission ?? 'read-only',
+    ...migrateWorkerModels(value.workerModelRoutes ?? undefined, value.workerModelDefaults ?? undefined, value.textWorkerRoutes ?? undefined, value.textWorkerDefaults ?? undefined),
+    ...(value.assistantModel ? { assistantModel: value.assistantModel } : {}),
+    ...(value.leaderModel ? { leaderModel: value.leaderModel } : {}),
+    ...(value.feishuConversation !== undefined ? { feishuConversation: value.feishuConversation } : {}),
+    ...(value.studioFeishuCredentialId != null ? { studioFeishuCredentialId: value.studioFeishuCredentialId } : {}),
+    ...(value.studioDirectoryToken != null ? { studioDirectoryToken: value.studioDirectoryToken } : {}),
+  }
+}, true)
+
+interface CommandInput { agent: Agent; commandId: string; rawInput: string; signal: AbortSignal }
+interface CommandResult { kind: 'success' | 'error'; text: string }
+interface StudioScope { role: StudioRole; dispose(): void }
+const presets: Record<StudioRole, string> = { assistant: ASSISTANT_PRESET, leader: LEADER_PRESET, worker: WORKER_PRESET }
+const roleForPreset = (preset: string | null) => (Object.keys(presets) as StudioRole[]).find(role => presets[role] === preset)
+const studioTools = new Set([WORKER_DELEGATE, WORKER_READ, LIST_PROJECTS, PROPOSE_PROJECT])
+const denied = 'Studio tool denied: INVALID_EXECUTION'
+
+/** 仅适配仓库较旧声明缺少的运行时入口；使用前统一校验，绝不把未接入的身份服务当成降级路径。 */
 type ManagedHost = Context & {
-  agentPresets: { presetForSession(session: Agent['session']): string | null }
+  agentPresets: { mount(ctx: Context, preset: string): Promise<unknown>; presetForSession(session: Agent['session']): string | null }
   connection: Parameters<typeof registerStudioHttp>[1] & { allowsRemoteAuthorities: boolean }
   commands: { register(command: { name: string; description: string; input: { hint: string }; recordInput: boolean;
     handler(input: CommandInput): CommandResult | Promise<CommandResult> }): () => void }
   sandboxPolicy: { resolve(request: { session: Agent['session'] }): { mode: string } }
-  webServer: { getOrigin(): string }
+  webServer: { host: string; getOrigin(): string }
 }
 
-/** Check that the Web host runs in single-owner mode; native command handlers do not receive the requesting Peer. */
 function localOwnerComposition(ctx: ManagedHost): boolean {
-  return ctx.connection.allowsRemoteAuthorities === false && ctx.connection.browserPeer.principal.kind === 'owner'
+  return ctx.connection.allowsRemoteAuthorities === false && ctx.connection.browserPeer?.principal?.kind === 'owner'
     && (ctx as unknown as { get(name: string): unknown }).get('liveshareShares') === undefined
 }
 
-/** Accept control commands and issue write permits only after verifying the bound Web listener address. */
-function controlReady(ctx: ManagedHost): boolean {
-  try { return localOwnerComposition(ctx) && ['127.0.0.1', '[::1]'].includes(new URL(ctx.webServer.getOrigin()).hostname) }
-  catch { return false }
+function loopbackOrigin(origin: string): boolean {
+  return isLoopbackHost(new URL(origin).hostname.replace(/^\[|\]$/gu, ''))
 }
 
 function localOwnerHost(ctx: Context): ManagedHost {
   const host = ctx as ManagedHost
-  if (typeof host.commands.register !== 'function' || typeof host.agentPresets.presetForSession !== 'function'
-    || typeof host.tools.guard !== 'function' || typeof host.webServer.getOrigin !== 'function') {
-    throw new Error('Managed Worker requires the DSH 0.2.2-rc.3 Web host contracts')
-  }
-  if (!localOwnerComposition(host)) throw new Error('Managed Worker requires a non-shared, owner Web host')
-  if (host.permissionPresets.resolve('read-only').sandbox !== 'read-only') throw new Error('Managed Worker requires a read-only sandbox preset')
+  const required = [
+    ['commands.register', host.commands?.register], ['agentPresets.mount', host.agentPresets?.mount],
+    ['agentPresets.presetForSession', host.agentPresets?.presetForSession], ['agents.create', host.agents?.create],
+    ['agents.resume', host.agents?.resume], ['agents.withoutInitiator', host.agents?.withoutInitiator],
+    ['tools.guard', host.tools?.guard], ['webServer.getOrigin', host.webServer?.getOrigin], ['webServer.register', host.webServer?.register],
+    ['connection.admit', host.connection?.admit], ['sandboxPolicy.resolve', host.sandboxPolicy?.resolve],
+    ['sessionPersistence.flush', host.sessionPersistence?.flush], ['sessionPersistence.open', host.sessionPersistence?.open],
+    ['permissionPresets.resolve', host.permissionPresets?.resolve], ['permissionPresets.current', host.permissionPresets?.current],
+    ['permissionPresets.set', host.permissionPresets?.set], ['llm.resolveModelInfo', host.llm?.resolveModelInfo],
+  ] as const
+  const missing = required.filter(([, value]) => typeof value !== 'function').map(([entry]) => entry)
+  if (missing.length) throw new Error(`Agent Studio requires DSH Web Host contracts: ${missing.join(', ')}`)
+  if (!localOwnerComposition(host)) throw new Error('Agent Studio requires a non-shared, owner Web Host')
+  // 宿主在端口绑定前 getOrigin 可能抛错；配置地址必须已是回环，真正提供服务前还会核验监听来源。
+  if (!isLoopbackHost(host.webServer.host)) throw new Error('Agent Studio requires a loopback Web listener')
+  if (host.permissionPresets.resolve('read-only').sandbox !== 'read-only') throw new Error('Agent Studio requires the read-only sandbox preset')
   return host
 }
 
-const rejected = (reason: string): CommandResult => ({ kind: 'error', text: `Managed document control rejected: ${reason}` })
-
-/** Report success only after the Store confirms a durable commit. Keep document text out of Session command history. */
-function receipt(operation: string, result: ManagedResult<ManagedTask>, showResume = true): CommandResult {
-  if (!result.ok) return documentHoldError(result.reason) ?? sharedDocumentError(result.reason) ?? rejected(result.reason)
-  const task = result.value
-  const shared = task.sharedDocument
-  const resumable = !shared || shared.baseVersion === shared.headVersion
-  const resume = task.paused && showResume && resumable ? ` To allow writes again when ready, run /studio-doc resume ${task.authorizationVersion} in the current Worker.` : ''
-  const snapshot = shared ? 'task snapshot version' : 'document version'
-  return { kind: 'success', text: `${operation}: task ${task.taskId}; execution epoch ${task.executionEpoch}; authorization version ${task.authorizationVersion}; ${snapshot} ${task.documentVersion}; ${task.paused ? 'paused' : 'active'}.${sharedDocumentCoordinates(task)}${resume}` }
-}
-
-/** Start without using the prototype Runtime, Sources, GitHub credentials, or work directories. */
-export async function apply(context: Context, config: Config): Promise<void> {
-  const { stateDir, guiDocumentInbox, documentContinuations, advisor, memory, feishuDocumentInbox, feishuTextInbox, quotaPools,
-    quotaFeishuAlerts, watchdog, documentRecovery, documentFailureFeishuAlerts, systemdJobInbox, systemdJobPollSeconds } = config
+/** 打开持久状态、注册宿主授权和跨渠道入口，关闭时先排空再封存。 */
+export async function apply(context: Context, config: StudioHostConfig): Promise<void> {
   const ctx = localOwnerHost(context)
-  if (!isAbsolute(stateDir)) throw new Error('Managed Worker stateDir must be absolute')
-  if (documentRecovery && !watchdog) throw new Error('Studio document recovery requires watchdog for evidence lookup')
-  const advisoryModel = advisor ? advisorSelection(advisor) : undefined
-  const textWorkerModels = createTextWorkerModelPolicy(ctx, config.textWorkerRoutes, config.textWorkerDefaults, config.textWorkerBounds)
-  if (systemdJobPollSeconds !== 0 && (!systemdJobInbox || !Number.isInteger(systemdJobPollSeconds) || systemdJobPollSeconds < 5 || systemdJobPollSeconds > 300)) {
-    throw new Error('Studio job watcher requires systemdJobInbox and a polling interval of 5–300 seconds')
-  }
-  const providerPool = quotaProviderMap(quotaPools)
-  const conversationInbox = config.feishuConversation
-  const cwd = config.studioCwd || process.cwd()
-  if (!isAbsolute(cwd)) throw new Error('Agent Studio studioCwd must be absolute')
-  if ([feishuDocumentInbox, feishuTextInbox, conversationInbox].filter(Boolean).length > 1) {
-    throw new Error('Configure only one Studio Feishu inbox; the unified Assistant conversation does not share a legacy listener')
-  }
-  const feishuConfig = feishuDocumentInbox ?? feishuTextInbox
-  if (feishuConfig || conversationInbox) validateFeishuInbox((feishuConfig ?? conversationInbox)!)
-  if (feishuTextInbox) validateFeishuTextRoute(feishuTextInbox)
-  const combinedFeishu = feishuTextInbox?.documentCorrections === true
-  const feishuTextScope = feishuTextInbox ? { scope: feishuSourceScope(feishuTextInbox), documentCorrections: combinedFeishu } : undefined
-  if (quotaFeishuAlerts && (!feishuConfig || !quotaPools.length)) throw new Error('Studio quota notices require a dedicated Feishu inbox and quota pools')
-  if (documentFailureFeishuAlerts && (!documentRecovery || !feishuConfig)) {
-    throw new Error('Studio document failure notices require document recovery and a dedicated Feishu inbox')
-  }
-  const feishuScope = feishuConfig ? feishuSourceScope(feishuConfig) : undefined
-  const quotaNoticeScope = quotaFeishuAlerts ? feishuScope : undefined
-  const documentFailureNoticeScope = documentFailureFeishuAlerts ? feishuScope : undefined
-  const transportConfig = feishuConfig ?? conversationInbox
+  const { stateDir, studioCwd: cwd } = config
+  if (!isAbsolute(stateDir)) throw new Error('Agent Studio stateDir must be absolute')
+  verifyWorkspace(cwd)
+  if (config.defaultWorkerPermission !== 'read-only' && config.defaultWorkerPermission !== 'workspace-write') throw new Error('Invalid default Worker permission')
+  const models = new WorkerModelPolicy(ctx, config.workerModelRoutes, config.workerModelDefaults)
+  const binding = config.feishuConversation ?? undefined
+  if (binding) validateFeishuInbox(binding)
   const credentials = new StudioCredentials(ctx)
-  const credential = await credentials.load(transportConfig ?? undefined, config.studioFeishuCredentialId)
-  const feishuSdk = transportConfig && credential.secret ? new StudioFeishuSdk(transportConfig.appId, credential.secret) : undefined
+  const credential = await credentials.load(binding, config.studioFeishuCredentialId ?? '')
   const setup = new StudioFeishuSetup()
-  // 只有保留了准备凭据的新目录才可启用；复制未落盘时，DSH 会拒绝本次配置激活。
-  confirmStudioDirectory(stateDir, config.studioDirectoryToken)
+  const feishuSdk = binding && credential.secret ? new StudioFeishuSdk(binding.appId, credential.secret) : undefined
+  confirmStudioDirectory(stateDir, config.studioDirectoryToken ?? '')
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   let available = true
   let applyingSettings = false
   let directorySwitch: StudioDirectorySwitch | undefined
-  const channelStop = new AbortController()
-  let channelRun: Promise<void> | undefined
-  let projectJobRun: Promise<void> | undefined
-  let quotaNoticeRun: Promise<void> | undefined
-  // Reserve the directory for one host. The SQLite run fence also rejects commits from a prior holder of the lock.
+  const stopping = new AbortController()
   const unlock = lockSync(stateDir, { stale: 30_000, onCompromised(error) {
     available = false
-    channelStop.abort()
-    ctx.logger.error('Managed Worker lost its state directory lock: %s', String(error))
+    stopping.abort()
+    ctx.logger.error('Agent Studio lost its state directory lock: %s', String(error))
   } })
   let store: ManagedWorkerStore
-  try {
-    store = new ManagedWorkerStore(join(stateDir, STUDIO_DB), quotaPools.map(pool => pool.id),
-      quotaNoticeScope, feishuTextScope, documentFailureNoticeScope)
-  }
+  try { store = new ManagedWorkerStore(join(stateDir, STUDIO_DB)) }
   catch (error) { unlock(); throw error }
-  if (feishuTextScope && !store.feishuDraftScopeAvailable(feishuTextScope.scope)) {
-    // Only the explicit combined configuration can share an existing document chat.
-    try { store.finishRun() } finally { try { store.close() } finally { unlock() } }
-    throw new Error('Studio Feishu text requires an unbound chat or an available combined inbox')
-  }
-  if (store.recoveredTasks) ctx.logger.warn('Managed Worker paused %d unfinished tasks after an unconfirmed run', store.recoveredTasks)
 
+  let channel: StudioFeishuConversation | undefined
+  let channelRun: Promise<void> | undefined
+  let studio: StudioService | undefined
   const scopes = new Map<Agent, StudioScope>()
-  const permits = new Map<ToolExecutionToken, ManagedWritePermit>()
+  ctx.effect(() => async () => {
+    const held = available
+    available = false
+    try {
+      try { if (held) store.interruptActiveTasks() } finally {
+        stopping.abort()
+        try { await channelRun } finally { try { await setup.stop() } finally { await studio?.sessions.drain() } }
+      }
+      for (const scope of scopes.values()) scope.dispose()
+      scopes.clear()
+      if (held) { store.finishRun(); await directorySwitch?.prepare(store) }
+    } finally { try { store.close() } finally { unlock() } }
+  })
+
   const presetOf = (agent: Agent) => currentPresetId(ctx.agentPresets.presetForSession(agent.session))
-  const presetFor = (role: StudioRole) => role === 'assistant' ? ASSISTANT_PRESET : role === 'leader' ? LEADER_PRESET : PRESET
-  const currentSession = (agent: Agent): boolean => ctx.agents.get(agent.id) === agent
-  const restricted = (agent: Agent): boolean => ctx.permissionPresets.current(agent.session) === 'read-only'
-    && ctx.sandboxPolicy.resolve({ session: agent.session }).mode === 'read-only'
-  const channelReady = () => available && !applyingSettings && controlReady(ctx)
-  const ready = (agent: Agent, role: StudioRole): boolean => channelReady() && currentSession(agent)
-    && scopes.get(agent)?.role === role && presetOf(agent) === presetFor(role) && restricted(agent)
-  let conversationChannel: StudioFeishuConversation | undefined
-  let feishu: StudioFeishuInbox | undefined
-  const wakeConversationChannel = () => conversationChannel?.wake()
-  const feishuState = (): FeishuState => conversationChannel?.state ?? feishu?.connectionState
-    ?? (transportConfig ? 'credential-missing' : 'disabled')
-  // A channel config can start a verified long connection only on the same owner Host that serves the GUI.
+  const current = (agent: Agent) => ctx.agents.get(agent.id) === agent
+  const inferred = (agent: Agent) => roleForPreset(presetOf(agent))
+  const channelReady = () => {
+    if (!available || applyingSettings || !localOwnerComposition(ctx)) return false
+    try { return loopbackOrigin(ctx.webServer.getOrigin()) } catch { return false }
+  }
+  const ready = (agent: Agent, role: StudioRole): boolean => {
+    if (!channelReady() || !current(agent) || scopes.get(agent)?.role !== role || presetOf(agent) !== presets[role]
+      || ctx.permissionPresets.current(agent.session) !== 'read-only' || ctx.sandboxPolicy.resolve({ session: agent.session }).mode !== 'read-only') return false
+    const record = store.studioSession(agent.id)
+    if (record?.readonlyLegacy || (record && record.role !== role)) return false
+    return role === 'leader' ? !!store.projects.currentLeader(agent.id) : role === 'worker' ? record?.role === 'worker' : true
+  }
+
+  const feishuState = (): FeishuState => channel?.state ?? (binding ? 'credential-missing' : 'disabled')
+  const wake = () => channel?.wake()
   const defaults = { assistant: config.assistantModel ?? null, leader: config.leaderModel ?? null }
   const settingsScope = createHash('sha256').update(JSON.stringify([stateDir, config.studioDirectoryToken, defaults])).digest('hex')
-  const studio = new StudioService(ctx, store, cwd, defaults, ready, channelStop.signal, feishuState, wakeConversationChannel, settingsScope)
-  if (conversationInbox && feishuSdk) {
-    conversationChannel = new StudioFeishuConversation(feishuSdk, conversationInbox, studio.feishu, channelReady,
-      message => ctx.logger.warn('%s', message), value => setup.receive(value))
-  }
-  // 缺密钥只是暂时不可连接，同一绑定的历史分界不能因此丢失。
-  store.studio.deactivateFeishu(conversationInbox ? feishuSourceScope(conversationInbox) : undefined)
+  const service = new StudioService(ctx, store, cwd, defaults, ready, stopping.signal, feishuState, wake, settingsScope)
+  studio = service
+  const sessions = service.sessions
+  const assistant = new StudioAssistant(ctx, store, sessions, models, config.defaultWorkerPermission, ready, cwd)
+  const intake = new StudioProjectIntake(store, sessions)
+  const projects = new StudioProjectControl(store, sessions, ready)
+  if (binding && feishuSdk) channel = new StudioFeishuConversation(feishuSdk, binding, service.feishu, channelReady,
+    message => ctx.logger.warn('%s', message), value => setup.receive(value))
+  // 仅密钥不可用不代表用户解绑，保留同一已发布 binding 的切换边界。
+  store.studio.deactivateFeishu(binding ? feishuSourceScope(binding) : undefined)
+
   const configuration = new StudioConfigurationControl(ctx, config, { credentials, credential, setup, feishuState,
-    quiesce(next, directory) {
-      if (!channelReady() || studio.sessions.busy || [...scopes.keys()].some(agent => agent.status !== 'idle')) {
-        throw new StudioError('STUDIO_CONFIG_WORK_ACTIVE', 'Wait until the current Studio work ends before applying settings.', 409)
-      }
-      // 不让改名、移除映射或启用空账本变相清除已登记或尚未核实的额度停止。
-      if (directory?.mode === 'empty' || JSON.stringify(next.quotaPools) !== JSON.stringify(quotaPools)) {
-        for (const pool of quotaPools) {
-          const status = store.quotaStatus(pool.id)
-          if (!status.ok || status.value) throw new StudioError('STUDIO_QUOTA_HOLD', 'Resolve active quota holds before changing this configuration.', 409)
-        }
-      }
-      if (next.feishu.mode === 'text' && directory?.mode !== 'empty' &&
-        !store.canConfigureFeishuText(feishuSourceScope(next.feishu.binding), next.feishu.documentCorrections)) {
-        throw new StudioError('STUDIO_FEISHU_SCOPE_CONFLICT', 'The private chat is linked to a document and needs combined mode.', 409)
+    quiesce(_next, directory) {
+      if (!channelReady() || sessions.busy || [...scopes.keys()].some(agent => agent.status !== 'idle')) {
+        throw new StudioError('STUDIO_CONFIG_WORK_ACTIVE', 'Wait until current Studio work ends before applying settings.', 409)
       }
       applyingSettings = true
       directorySwitch = directory
       return () => { applyingSettings = false; directorySwitch = undefined }
     },
   })
-  // 同一入口只对本机所有者开放；设置不注册为 Agent 工具或会话命令。
-  if (typeof ctx.connection.admit === 'function') ctx.effect(() => registerStudioHttp(ctx, ctx.connection, channelReady,
-    { ...studio.operations, ...configuration.operations }))
-  let failureNotices: StudioDocumentFailureNotices | undefined
-  const failureNoticeReady = () => failureNotices?.wake()
-  const recovery = documentRecovery ? new StudioDocumentRecovery(ctx, store, agent => ready(agent, 'document-worker'),
-    channelReady, channelStop.signal, failureNoticeReady) : undefined
-  const quota = new StudioQuotaControl(ctx, store, quotaPools, providerPool, quotaFeishuAlerts)
-  const drafts = new StudioAssistant(ctx, store, PRESET, agent => ready(agent, 'assistant'), ready, provider => quota.denial(provider),
-    memory, channelStop.signal, textWorkerModels)
-  studio.sessions.setWorkerRunner(drafts)
-  ctx.on('llm/stream', (options, next) => drafts.stream(options, next))
-  // On hosts with this optional extension, native command receipts and the exact Worker relay stay out of supplemental log uploads.
-  ctx.inject(['sessionLogDeepSeek'], scope => {
-    const service = (scope as unknown as { sessionLogDeepSeek: { registerExclusion(exclude: (request: { sessionId: SessionId }) => boolean): () => Promise<void> } }).sessionLogDeepSeek
-    scope.effect(() => service.registerExclusion(({ sessionId }) => drafts.excludeHistoryUpload(sessionId)))
-  })
-  const advisors = new StudioAdvisor(ctx, store, drafts, advisoryModel, ready, channelStop.signal)
-  const studies = new StudioStudy(store, drafts, agent => ready(agent, 'assistant'), channelStop.signal)
-  const projects = new StudioProjectControl(store, agent => ready(agent, 'leader'), drafts, provider => providerPool.get(provider), memory)
-  const projectFactIntake = new StudioProjectFactIntake(ctx, store, ready, memory, channelStop.signal)
-  const jobMonitor = systemdJobPollSeconds ? new StudioProjectJobMonitor(store, systemdJobPollSeconds * 1000, channelReady, (permit, signal) => {
-    const leader = ctx.agents.get(permit.leaderSessionId as SessionId)
-    return leader ? projects.continueJob(leader, permit, signal) : undefined
-  }, () => ctx.logger.warn('Studio external job watcher could not confirm an operation; check /studio-job status')) : undefined
-  const projectJobs = systemdJobInbox ? new StudioProjectJobControl(store, agent => ready(agent, 'leader'), channelStop.signal,
-    jobMonitor ? agent => projects.jobRoute(agent) : undefined) : undefined
-  const intake = new StudioProjectIntake(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal)
-  const preferenceIntake = memory ? new StudioPreferenceIntake(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal) : undefined
-  const preferenceChanges = memory ? new StudioPreferenceChange(ctx, store, agent => ready(agent, 'assistant'), channelStop.signal) : undefined
-  const delivery = new AgentDelivery(ctx)
-  const continuations = documentContinuations ? new StudioDocumentContinuation(ctx, store, delivery, ready, channelStop.signal) : undefined
-  const feishuText = feishuTextInbox ? new StudioFeishuText(store, drafts, feishuTextInbox, channelStop.signal, channelReady) : undefined
-  if (feishuConfig && feishuSdk) feishu = new StudioFeishuInbox(ctx, store, feishuSdk, feishuConfig, channelReady, feishuText,
-    !!feishuDocumentInbox || combinedFeishu, failureNoticeReady,
-    continuations && ((source, intent, signal) => continuations.receiveFeishu(source, intent, signal)), value => setup.receive(value))
-  if (documentFailureNoticeScope && feishu) {
-    failureNotices = new StudioDocumentFailureNotices(ctx, store, () => feishu.noticeDestination(), channelStop.signal,
-      () => ctx.logger.warn('Studio Feishu document failure notice was not confirmed; check /studio-health document <task-id>'))
-  }
-  const quotaNotices = quotaFeishuAlerts && feishu ? new StudioQuotaNotices(store, quotaPools, () => feishu.noticeDestination(),
-    () => ctx.logger.warn('Studio Feishu quota notice delivery was not confirmed; check /studio-quota status')) : undefined
+  ctx.effect(() => registerStudioHttp(ctx, ctx.connection, channelReady, { ...service.operations, ...configuration.operations }))
 
-  /** A persisted binding wins over the picker, so a retired or finished Worker cannot become a different role on resume. */
-  function roleOf(agent: Agent): StudioRole | undefined {
-    if (store.advice.binding(agent.id)) return 'advisor'
-    if (store.draftBinding(agent.id) || store.studies.binding(agent.id) || store.feishuDraftBinding(agent.id)
-      || store.projects.workerBound(agent.id) || store.revisions.sourceBinding(agent.id)) {
-      return 'draft-worker'
-    }
-    if (store.binding(agent.id)) return 'document-worker'
-    if (store.assistantBinding(agent.id)) return 'assistant'
-    if (store.projects.binding(agent.id)) return 'leader'
-    return roleForPreset(presetOf(agent))
-  }
-
-  ctx.effect(() => async () => {
-    const heldLock = available
-    available = false
-    channelStop.abort()
-    drafts.stop()
-    permits.clear()
-    try {
-      // Drain channel attempts, lookups, and text work before closing the Store. External jobs are not owned by this Host.
-      if (channelRun) await channelRun
-      await setup.stop()
-      await studio.sessions.drain()
-      if (quotaNoticeRun) await quotaNoticeRun
-      await feishuText?.drain()
-      await advisors.drain()
-      await studies.drain()
-      await continuations?.drain()
-      await preferenceChanges?.drain()
-      await projectFactIntake.drain()
-      await recovery?.drain()
-      await failureNotices?.drain()
-      await projectJobs?.drain()
-      if (projectJobRun) await projectJobRun
-      for (const scope of scopes.values()) scope.dispose()
-      scopes.clear()
-      // Admit no work after marking the run clean. A lost lock or failed shutdown leaves recovery to the next run.
-      if (heldLock) {
-        store.finishRun()
-        // 新实例启动前确认有完整账本或已准备好的空账本；不移动或删除原目录。
-        await directorySwitch?.prepare(store)
-      }
-    } finally {
-      try { store.close() } finally { unlock() }
-    }
-  })
-
-  /** Configure the persisted role before admitting any Agent work, including work on a cold resume. */
   function configure(agent: Agent): void {
-    const role = roleOf(agent)
+    const record = store.studioSession(agent.id)
+    const role = inferred(agent)
     const prior = scopes.get(agent)
-    if (!role || prior?.role === role) return
+    if (!role || record?.readonlyLegacy || (record && record.role !== role)) return
+    if (prior?.role === role) return
     prior?.dispose()
     scopes.delete(agent)
     ctx.permissionPresets.set(agent.session, 'read-only')
-    // Hide inherited tools. The host guard also denies other Agent-local tools even if another plugin registers one.
     const unmask = agent.ctx.tools.restrict({ allow: [] })
+    const dispose: Array<() => void> = [unmask]
     try {
-      if (role === 'assistant') {
-        const bound = store.bindAssistant(agent.id)
-        if (!bound.ok) throw new Error(`Cannot bind Studio Assistant: ${bound.reason}`)
-      }
-      const unregister = role === 'leader' ? projects.install(agent, () => advisors.install(agent, role))
-        : role === 'assistant' ? drafts.install(agent, role, () => intake.install(agent), () => studies.install(agent), () => advisors.install(agent, role),
-          () => preferenceIntake?.install(agent) ?? (() => {})) : role !== 'document-worker' ? drafts.install(agent, role) : agent.ctx.tools.register({
-        name: TOOL,
-        description: 'Replace the text of the managed document bound to this worker, using its approved text and version.',
-        parameters: z.toJSONSchema(documentWriteActionSchema),
-        output: {
-          schema: { type: 'object', properties: { documentVersion: { type: 'integer' }, documentId: { type: 'string' } }, required: ['documentVersion'] },
-          render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
-        },
-        async execute(action, exec) {
-          exec.signal.throwIfAborted()
-          const permit = permits.get(exec.token)
-          permits.delete(exec.token)
-          // Use only the permit issued through the tool pipeline. Even after the Guard allows a call, the write transaction checks the current execution epoch.
-          if (!permit || exec.agent !== agent || !ready(agent, 'document-worker')
-            || permit.workerSessionId !== agent.id || permit.toolCallId !== exec.callId) throw new Error('Managed write denied: INVALID_EXECUTION')
-          const capture: DocumentGuardCapture = {}
-          const result = store.commit(permit, action, capture)
-          if (!result.ok) throw new Error(documentGuardFeedback(result.reason, capture))
-          return result.value
-        },
-      })
-      // The Studio directory is a display index. It does not grant or change role authority.
-      studio.observeSession(agent, role)
-      scopes.set(agent, { role, dispose() { try { unregister() } finally { unmask() } } })
-    } catch (error) { unmask(); throw error }
+      dispose.push(assistant.install(agent, role))
+      if (role === 'assistant') dispose.push(intake.install(agent))
+      scopes.set(agent, { role, dispose() { for (const cleanup of dispose.reverse()) cleanup() } })
+    } catch (error) { for (const cleanup of dispose.reverse()) cleanup(); throw error }
   }
 
+  // Studio 工具只存在于确切角色。普通 Ticket Agent 的工具不受 Studio 策略影响。
   ctx.effect(() => ctx.tools.guard((exec: Readonly<ToolExecution>) => {
     const { agent } = exec
-    let role: StudioRole | undefined
-    try { role = agent && (scopes.get(agent)?.role ?? roleOf(agent)) }
-    catch {
-      // Role storage can fail before seeing a document binding; never invent provenance for that check.
-      return exec.name === TOOL ? documentGuardFeedback('STORAGE_ERROR', {}) : 'Studio tool denied: STORAGE_ERROR'
-    }
-    if (!role || !agent) return exec.name === TOOL || exec.name === PROPOSE_PROJECT || exec.name === PROPOSE_PREFERENCE || isAssistantTool(exec.name)
-      || isStudyTool(exec.name) || isLeaderTool(exec.name) || isAdvisorTool(exec.name)
-      || exec.name === ASK_STUDIO_OWNER || exec.name === REVISE_STUDIO_TASK ? 'Studio tool denied: INVALID_EXECUTION' : undefined
-    if (!ready(agent, role) || exec.parent !== undefined) return 'Studio tool denied: INVALID_EXECUTION'
-    // 普通澄清用对话回答，不允许遗留同名工具重新开一个阻塞问答。
-    if (exec.name === ASK_STUDIO_OWNER) return 'Studio tool denied: INVALID_EXECUTION'
-    if (exec.name === REVISE_STUDIO_TASK) return studio.sessions.canRevise(agent) ? undefined : 'Studio tool denied: INVALID_EXECUTION'
-    if (studio.sessions.isExistingTaskReply(agent) && (exec.name === DRAFT_DELEGATE || exec.name === STUDY_DELEGATE
-      || exec.name === RECORD_WORK || exec.name === PROPOSE_PROJECT)) {
-      return 'Studio task already exists for this reply. Continue the existing item instead of creating new work.'
-    }
-    if (role === 'assistant') {
-      const denial = drafts.preferenceRouteDenial(agent, exec.callId, exec.name)
-      if (denial) return denial
-    }
-    if (isAdvisorTool(exec.name)) return advisors.guard(agent, exec.name, role)
-    if (role === 'assistant' && (isAssistantTool(exec.name) || isStudyTool(exec.name)
-      || (exec.name === PROPOSE_PROJECT && intake.available(agent))
-      || (exec.name === PROPOSE_PREFERENCE && preferenceIntake?.available(agent)))) return undefined
-    if (role === 'leader') return projects.guard(agent, exec.name)
-    if (role !== 'document-worker' || exec.name !== TOOL) return 'Studio tool denied: INVALID_EXECUTION'
-    // Only the call that actually reached this Guard can be cited in a corrective review.
-    const nativeCall = observeDocumentGuardCall(agent, exec.callId, exec.arguments)
-    const capture: DocumentGuardCapture = nativeCall ? { nativeCall } : {}
-    const result = store.authorize(agent.id, exec.arguments, exec.callId, capture)
-    if (!result.ok) return documentGuardFeedback(result.reason, capture)
-    permits.set(exec.token, result.value)
-    return undefined
+    if (!agent) return studioTools.has(exec.name) ? denied : undefined
+    try {
+      const role = scopes.get(agent)?.role ?? inferred(agent)
+      if (!role && !store.studioSession(agent.id) && !isStudioInternalSession(agent.id)) return studioTools.has(exec.name) ? denied : undefined
+      if (!role || exec.parent !== undefined || !ready(agent, role)) return denied
+      if (role === 'worker') return assistant.executionCurrent(agent) ? 'Studio tool denied: no Worker tools are enabled in this stage' : denied
+      if (!sessions.canAsk(agent)) return denied
+      if (exec.name === WORKER_READ || (role === 'assistant' && exec.name === LIST_PROJECTS)) return undefined
+      if (!sessions.isExistingTaskReply(agent) && (exec.name === WORKER_DELEGATE || (role === 'assistant' && exec.name === PROPOSE_PROJECT))) return undefined
+      return denied
+    } catch { return 'Studio tool denied: could not verify role or authorization' }
   }))
-  ctx.on('tools/result', exec => { permits.delete(exec.token); return undefined })
   ctx.on('agent/created', ({ agent }) => { if (available && !applyingSettings) configure(agent); return undefined })
   ctx.on('agent/disposed', ({ agent }) => { scopes.get(agent)?.dispose(); scopes.delete(agent) })
   ctx.on('agent-preset/selected', (id, selected) => {
-    const preset = currentPresetId(selected)
-    if (!roleForPreset(preset)) return
+    if (!roleForPreset(currentPresetId(selected))) return
     const agent = ctx.agents.get(id as SessionId)
     if (!agent) return
-    // DSH is still publishing the selection event. Wait until that append returns before recording read-only permissions.
     queueMicrotask(() => {
-      if (!available || applyingSettings) return
+      if (!available || applyingSettings || !current(agent) || presetOf(agent) !== currentPresetId(selected)) return
       try {
-        if (!currentSession(agent) || presetOf(agent) !== preset) return
-        // The loop assembles prompts and tools before pre-step. An overlapping turn may already have taken the old snapshot.
         if (agent.status === 'running') agent.cancel({ kind: 'hook', reason: 'Studio preset changed while the turn was starting.' }, { keepInbox: true })
         configure(agent)
-      } catch (error) {
-        ctx.logger.warn('Studio could not configure the role for session %s: %s', agent.id, String(error))
-      }
+      } catch { ctx.logger.warn('Studio could not configure a native role') }
     })
   })
   ctx.on('agent/pre-step', async (step, next) => {
-    const { agent, turn, messages } = step
+    const { agent } = step
     const role = scopes.get(agent)?.role
-    // A selected preset without an installed scope is not an ordinary Agent. Stop before sending its inherited prompt or tools.
-    if (role ? !ready(agent, role) : roleForPreset(presetOf(agent)) !== undefined) {
-      agent.cancel({ kind: 'hook', reason: 'Studio role is not ready. Check the Studio host, the selected preset, and read-only permissions.' }, { keepInbox: true })
-      return { kind: 'reject' }
+    if (!role) {
+      if (inferred(agent) || isStudioInternalSession(agent.id) || store.studioSession(agent.id)) return { kind: 'reject' }
+      return next()
     }
-    if (!validateDocumentRelays(store, agent, messages, () => ready(agent, 'document-worker'))) return { kind: 'reject' }
-    if (role === 'assistant' || role === 'leader') {
-      const input = currentOwnerInboxInput(step)
-      if (input) {
-        step.signal.throwIfAborted()
-        const relatedDocument = studio.sessions.relatedDocumentId(agent)
-        const existingTopic = studio.sessions.isExistingTaskReply(agent)
-        const continuation = role === 'assistant' && (!existingTopic || relatedDocument) && continuations?.reviewWeb(step, input, relatedDocument)
-        if (continuation) {
-          await continuation
-          return { kind: 'enter', messages: [] }
-        }
-        const registration = !existingTopic && projectFactIntake.review(step, input, role)
-        if (registration) {
-          await registration
-          return { kind: 'enter', messages: [] }
-        }
-        if (memory && role === 'assistant') {
-          if (answerPreferenceQuery(store, agent, input)) return { kind: 'enter', messages: [] }
-          const change = preferenceChanges?.review(step, input)
-          if (change) {
-            await change
-            return { kind: 'enter', messages: [] }
-          }
-        }
-      } else if (messages.some(message => message.content.some(block => block.type === 'text'
-        && (parseProjectFactRequest(block.text).kind !== 'plain'
-          || (role === 'assistant' && continuations && documentContinuationIntent(block.text)))))) {
-        // An edited, batched, or non-owner control request must not silently enter a different work route.
-        return { kind: 'reject' }
-      }
-    }
+    if (!ready(agent, role) || (role === 'worker' ? !assistant.executionCurrent(agent) : !sessions.canAsk(agent))) return { kind: 'reject' }
     const decision = await next()
-    if (decision.kind === 'enter' && (role === 'draft-worker' || role === 'advisor')) {
-      // Verify the messages the native loop will actually admit, after any downstream pre-step transforms.
-      const selection = (step as typeof step & { modelSelection?: AdvisorRoute }).modelSelection
-      if (!drafts.admit(agent, decision.messages, turn, selection, step.signal)) return { kind: 'reject' }
+    if (decision.kind !== 'enter') return decision
+    if (!ready(agent, role)) return { kind: 'reject' }
+    if (role === 'worker') {
+      // DSH 预检追加的必需运行时快照不算任务输入；收件箱里的同类输入仍须通过 Worker 的原文检查。
+      const inputs = decision.messages.filter(message => {
+        const source: { kind: string; form?: string } = message.source
+        return source.kind !== 'runtime-context' || source.form !== 'snapshot' || step.messages.some(input => input.id === message.id)
+      })
+      return assistant.admit(agent, inputs, step.turn) ? decision : { kind: 'reject' }
     }
-    if (decision.kind === 'enter' && (role === 'assistant' || role === 'leader')) {
-      const context = studio.sessions.contextFor(agent, decision.messages, step.step)
-      if (context) return { ...decision, messages: [context, ...decision.messages] }
-    }
-    return decision
+    if (!sessions.canAsk(agent)) return { kind: 'reject' }
+    const extra = sessions.contextFor(agent, decision.messages, step.step)
+    return extra ? { ...decision, messages: [extra, ...decision.messages] } : decision
   })
   for (const agent of ctx.agents.list()) configure(agent)
-  recovery?.install()
 
-  if (guiDocumentInbox) captureDocumentInstructions(ctx, store, session => {
-    if (!channelReady()) return false
-    const agent = ctx.agents.get(session.id)
-    // Restrictions on the role's tools do not turn a message to its exact live Session into an untracked input.
-    return agent?.session === session && scopes.get(agent)?.role === 'document-worker'
-  })
-
-  // DSH Web authorizes commands.execute through its native remote access checks. Document authorization stays user-only.
-  ctx.effect(() => ctx.commands.register({
-    name: 'studio-doc',
-    description: 'Manage a document task in its Worker Session. Use /studio-doc guard to read past checks, including how to request a bounded review without retrying the write.',
-    input: { hint: `status | ${DOCUMENT_GUARD_HINT} | ${GUARD_REVIEW_HINT} | doc-new <JSON> | doc-read <document-id> [revision] | doc-save <JSON> | start <JSON> | pause | transfer <task-id> <epoch> | resume <authorization-version> | inbox | review [<instruction-id> <authorization-version> <unchanged|pause>] | narrow <JSON> | continue <authorization-version> | feishu-status | bind-feishu`
-      + (recovery ? ' | recover <task-id> <evidence-id>' : '') },
-    recordInput: false,
-    handler({ agent, commandId, rawInput, signal }) {
+  ctx.effect(() => ctx.commands.register({ name: PROJECT_COMMAND, description: 'Inspect or manage Studio projects and their task results.',
+    input: { hint: PROJECT_HINT }, recordInput: false, handler: ({ agent, rawInput, signal }) => projects.command(agent, rawInput, signal) }))
+  ctx.effect(() => ctx.commands.register({ name: MEMORY_COMMAND, description: 'View, save, edit or forget explicit Studio preferences.',
+    input: { hint: MEMORY_HINT }, recordInput: false, handler: ({ agent, rawInput, signal }) => {
       signal.throwIfAborted()
-      if (!channelReady()) return rejected('CONTROL_UNAVAILABLE')
-      if (rawInput.length > TEXT_LIMIT * 12 + 128) return rejected('INPUT_TOO_LARGE')
-      const [, verb, argument = ''] = /^\s*(\S+)(?:\s+([\s\S]*))?$/.exec(rawInput.trim()) ?? []
-      if (!ready(agent, 'document-worker')) return verb === 'guard' || verb === 'guard-review'
-        ? { kind: 'error', text: 'MANAGED_SESSION_REQUIRED. Open the document Worker currently bound to this task in Studio Web.' }
-        : rejected('MANAGED_SESSION_REQUIRED')
-      if (verb === 'guard') return documentGuardCommand(store, agent.id, argument)
-      if (verb === 'guard-review') return documentGuardReviewCommand(ctx, store, agent, commandId, argument,
-        AbortSignal.any([signal, channelStop.signal]), () => ready(agent, 'document-worker'))
-      // Only explicit continuation wakes the Worker. Review, replacement, and other controls do not cancel the old turn.
-      if (verb === 'recover') return recovery ? recovery.command(agent, argument, commandId, signal) : rejected('DOCUMENT_RECOVERY_DISABLED')
-      if (verb === 'continue') return continueDocument(delivery, store, agent, argument, signal, () => ready(agent, 'document-worker'))
-      if (verb === 'review' && !argument) return reviewDocumentIntent(store, agent, commandId, signal, channelStop.signal, () => ready(agent, 'document-worker'))
-      // Keep review available even after capture is disabled; toggling the listener must not clear a durable pending hold.
-      const control = instructionCommand(store, agent.id, commandId, verb, argument)
-        ?? sharedDocumentCommand(store, agent.id, commandId, verb, argument)
-      if (control) return control
-      if ((verb === 'feishu-status' || verb === 'bind-feishu') && !argument) {
-        if (!feishu) return rejected('FEISHU_INBOX_DISABLED')
-        if (verb === 'feishu-status') return { kind: 'success', text: feishu.status() }
-        const result = feishu.bind(agent.id, commandId)
-        if (!result.ok) return documentHoldError(result.reason) ?? rejected(result.reason)
-        const linked = `The configured Feishu private chat is linked to task ${result.value.taskId}.`
-        return { kind: 'success', text: continuations
-          ? `${linked} No write scope or pause changed. To continue this task, send a separate message in that chat:\nContinue that task\nOther ordinary messages still go to document review.`
-          : `${linked} Incoming messages require review; no write scope or pause changed.` }
-      }
-      if (verb === 'start') {
-        let json: unknown
-        try { json = JSON.parse(argument) } catch { return rejected('INVALID_START_JSON') }
-        const fields = documentStartArgs.safeParse(json)
-        if (!fields.success) return rejected('INVALID_START_JSON')
-        const input = fields.data
-        const result = 'documentId' in input ? store.createSharedTask(agent.id, input.documentId, input.expectedVersion, input.replacement, commandId)
-          : store.create(agent.id, input.initial, input.replacement, commandId)
-        const created = receipt('Managed task created', result)
-        return continuations && result.ok ? { ...created, text: `${created.text}\n\nTo continue from a Studio Assistant Session, send a separate message:\nContinue document task ${result.value.taskId}` } : created
-      }
-      if (verb === 'status' && argument === '') return receipt('Managed task status', store.status(agent.id))
-      if (verb === 'pause' && argument === '') return receipt('Pause effective', store.pause(agent.id, commandId), false)
-      if (verb === 'transfer') {
-        const fields = /^([a-f0-9-]{36})\s+([1-9]\d*)$/.exec(argument)
-        const epoch = version.safeParse(Number(fields?.[2]))
-        return fields?.[1] && epoch.success
-          ? receipt('Execution transferred', store.transfer(fields[1], epoch.data, agent.id, commandId))
-          : rejected('INVALID_TRANSFER')
-      }
-      if (verb === 'resume' && /^[1-9]\d*$/.test(argument)) {
-        const revision = version.safeParse(Number(argument))
-        if (revision.success) return receipt('Execution resumed', store.resume(agent.id, revision.data, commandId))
-      }
-      return rejected('INVALID_CONTROL_COMMAND')
+      if (!ready(agent, 'assistant') && !ready(agent, 'leader')) return { kind: 'error', text: 'Use a current Studio Assistant or Leader Session.' }
+      return memoryCommand(store.memory, rawInput, id => ready(agent, 'assistant') || store.projects.currentLeader(agent.id)?.id === id)
     },
   }))
-  ctx.effect(() => ctx.commands.register({
-    name: 'studio-result',
-    description: 'Read a Studio Worker result or find recent Feishu tasks without running a model.',
-    input: { hint: '[task-id | feishu]' },
-    recordInput: false,
-    handler({ agent, rawInput, signal }) {
+  ctx.effect(() => ctx.commands.register({ name: 'studio-result', description: 'Read a saved Studio task and its status without running a model.',
+    input: { hint: '<task-id>' }, recordInput: false, handler: ({ agent, rawInput, signal }) => {
       signal.throwIfAborted()
-      if (!ready(agent, 'assistant')) {
-        // Start with the diagnosis shown in the collapsed row; put the recovery steps in the expandable body.
-        const text = presetOf(agent) !== ASSISTANT_PRESET
-          ? 'Use Agent Studio Assistant to read results.\n'
-            + 'In a new blank session in the same Studio Web profile, choose that Agent preset beside the workspace picker. '
-            + 'Run /studio-result <task-id> there, or /studio-result feishu to find recent Feishu tasks. No chat message is needed.'
-          : 'This Studio Assistant is not ready to read results.\n'
-            + 'Check that you are in the local Studio Web profile and the session uses Read-only permissions. '
-            + 'Retry here when ready. If you open a new Studio Assistant session, include the task ID to read a specific result.'
-        return { kind: 'error', text }
-      }
-      const id = rawInput.trim()
-      if (id === 'feishu') return feishuDraftsCommand(store)
-      if (id && !z.uuid().safeParse(id).success) {
-        return { kind: 'error', text: 'Use /studio-result [task-id] to read a result, or /studio-result feishu to find recent Feishu tasks.' }
-      }
-      const result = store.readDraft(agent.id, id || undefined, memory)
-      if (result.ok) return { kind: 'success', text: draftOutput(result.value, memory).text }
-      // The no-ID lookup still selects only an ordinary draft in this Session. Studies and Feishu require their durable IDs.
-      if (id && result.reason === 'TASK_NOT_FOUND') {
-        const study = store.studies.read(agent.id, id)
-        if (study.ok) return { kind: 'success', text: studyOutput(study.value).text }
-        if (study.reason !== 'TASK_NOT_FOUND') return { kind: 'error', text: `Cannot read Studio result: ${study.reason}.` }
-        const external = store.readFeishuDraft(id)
-        if (external.ok) return { kind: 'success', text: feishuDraftOutput(external.value) }
-        return { kind: 'error', text: `Cannot read Studio result: ${external.reason}.` }
-      }
-      return { kind: 'error', text: `Cannot read Studio result: ${result.reason}.` }
+      if (!ready(agent, 'assistant') && !ready(agent, 'leader')) return { kind: 'error', text: 'Use a current Studio Assistant or Leader Session.' }
+      const task = store.task(rawInput.trim())
+      if (!task || (!ready(agent, 'assistant') && store.projects.currentLeader(agent.id)?.id !== task.projectId)) return { kind: 'error', text: 'Studio task not found.' }
+      return { kind: 'success', text: `${task.taskId}: ${task.status}${task.resultSummary ? `\n\n${task.resultSummary}` : ''}` }
     },
   }))
-  if (memory) ctx.effect(() => ctx.commands.register({
-    name: MEMORY_COMMAND,
-    description: 'Record, inspect, correct, or forget explicit owner preferences without starting a model.',
-    input: { hint: MEMORY_HINT },
-    recordInput: false,
-    handler({ agent, commandId, rawInput, signal }) {
-      return memoryCommand(ctx, store, agent, commandId, rawInput, AbortSignal.any([signal, channelStop.signal]),
-        () => ready(agent, 'assistant') && agent.session.header.origin !== 'subagent')
-    },
-  }))
-  ctx.effect(() => ctx.commands.register({
-    name: 'studio-advice',
-    description: 'Read the recorded opinion and the Advisor’s provenance without running a model.',
-    input: { hint: '<advice-id>' },
-    recordInput: false,
-    handler({ agent, rawInput, signal }) {
-      signal.throwIfAborted()
-      return advisors.command(agent, rawInput)
-    },
-  }))
-  ctx.effect(() => ctx.commands.register({
-    name: 'studio-study',
-    description: 'Read the saved synthesis or an individual Worker contribution without running a model.',
-    input: { hint: '<task-id> [step-number]' },
-    recordInput: false,
-    handler({ agent, rawInput, signal }) {
-      signal.throwIfAborted()
-      return studies.command(agent, rawInput)
-    },
-  }))
-  ctx.effect(() => ctx.commands.register({
-    name: 'studio-project',
-    description: 'Read or manage project work. Open work <work-id> in the current Leader Session for templates to block or clear unstarted text work, or to choose a model when routes are configured.',
-    input: { hint: 'create <JSON> | status [project-id] | take <project-id> <epoch> [leader-bot-id|new] | work [work-id] | attach-document <work-id> <task-id> <authorization-version> | proposal [proposal-id]'
-      + ` | ${PROJECT_WORK_BLOCK_HINT}` + (textWorkerModels ? ` | ${PROJECT_MODEL_USE_HINT}` : '') + ` | ${PROJECT_MODEL_CLEAR_HINT}`
-      + (memory ? ` | ${PROJECT_RESULT_USE_HINT} | ${PROJECT_HANDOFF_HINT} | ${PROJECT_ARCHIVE_HINT} | ${BOT_EXPERIENCE_HINT}` : '') },
-    recordInput: false,
-    handler({ agent, commandId, rawInput, signal }) {
-      signal.throwIfAborted()
-      const assistant = ready(agent, 'assistant')
-      const proposal = /^proposal(?:\s+(\S+))?$/.exec(rawInput.trim())
-      if (proposal) {
-        if (!assistant || (proposal[1] && !z.uuid().safeParse(proposal[1]).success)) {
-          return { kind: 'error', text: 'Use /studio-project proposal [proposal-id] in the original Studio Assistant Session.' }
-        }
-        const result = store.projects.readProposal(agent.id, proposal[1])
-        return result.ok ? { kind: 'success', text: intake.describe(agent, result.value) }
-          : { kind: 'error', text: `Cannot read project proposal: ${result.reason}.` }
-      }
-      const result = projects.command(agent, commandId, rawInput, assistant || ready(agent, 'leader'))
-      if (result.kind === 'success') {
-        // A legacy owner command can create or adopt a Leader before its first conversation turn.
-        try { studio.observeSession(agent, assistant ? 'assistant' : 'leader'); wakeConversationChannel() }
-        catch { ctx.logger.warn('Agent Studio could not index a native project record') }
-      }
-      return result
-    },
-  }))
-  if (projectJobs) ctx.effect(() => ctx.commands.register({
-    name: 'studio-job',
-    description: 'Check or link an external job, keep an unconfirmed reference, or pause project work without stopping its job.',
-    input: { hint: STUDIO_JOB_HINT },
-    recordInput: false,
-    handler: ({ agent, commandId, rawInput, signal }) => projectJobs.command(agent, commandId, rawInput, signal),
-  }))
-  if (watchdog) ctx.effect(() => ctx.commands.register({
-    name: 'studio-health',
-    description: 'Inspect saved Studio state without calling a model, querying a job, or recovering work.',
-    input: { hint: '[document|job|draft|feishu|project|study|advice <id>]' },
-    recordInput: false,
-    handler({ agent, rawInput, signal }) {
-      signal.throwIfAborted()
-      if (!channelReady() || !currentSession(agent)) return { kind: 'error', text: 'Studio Watchdog unavailable.' }
-      return watchdogCommand(store, rawInput, sessionId => {
-        const observed = ctx.agents.get(sessionId as SessionId)
-        if (!observed) return 'not-attached'
-        return observed.id === sessionId ? observed.status : 'unknown'
-      }, documentFailureFeishuAlerts)
-    },
-  }))
-  quota.install()
-  if (quotaPools.length) ctx.effect(() => ctx.commands.register({
-    name: 'studio-quota',
-    description: 'Read Studio quota stops or confirm recovery with independent evidence, without calling a model.',
-    input: { hint: 'status | restore <pool-id> <incident-id> <independent-evidence>' },
-    recordInput: false,
-    handler({ agent, commandId, rawInput, signal }) {
-      signal.throwIfAborted()
-      if (!channelReady() || !currentSession(agent)) return { kind: 'error', text: 'Studio quota control unavailable.' }
-      if (rawInput.length > 1_280) return { kind: 'error', text: 'Studio quota controls accept at most 1000 characters of recovery evidence.' }
-      return quota.command(agent.id, commandId, rawInput)
-    },
-  }))
-  if (conversationChannel) channelRun = ctx.agents.withoutInitiator(() => conversationChannel!.run(channelStop.signal))
-  else if (feishu) channelRun = feishu.run(channelStop.signal)
-  if (quotaNotices) quotaNoticeRun = ctx.agents.withoutInitiator(() => quotaNotices.run(channelStop.signal))
-  if (jobMonitor) projectJobRun = ctx.agents.withoutInitiator(() => jobMonitor.run(channelStop.signal))
+  if (channel) channelRun = ctx.agents.withoutInitiator(() => channel!.run(stopping.signal))
+  if (store.recoveredTasks) ctx.logger.warn('Agent Studio interrupted %d unfinished tasks from a previous run', store.recoveredTasks)
   ctx.logger.info('Agent Studio ready (no GitHub source)')
 }

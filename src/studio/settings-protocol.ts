@@ -1,35 +1,21 @@
 /** 设置页的浏览器契约。路径、绑定和模型都是宿主配置；密钥不进入任何快照或保存回执。 */
-import type { FeishuState, StudioModel } from './protocol.ts'
+import type { WorkerModelDefaultsConfig, WorkerModelRouteConfig } from '../managed-worker/text-worker-model-policy.ts'
+import type { FeishuState, StudioModel, StudioWorkerPermission } from './protocol.ts'
 
 export interface FeishuBinding { appId: string; botOpenId: string; ownerOpenId: string; chatId: string }
-export type FeishuMode = 'off' | 'conversation' | 'document' | 'text'
-export type FeishuConfiguration = { mode: 'off' }
-  | { mode: 'conversation' | 'document'; binding: FeishuBinding }
-  | { mode: 'text'; binding: FeishuBinding; cwd: string; route: StudioModel; documentCorrections: boolean }
-export type PinnedModel = Required<StudioModel>
-export type StudioDispatchRole = 'assistant' | 'leader'
-export interface StudioQuotaPool { id: string; providers: string[] }
+export type FeishuMode = 'disabled' | 'conversation'
+export type FeishuConfiguration = { mode: 'disabled' } | { mode: 'conversation'; binding: FeishuBinding }
+export type { WorkerModelDefaultsConfig, WorkerModelRouteConfig }
 
 export interface StudioConfiguration {
   stateDir: string
   studioCwd: string
   assistantModel: StudioModel | null
   leaderModel: StudioModel | null
+  workerModelRoutes: WorkerModelRouteConfig[]
+  workerModelDefaults: WorkerModelDefaultsConfig
+  defaultWorkerPermission: StudioWorkerPermission
   feishu: FeishuConfiguration
-  guiDocumentInbox: boolean
-  documentContinuations: boolean
-  advisor: StudioModel | null
-  memory: boolean
-  textWorkerRoutes: PinnedModel[]
-  textWorkerDefaults: Record<StudioDispatchRole, PinnedModel | null>
-  textWorkerBounds: Record<StudioDispatchRole, { min: PinnedModel | null; max: PinnedModel | null }>
-  quotaPools: StudioQuotaPool[]
-  quotaFeishuAlerts: boolean
-  watchdog: boolean
-  documentRecovery: boolean
-  documentFailureFeishuAlerts: boolean
-  systemdJobInbox: boolean
-  systemdJobPollSeconds: number
 }
 
 export type CredentialState = 'none' | 'startup' | 'stored' | 'missing'
@@ -64,11 +50,11 @@ export type FeishuCheckResult = { id: string; state: 'connecting' | 'waiting'; p
 
 export type StudioConfigurationOp = 'configuration' | 'saveConfiguration' | 'feishuCheck'
 
-/** 绑定身份变化与模式变化分开。相同四元组切换模式时，不会被视为迁移到另一个用户。 */
+/** 仅比较绑定四元组；验证和凭据保留都依赖同一个精确私聊身份。 */
 export function sameBinding(a: FeishuBinding | undefined, b: FeishuBinding | undefined): boolean {
   return a?.appId === b?.appId && a?.botOpenId === b?.botOpenId && a?.ownerOpenId === b?.ownerOpenId && a?.chatId === b?.chatId
 }
 
 export function feishuBinding(value: FeishuConfiguration): FeishuBinding | undefined {
-  return value.mode === 'off' ? undefined : value.binding
+  return value.mode === 'disabled' ? undefined : value.binding
 }

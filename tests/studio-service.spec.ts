@@ -129,19 +129,25 @@ describe('Studio owner conversation and Feishu port', () => {
 
   it('routes a durable project block to the exact task and records the owner clearance without dispatching', async () => {
     const f = fixture()
-    const created = f.domain.projects.create({ commandId: 'create-test-project', leaderSessionId: 'exact-leader', name: 'Source review', objective: 'Verify the source' })
-    if (!created.ok) throw Error(created.reason)
-    const added = f.domain.projects.recordWork({ leaderSessionId: 'exact-leader', sourceMessageId: 'source-1', sourceRequestId: 'request-1', requestText: 'Prepare an annotated copy.' })
-    if (!added.ok) throw Error(added.reason)
-    f.service.feishu.activate(scope, Date.now())
-    const block = f.domain.projects.blockWork('exact-leader', added.value.work.workId, 'Missing source', 'Owner provides the source', 'block-test-project')
-    if (!block.ok) throw Error(block.reason)
+    const project = f.domain.projects.create({ leaderSessionId: 'exact-leader', name: 'Source review', objective: 'Verify the source' })
+    const leader = f.domain.projects.currentLeader('exact-leader')!
+    const { taskId } = f.domain.registerTask({ projectId: project.id, requesterBotId: leader.leaderBotId, workspacePath: project.workspacePath,
+      permission: 'read-only', sourceMessageId: 'source-1', requestId: 'request-1', requestText: 'Prepare an annotated copy.',
+      leader: { sessionId: 'exact-leader', managementEpoch: project.managementEpoch } })
+    const execution = f.domain.beginExecution(taskId, 'exact-worker', project.managementEpoch, { provider: 'fixture', model: 'worker' })!
+    const since = Date.now() - 1
+    f.service.feishu.activate(scope, since)
+    expect(f.domain.markTaskBlocked(taskId, execution.authorizationVersion, 'Owner provides the source')).toBe(true)
+    expect(f.domain.executionCurrent(execution)).toBe(false)
+    expect((await f.api.tasks({ conversationId: project.id }, f.signal)).items).toMatchObject([{ taskId, status: 'blocked' }])
+    expect((await f.api.tasks({ conversationId: assistant }, f.signal)).items).toEqual([])
     const [item] = (await f.api.pending({}, f.signal)).items
-    expect(item).toMatchObject({ kind: 'blocked', state: 'pending', mobile: 'unsupported', conversationId: created.value.projectId,
-      taskId: added.value.work.workId, recordSessionId: 'exact-leader' })
+    expect(item).toMatchObject({ kind: 'blocked', state: 'pending', mobile: 'unsupported', conversationId: project.id,
+      taskId, recordSessionId: 'exact-worker', detail: 'Owner provides the source' })
     expect(f.service.feishu.next(scope)).toMatchObject({ kind: 'pending', pending: { id: item!.id, mobile: 'unsupported' } })
     const settled = await f.api.answer({ id: item!.id, value: 'The source is now verified.' }, f.signal)
-    expect(settled).toMatchObject({ state: 'resolved', answeredBy: 'gui' })
+    expect(settled).toMatchObject({ state: 'resolved', answeredBy: 'gui', answer: 'The source is now verified.' })
+    expect(await f.api.task({ taskId }, f.signal)).toMatchObject({ status: 'interrupted', authorizationVersion: execution.authorizationVersion + 2 })
     expect(f.enqueue).not.toHaveBeenCalled()
     expect((await f.api.state({}, f.signal)).pendingCount).toBe(0)
     expect(() => f.api.answer({ id: item!.id, value: 'Try the same stale block again.' }, f.signal)).toThrow('no longer waiting')

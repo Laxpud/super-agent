@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, it } from 'vitest'
 import {
   ASSISTANT_CONVERSATION as assistant, STUDIO_PAGE_SIZE, type StudioPending, type StudioSessionRecord, type StudioSettings,
 } from '../src/studio/protocol.ts'
+import { ManagedWorkerStore } from '../src/managed-worker/store.ts'
 import { StudioStore } from '../src/studio/store.ts'
 
 let db: DatabaseSync
@@ -216,6 +217,33 @@ it('finds immutable Session records through filtered, exclusive pages', () => {
   expect(recent.items).toEqual(records.slice(0, STUDIO_PAGE_SIZE))
   expect(store.records('alpha_%', recent.next)).toEqual({ items: records.slice(STUDIO_PAGE_SIZE) })
   expect(store.records('no match')).toEqual({ items: [] })
+
+  const directory = mkdtempSync(join(tmpdir(), 'agent-studio-session-migration-'))
+  const path = join(directory, 'studio.sqlite')
+  const historical: StudioSessionRecord[] = (['document-worker', 'draft-worker', 'advisor'] as const).map(role => ({
+    id: `former-${role}`, conversationId: assistant, role, createdAt: 11,
+  }))
+  let managed: ManagedWorkerStore | undefined
+  try {
+    const legacy = new DatabaseSync(path)
+    try {
+      const writer = new StudioStore(legacy, assertActive)
+      for (const record of historical) writer.registerSession(record)
+    } finally { legacy.close() }
+    managed = new ManagedWorkerStore(path)
+    managed.registerSession('current-worker', 'worker', null, null)
+    expect(managed.studio.records().items).toEqual([
+      { id: 'current-worker', conversationId: assistant, role: 'worker', createdAt: expect.any(Number) },
+      ...historical.toReversed().map(record => ({ ...record, readonlyLegacy: true })),
+    ])
+    for (const record of historical) {
+      expect(managed.studio.session(record.id)).toEqual({ ...record, readonlyLegacy: true })
+      expect(() => managed!.registerSession(record.id, 'worker', null, null)).toThrow('different binding')
+    }
+  } finally {
+    managed?.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
 })
 
 it('prioritizes pending items, pages history, and settles each item only once', () => {

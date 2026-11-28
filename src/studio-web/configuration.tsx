@@ -6,7 +6,7 @@ import { StudioApiError } from './api.ts'
 import { createQuery, useQuery, type QuerySnapshot } from './query.ts'
 import { FeishuSettings, type VerifiedFeishu } from './settings-feishu.tsx'
 import { ConfigurationFailure, SettingSelect, SettingText, SettingsConfirm, type ModelCatalog, type SettingsSection } from './settings-fields.tsx'
-import { AdvancedSettings, configurationProblem, DocumentSettings, normalizeConfiguration, OversightSettings, WorkerSettings } from './settings-sections.tsx'
+import { absolute, AdvancedSettings, configurationProblem, normalizeConfiguration, WorkerSettings } from './settings-sections.tsx'
 import { Button, QueryStatus, useStudio } from './ui.tsx'
 
 interface Draft { revision: string; value: StudioConfiguration }
@@ -18,13 +18,9 @@ const equal = (left: unknown, right: unknown) => canonical(left) === canonical(r
 const unknownOutcome = (error: unknown) => !(error instanceof StudioApiError) || error.status === 0
   || error.kind === 'timeout' || error.kind === 'badResponse'
   || (error.status >= 500 && !['STUDIO_MODELS_UNCONFIRMED', 'STUDIO_CREDENTIAL_UNCONFIRMED'].includes(error.code ?? ''))
-const absolute = (path: string) => /^(?:\/|[a-zA-Z]:[\\/]|\\\\)/u.test(path)
 const FIELD_LABELS = {
   stateDir: 'stateDirectory', studioCwd: 'workDirectory', assistantModel: 'role.assistant', leaderModel: 'role.leader',
-  feishu: 'feishuMode', guiDocumentInbox: 'docCapture', documentContinuations: 'docContinuation', advisor: 'advisorModel',
-  memory: 'memorySetting', textWorkerRoutes: 'workerRoutes', textWorkerDefaults: 'workerDefault', textWorkerBounds: 'workerBounds',
-  quotaPools: 'quotaPools', quotaFeishuAlerts: 'quotaAlerts', watchdog: 'watchdog', documentRecovery: 'docRecovery',
-  documentFailureFeishuAlerts: 'docFailureAlerts', systemdJobInbox: 'externalJobs', systemdJobPollSeconds: 'pollInterval',
+  workerModelRoutes: 'workerRoutes', workerModelDefaults: 'workerDefault', defaultWorkerPermission: 'workerPermission', feishu: 'feishuMode',
 } as const satisfies Record<keyof StudioConfiguration, string>
 
 /** 普通设置、明确解绑和切换目录分别确认，避免一次提交夹带未检查的改动。 */
@@ -66,7 +62,7 @@ export function HostSettings({ section, select, models, reloadOptions, dirtyChan
   const problem = next && hostDirty ? configurationProblem(next) : undefined
   const available = !!snapshot?.writable && result.failure === undefined && !busy && !checking && !modelsBusy && !outcome && !stale
   const lockFields = !available
-  const disconnect = !!(activeBinding && next?.feishu.mode === 'off')
+  const disconnect = !!(activeBinding && next?.feishu.mode === 'disabled')
   const changed = hostDirty || !!verificationId
   const dirty = !!(draft || verificationId || transient || path || mode || outcome)
   const directoryBlocked = changed || transient || modelsDirty
@@ -146,21 +142,19 @@ export function HostSettings({ section, select, models, reloadOptions, dirtyChan
     {snapshot && value && <>
       {!snapshot.writable && <p className="as-warning" role="status">{t('readOnlyConfiguration')}</p>}
       {snapshot.profile && section === 'advanced' && <p className="as-muted">{t('configProfile', { name: snapshot.profile })}</p>}
-      {(section === 'workers' || section === 'advanced' || value.feishu.mode === 'text' && section === 'feishu') && <div className="as-actions">
+      {(section === 'workers' || section === 'advanced') && <div className="as-actions">
         <QueryStatus query={models} reload={reloadOptions} />
         {models.failure === undefined && <Button onClick={reloadOptions}>{t('reloadOptions')}</Button>}
       </div>}
       <div hidden={section !== 'feishu'}>
-        <FeishuSettings key={`${snapshot.revision}:${formRevision}`} snapshot={snapshot} value={value.feishu} models={models.data}
+        <FeishuSettings key={`${snapshot.revision}:${formRevision}`} snapshot={snapshot} value={value.feishu}
           change={feishu => change({ feishu })} verify={evidence => setVerified(evidence ? { evidence, revision: snapshot.revision } : undefined)}
           transient={setTransient} reload={query.reload} disabled={lockFields} />
       </div>
-      <fieldset className="as-setting-panel as-fields" disabled={lockFields}>
-        {section === 'workers' && <WorkerSettings value={value} change={change} models={models.data} />}
-        {section === 'documents' && <DocumentSettings value={value} change={change} />}
-        {section === 'oversight' && <OversightSettings value={value} change={change} />}
-        {section === 'advanced' && <AdvancedSettings value={value} change={change} models={models.data} />}
-      </fieldset>
+      {(section === 'workers' || section === 'advanced') && <fieldset className="as-setting-panel as-fields" disabled={lockFields}>
+        {section === 'workers' ? <WorkerSettings value={value} change={change} models={models.data} />
+          : <AdvancedSettings value={value} change={change} models={models.data} />}
+      </fieldset>}
       {failure !== undefined && <ConfigurationFailure error={failure} />}
       {stale && <div className="as-warning"><span>{t('configConflict')}</span>
         <Button onClick={() => { clearDraft(); setFailure(undefined); query.reload() }}>{t('useCurrentSettings')}</Button></div>}
@@ -205,11 +199,9 @@ export function HostSettings({ section, select, models, reloadOptions, dirtyChan
         {confirm.kind === 'directory' ? <><code className="as-settings-code">{confirm.input.config.stateDir}</code>
           <SettingText label={t('directoryConfirm')} value={typed} maxLength={4096} change={setTyped} /></> : <div className="as-fields">
           <strong>{t('confirmChanges')}</strong><ul className="as-settings-changes">
-            {(Object.keys(FIELD_LABELS) as Array<keyof StudioConfiguration>).filter(key => !equal(snapshot.config[key], confirm.input.config[key])).map(key => {
-              const item = confirm.input.config[key]
-              return <li key={key}>{t(FIELD_LABELS[key])}{typeof item === 'boolean' ? ` · ${t(item ? 'switchOn' : 'switchOff')}`
-                : key === 'feishu' ? ` · ${t(`mode.${confirm.input.config.feishu.mode}`)}` : ''}</li>
-            })}
+            {(Object.keys(FIELD_LABELS) as Array<keyof StudioConfiguration>).filter(key => !equal(snapshot.config[key], confirm.input.config[key]))
+              .map(key => <li key={key}>{t(FIELD_LABELS[key])}{key === 'feishu' ? ` · ${t(`mode.${confirm.input.config.feishu.mode}`)}`
+                : key === 'defaultWorkerPermission' ? ` · ${t(`permission.${confirm.input.config.defaultWorkerPermission}`)}` : ''}</li>)}
             {confirm.input.verificationId && <li>{t('confirmCredentialWrite')}</li>}
           </ul></div>}
       </SettingsConfirm>}

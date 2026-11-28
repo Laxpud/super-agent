@@ -33,6 +33,11 @@ it('defines the worker preset Executor Sessions run under, with a shell that mov
     'agent-studio-worker-preset', 'agent-studio-router-preset'])
   expect(rows.filter(row => row.id?.startsWith('agent-studio-managed-worker') || row.id === 'agent-studio-assistant-preset'
     || row.id === 'agent-studio-leader-preset').map(row => row.disabled)).toEqual([true, true, true, true])
+  for (const [id, name, description] of [
+    ['agent-studio-managed-worker', 'Agent Studio Worker', 'Runs a controlled Studio task distinct from the GitHub Ticket presets. This stage enables no shell, filesystem writes, or agent delegation.'],
+    ['agent-studio-assistant', 'Agent Studio Assistant', 'Answers owner questions, proposes projects, and delegates background tasks through the Studio host.'],
+    ['agent-studio-leader', 'Agent Studio Leader', 'Organizes work for one Studio project, delegates controlled tasks, and retrieves results while assigned as its current Leader.'],
+  ]) expect(presetOf(rows, id!)).toMatchObject({ name, description })
   const preset = presetOf(rows, WORKER_PRESET)
   expect(preset.id).toBe(WORKER_PRESET)
   const plugins = flat(preset.plugins)

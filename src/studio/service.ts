@@ -1,14 +1,13 @@
 /** Coordinate the owner-facing timeline, native sessions, and the verified private-chat transport. */
-import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { documentIntent } from '../managed-worker/document-intent.ts'
+import { studioBlockTarget } from './domain.ts'
 import type { ManagedWorkerStore } from '../managed-worker/store.ts'
 import { confirmStudioModel, studioModelOptions } from './models.ts'
 import { StudioError } from './pending.ts'
-import { asksForActiveWork, asksForPending, asksForProjects, confirmationStatusQuery, namesConfirmation, readTextDecision, readRouteControl,
+import { asksForActiveWork, asksForPending, asksForProjects, confirmationStatusQuery, namesConfirmation, readTextDecision, readRouteControl, readTaskUnblock,
   refersToThisConfirmation } from './owner-text.ts'
-import { ASSISTANT_CONVERSATION, STUDIO_TEXT_LIMIT, type FeishuState, type StudioMessage, type StudioPending, type StudioSend, type StudioSessionRecord, type StudioSettings } from './protocol.ts'
+import { ASSISTANT_CONVERSATION, STUDIO_TEXT_LIMIT, type FeishuState, type StudioMessage, type StudioPending, type StudioSend, type StudioSettings } from './protocol.ts'
 import { StudioSessions } from './sessions.ts'
 import type { StudioFeishuInput, StudioFeishuPort } from './feishu.ts'
 import type { StudioHttpOperations } from './http.ts'
@@ -33,6 +32,7 @@ export class StudioService {
 
   private send(input: StudioSend) {
     this.conversation(input.conversationId)
+    if (this.domain.studioProject(input.conversationId)?.state === 'archived') throw new StudioError('PROJECT_ARCHIVED', 'This project is archived.', 409)
     const { message, created } = this.store.addUser({ ...input, channel: 'gui' })
     if (created) {
       this.ownerInput(message, message.replyTo ? this.store.pendingItem(message.replyTo) : undefined)
@@ -53,7 +53,8 @@ export class StudioService {
       return
     }
     if (message.conversationId === ASSISTANT_CONVERSATION && asksForActiveWork.test(text)) {
-      const active = this.sessions.activeWork()
+      const active = this.domain.tasks().items.filter(task => ['queued', 'running', 'waiting_approval', 'blocked'].includes(task.status))
+        .map(task => `${task.title} · ${task.status}（${task.taskId}）`).concat(this.sessions.activeWork())
       this.reply(message.id, active.length ? `Assistant 当前正在处理：\n${active.map(item => `- ${item}`).join('\n')}`
         : 'Assistant 当前没有在处理的请求。')
       return
@@ -62,47 +63,38 @@ export class StudioService {
     if (query) { this.publishDecisions(message.id, query.target, direct); return }
     const decision = this.textDecision(message, direct)
     if (decision !== undefined) { this.reply(message.id, decision); return }
-    const control = readRouteControl(text)
-    const related = this.sessions.relatedWork(message)
-    const exact = control?.target && /^(?:文档(?:任务)?\s*|document(?: task)?\s+)?([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/iu.exec(control.target)?.[1]
-    const intent = documentIntent(text)
-    const document = exact || (related?.type === 'document' && (intent || !control?.target || /^(?:文档|文档任务|该文档|这(?:份|个)文档)$/u.test(control.target)) ? related.id : undefined)
-    const nextScope = document && (intent ?? (control?.kind === 'redirect' ? documentIntent(text.replace(/^.*?(?:改为|改成|调整为)\s*/u, '')) : undefined))
-    if (document && nextScope && nextScope.kind === 'narrow') {
-      const result = this.domain.narrowStudioDocument(document, message.id, nextScope.keepLines)
-      if (result.ok) this.reply(message.id, `已收紧这项文档任务的写入权限（授权版本 ${result.value.authorizationVersion}），原许可不再有效。没有写入文档。`)
-      else if (result.reason === 'STALE_AUTHORIZATION' || result.reason === 'TASK_NOT_FOUND') {
-        this.reply(message.id, `未改变这项写入权限（${result.reason}）。请核对当前任务。`)
-      } else {
-        // 能定位到收紧意图，但不能核实精确子集时，先拦住原范围的后续写入。
-        const held = this.domain.pauseStudioDocument(document, `agent-studio:${message.id}`)
-        this.reply(message.id, held.ok ? `尚未应用你指定的范围（${result.reason}）。已暂停这项任务的后续写入，原许可不能继续使用。`
-          : `未能确认收紧范围或暂停写入（${result.reason} / ${held.reason}）；请核对该任务。`)
+    const unblocking = readTaskUnblock(text)
+    if (unblocking) {
+      this.refreshBlockers()
+      const item = this.store.openBlockers().find(item => item.taskId === unblocking.taskId)
+      if (!item || message.createdAt < item.createdAt) { this.reply(message.id, '找不到对应的当前阻塞。未改变任何任务。'); return }
+      try {
+        this.answerBlock(item.id, unblocking.detail, message.channel === 'feishu' ? 'feishu' : 'gui')
+        this.reply(message.id, '已解除该任务的阻塞，原执行不会自动重启。')
+      } catch (error) {
+        if (!(error instanceof StudioError)) throw error
+        this.reply(message.id, '该任务的阻塞已处理或失效。未重新派工。')
       }
       return
     }
-    if (document && nextScope && nextScope.kind === 'pause') {
-      const paused = this.domain.pauseStudioDocument(document, `agent-studio:${message.id}`)
-      this.reply(message.id, paused.ok ? `已暂停这项文档任务的后续写入（授权版本 ${paused.value.authorizationVersion}）。不会撤回已发生的动作。`
-        : `没有确认该任务已暂停（${paused.reason}），请核对状态。`)
-      return
-    }
+    const control = readRouteControl(text)
     if (control) {
+      const related = this.sessions.relatedWork(message)
+      const target = control.target.replace(/^[#＃]/u, '')
+      const task = target ? this.domain.task(target) : related && this.domain.task(related.taskId)
+      const validRoom = message.conversationId === ASSISTANT_CONVERSATION || task?.projectId === message.conversationId
+      if (task && validRoom) {
+        if (this.sessions.stopTask(task.taskId)) {
+          if (control.kind === 'redirect') this.reply(message.id, `任务 ${task.taskId} 已停止。请另发明确的新请求；不会沿用旧任务授权。`)
+          else this.reply(message.id, `已停止任务 ${task.taskId}，其他任务不受影响。`)
+        } else this.reply(message.id, '该任务不再运行，没有改变任何工作。')
+        return
+      }
       const result = this.sessions.control(message, control)
       if (result?.reply) { this.reply(message.id, result.reply); return }
       if (result?.redirectFrom) { this.sessions.enqueue(message, result.redirectFrom); return }
-      if (control.kind === 'stop') {
-        if (document) {
-          const paused = this.domain.pauseStudioDocument(document, `agent-studio:${message.id}`)
-          if (paused.ok || paused.reason !== 'TASK_NOT_FOUND') {
-            this.reply(message.id, paused.ok ? `已暂停这项文档任务的后续写入（授权版本 ${paused.value.authorizationVersion}）。不会撤回已发生的动作。`
-              : `没有确认该任务已暂停（${paused.reason}），请核对状态。`)
-            return
-          }
-        }
-        this.reply(message.id, '没有唯一对应的在途事项；没有停止任何工作。请直接回复相关消息，或说出任务名称与动作。')
-        return
-      }
+      this.reply(message.id, '没有唯一对应的在途事项；没有停止任何工作。请直接回复相关消息，或指定任务 ID。')
+      return
     }
     this.sessions.enqueue(message)
   }
@@ -166,7 +158,7 @@ export class StudioService {
     const current = new Map(this.domain.studioBlockingItems().map(item => [item.id, item]))
     const previous = new Map(this.store.openBlockers().map(item => [item.id, item]))
     for (const item of current.values()) if (!previous.has(item.id)) this.store.addPending(item)
-    for (const item of previous.values()) if (!current.has(item.id)) this.store.settlePending(item.id, 'resolved')
+    for (const item of previous.values()) if (!current.has(item.id)) this.store.settlePending(item.id, 'expired')
   }
 
   private publishPendingSummary(requestId: string): void {
@@ -181,20 +173,29 @@ export class StudioService {
     this.reply(requestId, summary)
   }
 
-  /** Clearing a block records the owner's checked condition on that exact active block. It never dispatches. */
-  private answerGui(id: string, value: string): StudioPending {
-    if (!id.startsWith('work-block:')) return this.sessions.answer(id, value, 'gui', 'gui')
+  /** 仅解除指定版本的现役阻塞，不恢复执行授权或重派原任务。 */
+  private answerBlock(id: string, value: string, channel: 'gui' | 'feishu'): StudioPending {
+    const target = studioBlockTarget(id)
     const item = this.store.pendingItem(id)
-    const project = item && this.domain.studioProject(item.conversationId)
-    if (!item || item.kind !== 'blocked' || item.state !== 'pending' || !item.taskId || !project) {
+    if (!target || !item || item.kind !== 'blocked' || item.state !== 'pending' || item.taskId !== target.taskId) {
       throw new StudioError('BLOCK_NOT_CURRENT', 'The task is no longer waiting on this block.', 409)
     }
-    if (value.length > 1_000) throw new StudioError('INVALID_ANSWER', 'Describe the condition you verified in at most 1000 characters.')
-    const result = this.domain.projects.unblockWork(project.leaderSessionId, item.taskId, id.slice('work-block:'.length), value,
-      `agent-studio:${randomUUID()}`)
-    if (!result.ok) throw new StudioError('BLOCK_NOT_CURRENT', 'The block could not be cleared. Check the current project state.', 409)
+    if (!value.trim() || value.length > 1_000 || !value.isWellFormed() || value.includes('\0')) {
+      throw new StudioError('INVALID_ANSWER', 'Describe the condition you verified in at most 1000 characters.')
+    }
+    if (!this.domain.invalidateTask(target.taskId, 'interrupted', target.version)) {
+      throw new StudioError('BLOCK_NOT_CURRENT', 'The blocking condition is no longer current.', 409)
+    }
+    this.sessions.terminateInvalidated([target.taskId])
+    const settled = this.store.settlePending(id, 'resolved', value.trim(), channel)
     this.wake()
-    return this.store.settlePending(id, 'resolved', value, 'gui') ?? this.store.pendingItem(id) ?? item
+    return settled ?? item
+  }
+
+  private task(id: string) {
+    const item = this.domain.task(id)
+    if (!item) throw new StudioError('TASK_NOT_FOUND', 'Studio task not found.', 404)
+    return item
   }
 
   private scoped(settings: StudioSettings): StudioSettings {
@@ -231,6 +232,16 @@ export class StudioService {
       return message
     },
     send: input => this.send(input),
+    tasks: ({ conversationId, before }) => {
+      if (conversationId !== undefined) this.conversation(conversationId)
+      return this.domain.tasks(conversationId, before)
+    },
+    task: ({ taskId }) => this.task(taskId),
+    stopTask: ({ taskId }) => {
+      this.task(taskId)
+      if (!this.sessions.stopTask(taskId)) throw new StudioError('TASK_NOT_ACTIVE', 'This task is no longer active.', 409)
+      return this.task(taskId)
+    },
     pending: ({ before }) => {
       this.refreshBlockers()
       const page = this.store.pending(before)
@@ -240,7 +251,7 @@ export class StudioService {
           ? { ...item, recordSessionId } : item
       }) }
     },
-    answer: ({ id, value }) => this.answerGui(id, value),
+    answer: ({ id, value }) => studioBlockTarget(id) ? this.answerBlock(id, value, 'gui') : this.sessions.answer(id, value, 'gui', 'gui'),
     records: ({ query, before }) => this.store.records(query, before),
     record: ({ sessionId, from }, signal) => this.sessions.record(sessionId, from ?? 0, signal),
   }
@@ -300,13 +311,4 @@ export class StudioService {
     finish: (id, remoteId) => this.store.finishFeishu(id, remoteId),
   }
 
-  /** Record live native Sessions owned by Studio without making a raw Session part of the main timeline. */
-  observeSession(agent: Agent, role: StudioSessionRecord['role']): void {
-    const record = this.domain.studioSession(agent.id)
-    if (!record) return
-    const current = this.store.session(agent.id)
-    if (current) return
-    const stamp = agent.session.header.createdAt
-    this.store.registerSession({ ...record, role: record.role ?? role, createdAt: typeof stamp === 'number' ? stamp : record.createdAt || Date.now() })
-  }
 }

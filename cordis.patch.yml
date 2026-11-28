@@ -10,7 +10,7 @@
     - id: agent-studio-feishu
       name: agent-studio/feishu-watch
       disabled: true
-    # The managed document Worker starts without GitHub setup. Its preset is also off by default and separate from the legacy Executor.
+    # Studio opt-in roles start without GitHub setup and are separate from the GitHub Ticket Executor and Router.
     - id: agent-studio-managed-worker
       name: ./studio-web/index.js
       disabled: true
@@ -19,8 +19,8 @@
       disabled: true
       config:
         id: agent-studio-managed-worker
-        name: Agent Studio Document Worker
-        description: For managed document tasks only. No shell, filesystem writes, or agent delegation.
+        name: Agent Studio Worker
+        description: Runs a controlled Studio task distinct from the GitHub Ticket presets. This stage enables no shell, filesystem writes, or agent delegation.
         order: 92
         plugins:
           - id: tool-executor-native
@@ -32,7 +32,7 @@
       config:
         id: agent-studio-assistant
         name: Agent Studio Assistant
-        description: Delegates text tasks to a managed Worker and retrieves its results. Requires the Studio host entry.
+        description: Answers owner questions, proposes projects, and delegates background tasks through the Studio host.
         order: 93
         plugins:
           - id: tool-executor-native
@@ -44,7 +44,7 @@
       config:
         id: agent-studio-leader
         name: Agent Studio Leader
-        description: Manages a Studio project, dispatches restricted text Workers, and retrieves their results. Requires the Studio host entry.
+        description: Organizes work for one Studio project, delegates controlled tasks, and retrieves results while assigned as its current Leader.
         order: 94
         plugins:
           - id: tool-executor-native

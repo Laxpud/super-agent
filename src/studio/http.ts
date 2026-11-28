@@ -23,6 +23,9 @@ const schemas = {
   timeline: z.strictObject({ conversationId: id, topicId: id.exactOptional(), before: coord.positive().exactOptional() }),
   message: z.strictObject({ conversationId: id, id }),
   send: z.strictObject({ conversationId: id, requestId: id, text: text(STUDIO_TEXT_LIMIT), replyTo: id.exactOptional(), quoteId: id.exactOptional() }),
+  tasks: z.strictObject({ conversationId: id.exactOptional(), before: coord.positive().exactOptional() }),
+  task: z.strictObject({ taskId: id }),
+  stopTask: z.strictObject({ taskId: id }),
   pending: z.strictObject({ before: coord.positive().exactOptional() }),
   answer: z.strictObject({ id, value: text(4_000) }),
   records: z.strictObject({ query: z.string().max(256).exactOptional(), before: coord.positive().exactOptional() }),
@@ -38,7 +41,7 @@ interface BrowserConnection {
 }
 
 async function body(request: IncomingMessage): Promise<unknown> {
-  // A complete settings proposal may include 64 model combinations and 32 provider pools.
+  // 完整设置请求可包含最多 64 个 Worker 模型路由。
   const max = 512 * 1024
   if (Number(request.headers['content-length']) > max) throw new StudioError('REQUEST_TOO_LARGE', 'Studio request is too large.', 413)
   let bytes = 0

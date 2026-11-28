@@ -3,8 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import type { Context } from '@deepseek-ai/cordis'
 import type { StudioHostConfig } from '../managed-worker/index.ts'
-import { quotaProviderMap } from '../managed-worker/quota.ts'
-import { createTextWorkerModelPolicy } from '../managed-worker/text-worker-model-policy.ts'
+import { WorkerModelPolicy } from '../managed-worker/text-worker-model-policy.ts'
 import { validateFeishuInbox } from './feishu-binding.ts'
 import { StudioFeishuSetup } from './feishu-setup.ts'
 import type { StudioHttpOperations } from './http.ts'
@@ -29,25 +28,14 @@ const ownModel = ({ provider, model, reasoningEffort }: StudioModel): StudioMode
 
 /** Project every supported option explicitly; internal references and unknown profile properties never cross HTTP. */
 export function studioConfiguration(config: StudioHostConfig): StudioConfiguration {
-  const binding = config.feishuConversation ?? config.feishuDocumentInbox ?? config.feishuTextInbox
+  const binding = config.feishuConversation
   const summary = binding && { appId: binding.appId, botOpenId: binding.botOpenId, ownerOpenId: binding.ownerOpenId, chatId: binding.chatId }
-  const { assistant, leader } = config.textWorkerBounds
-  const bounds = (value: typeof assistant) => ({ min: value?.min ?? null, max: value?.max ?? null })
   return { stateDir: config.stateDir, studioCwd: config.studioCwd,
     assistantModel: config.assistantModel ? ownModel(config.assistantModel) : null,
     leaderModel: config.leaderModel ? ownModel(config.leaderModel) : null,
-    feishu: !summary ? { mode: 'off' }
-      : config.feishuConversation ? { mode: 'conversation', binding: summary }
-        : config.feishuDocumentInbox ? { mode: 'document', binding: summary }
-          : { mode: 'text', binding: summary, cwd: config.feishuTextInbox!.cwd, route: ownModel(config.feishuTextInbox!),
-            documentCorrections: config.feishuTextInbox!.documentCorrections },
-    guiDocumentInbox: config.guiDocumentInbox, documentContinuations: config.documentContinuations,
-    advisor: config.advisor ? ownModel(config.advisor) : null, memory: config.memory,
-    textWorkerRoutes: config.textWorkerRoutes, textWorkerDefaults: { assistant: config.textWorkerDefaults.assistant ?? null,
-      leader: config.textWorkerDefaults.leader ?? null }, textWorkerBounds: { assistant: bounds(assistant), leader: bounds(leader) },
-    quotaPools: config.quotaPools, quotaFeishuAlerts: config.quotaFeishuAlerts, watchdog: config.watchdog,
-    documentRecovery: config.documentRecovery, documentFailureFeishuAlerts: config.documentFailureFeishuAlerts,
-    systemdJobInbox: config.systemdJobInbox, systemdJobPollSeconds: config.systemdJobPollSeconds }
+    workerModelRoutes: config.workerModelRoutes.map(route => ({ id: route.id, ...ownModel(route) })),
+    workerModelDefaults: { ...config.workerModelDefaults }, defaultWorkerPermission: config.defaultWorkerPermission,
+    feishu: summary ? { mode: 'conversation', binding: summary } : { mode: 'disabled' } }
 }
 
 function fingerprint(value: unknown) {
@@ -55,55 +43,38 @@ function fingerprint(value: unknown) {
     ? Object.fromEntries(Object.entries(node).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : node)).digest('hex')
 }
 
-/** Only changed business fields are expanded into the raw complete-config slot; retain inheritance/expressions for untouched fields. */
+const retired = ['textWorkerRoutes', 'textWorkerDefaults', 'textWorkerBounds', 'feishuDocumentInbox', 'feishuTextInbox',
+  'guiDocumentInbox', 'documentContinuations', 'advisor', 'memory', 'quotaPools', 'quotaFeishuAlerts', 'watchdog',
+  'documentRecovery', 'documentFailureFeishuAlerts', 'systemdJobInbox', 'systemdJobPollSeconds', 'documents', 'oversight']
+
+/** 普通字段保留未修改的配置表达式；主动清除退出 V1 的键和已经转换的兼容别名。 */
 function candidate(raw: Raw, base: StudioConfiguration, next: StudioConfiguration, credentialId: string, directory?: StudioDirectorySwitch): Raw {
   const result = { ...raw }
-  for (const field of Object.keys(base) as Array<keyof StudioConfiguration>) {
-    if (field !== 'feishu' && !isDeepStrictEqual(next[field], base[field])) result[field] = next[field]
+  for (const key of retired) delete result[key]
+  for (const field of ['stateDir', 'studioCwd', 'assistantModel', 'leaderModel', 'workerModelRoutes', 'workerModelDefaults', 'defaultWorkerPermission'] as const) {
+    if (!isDeepStrictEqual(next[field], base[field]) || (!Object.hasOwn(raw, field) && field.startsWith('workerModel'))) result[field] = next[field]
   }
-  const { feishu } = next
-  if (!isDeepStrictEqual(feishu, base.feishu)) {
-    result.feishuConversation = feishu.mode === 'conversation' ? feishu.binding : null
-    result.feishuDocumentInbox = feishu.mode === 'document' ? feishu.binding : null
-    result.feishuTextInbox = feishu.mode === 'text' ? { ...feishu.binding, ...feishu.route, cwd: feishu.cwd,
-      documentCorrections: feishu.documentCorrections } : null
-  }
+  if (!Object.hasOwn(raw, 'defaultWorkerPermission')) result.defaultWorkerPermission = next.defaultWorkerPermission
+  if (!Object.hasOwn(raw, 'feishuConversation') || !isDeepStrictEqual(next.feishu, base.feishu)) result.feishuConversation = feishuBinding(next.feishu) ?? null
   if (credentialId !== (raw.studioFeishuCredentialId ?? '')) result.studioFeishuCredentialId = credentialId
   if (directory) result.studioDirectoryToken = directory.token
   return result
 }
 
 function routes(value: StudioConfiguration): StudioModel[] {
-  return [value.assistantModel, value.leaderModel, value.advisor, ...value.textWorkerRoutes,
-    value.feishu.mode === 'text' ? value.feishu.route : null].filter((model): model is StudioModel => model !== null)
+  return [value.assistantModel, value.leaderModel, ...value.workerModelRoutes.map(ownModel)].filter((model): model is StudioModel => model !== null)
 }
 
-/** Match activation rules before saving. Only confirm new model tuples so unrelated edits can repair an unavailable configuration. */
+/** 保存前验证新增的模型选择；清理其他设置仍可进行，即使原有提供方暂时不可用。 */
 async function verifyChanges(ctx: Context, base: StudioConfiguration, next: StudioConfiguration, signal: AbortSignal) {
-  const { feishu, watchdog, documentRecovery, documentFailureFeishuAlerts, quotaFeishuAlerts, quotaPools,
-    systemdJobInbox, systemdJobPollSeconds: interval } = next
-  const dedicatedInbox = feishu.mode === 'text' || feishu.mode === 'document'
-  if (documentRecovery && !watchdog) throw error('STUDIO_WATCHDOG_REQUIRED', 'Document recovery requires Watchdog.')
-  if (quotaFeishuAlerts && (!dedicatedInbox || !quotaPools.length)) {
-    throw error('STUDIO_QUOTA_ALERT_REQUIREMENTS', 'Quota notices require a quota pool and a dedicated Feishu inbox.')
-  }
-  if (documentFailureFeishuAlerts && (!dedicatedInbox || !documentRecovery)) {
-    throw error('STUDIO_DOCUMENT_ALERT_REQUIREMENTS', 'Document notices require recovery and a dedicated Feishu inbox.')
-  }
-  if (interval !== 0 && (!systemdJobInbox || interval < 5 || interval > 300)) {
-    throw error('STUDIO_JOB_INTERVAL', 'Enable job observation and use 5–300 seconds, or use zero to disable automatic observation.')
-  }
-  if (next.studioCwd && next.studioCwd !== base.studioCwd) verifyWorkspace(next.studioCwd)
-  if (feishu.mode === 'text' && (base.feishu.mode !== 'text' || base.feishu.cwd !== feishu.cwd)) verifyWorkspace(feishu.cwd)
-  const binding = feishuBinding(feishu)
+  if (next.studioCwd !== base.studioCwd) verifyWorkspace(next.studioCwd)
+  const binding = feishuBinding(next.feishu)
   if (binding) {
     try { validateFeishuInbox(binding) }
     catch { throw error('STUDIO_FEISHU_IDS_INVALID', 'Use distinct bot and owner IDs and an exact private chat.') }
   }
-  try { createTextWorkerModelPolicy(ctx, next.textWorkerRoutes, next.textWorkerDefaults, next.textWorkerBounds) }
-  catch { throw error('STUDIO_WORKER_POLICY_INVALID', 'Worker defaults and bounds must use exact allow-list rows and follow their order.') }
-  try { quotaProviderMap(quotaPools) }
-  catch { throw error('STUDIO_QUOTA_POOLS_INVALID', 'Each quota pool and provider must be unique.') }
+  try { new WorkerModelPolicy(ctx, next.workerModelRoutes, next.workerModelDefaults) }
+  catch { throw error('STUDIO_WORKER_POLICY_INVALID', 'Worker routes require distinct IDs and defaults must use these IDs.') }
   const previous = new Set(routes(base).map(fingerprint))
   const selected = new Map(routes(next).map(route => [fingerprint(route), route]))
   const newRoutes = [...selected].filter(([key]) => !previous.has(key)).map(([, value]) => value)
@@ -181,7 +152,7 @@ export class StudioConfigurationControl {
     const root = this.ctx.root
     if (edits.has(root)) throw error('STUDIO_CONFIG_BUSY', 'Studio is applying another settings change.')
     edits.add(root)
-    let nextCredential = this.initial.studioFeishuCredentialId
+    let nextCredential = this.initial.studioFeishuCredentialId ?? ''
     const oldBinding = feishuBinding(this.#base.feishu)
     const { config, directory: change, verificationId } = input
     const newBinding = feishuBinding(config.feishu)

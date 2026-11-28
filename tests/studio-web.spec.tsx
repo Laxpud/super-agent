@@ -2,8 +2,9 @@
 import { act, type ComponentType } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, expect, it, vi } from 'vitest'
-import { STUDIO_API, STUDIO_HEADER, type StudioMessage, type StudioOp, type StudioPending, type StudioSessionRecord,
+import { DRAFT_DELEGATE, DRAFT_READ, STUDIO_API, STUDIO_HEADER, WORKER_DELEGATE, WORKER_READ, type StudioMessage, type StudioOp, type StudioPending, type StudioSessionRecord,
   type StudioState } from '../src/studio/protocol.ts'
+import type { ConfigurationSnapshot } from '../src/studio/settings-protocol.ts'
 import { apply } from '../src/studio-web/index.tsx'
 import { en, NS, zh, type T } from '../src/studio-web/locales.ts'
 
@@ -73,7 +74,8 @@ const at = Date.UTC(2026, 10, 24, 8)
 const message = (id: string, text: string, data: Partial<StudioMessage> = {}): StudioMessage => ({
   id, text, sequence: 1, conversationId: 'assistant', role: 'user', channel: 'gui', createdAt: at, replyCount: 0, ...data,
 })
-const record: StudioSessionRecord = { id: 'session-1', conversationId: 'assistant', createdAt: at, role: 'assistant' }
+const record: StudioSessionRecord = { id: 'session-1', conversationId: 'assistant', createdAt: at, role: 'worker' }
+const legacyRecord: StudioSessionRecord = { ...record, id: 'historic-worker', role: 'draft-worker', readonlyLegacy: true }
 const confirmation: StudioPending = { id: 'waiting-1', conversationId: 'project-a', kind: 'confirmation', requester: 'Leader A',
   title: 'Approve deployment', detail: 'Specific request', taskId: 'task-1', messageId: 'source-in-project', options: ['Approve', 'Decline'],
   acceptsText: false, mobile: 'unsupported', state: 'pending', createdAt: at }
@@ -84,7 +86,7 @@ function deferred<T>() {
 }
 interface Request { op: StudioOp; input: Record<string, unknown>; signal?: AbortSignal }
 function server(handle: (request: Request) => unknown = () => undefined) {
-  const state: StudioState = { projects: [{ id: 'project-a', name: 'Project A', objective: 'Release' }], pendingCount: 0,
+  const state: StudioState = { projects: [{ id: 'project-a', name: 'Project A', objective: 'Release', workspacePath: null, state: 'active', managementEpoch: 1 }], pendingCount: 0,
     settings: { revision: 3, assistant: null, leader: { provider: 'p1', model: 'm1' } }, feishu: 'offline' }
   const requests: Request[] = []
   vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
@@ -122,11 +124,13 @@ it('adds a localized Agent Studio entry, shares state with its pending-only badg
   await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
   expect(glyph.querySelector('[title]')).toBeNull()
   const tools = entries.filter(entry => entry.options.name === 'tool.call.toolview')
-  expect(tools).toHaveLength(6)
-  const view = await render(tools[0]!, { phase: 'result', useDisclosure: () => ({ expanded: true, toggle: () => {} }),
-    block: { meta: { title: 'Saved receipt', text: '<b>Literal tool text</b>' }, content: [], isError: false } })
-  expect(node('pre', view).textContent).toBe('<b>Literal tool text</b>')
-  expect(view.querySelector('b')).toBeNull()
+  expect(tools.map(tool => tool.options.key)).toEqual([WORKER_DELEGATE, WORKER_READ, DRAFT_DELEGATE, DRAFT_READ])
+  for (const tool of tools) {
+    const view = await render(tool, { phase: 'result', useDisclosure: () => ({ expanded: true, toggle: () => {} }),
+      block: { meta: { title: 'Saved receipt', text: '<b>Literal tool text</b>' }, content: [], isError: false } })
+    expect(node('pre', view).textContent).toBe('<b>Literal tool text</b>')
+    expect(view.querySelector('b')).toBeNull()
+  }
 })
 
 it('opens an older quote directly, keeps topic replies off the main timeline, and routes replies separately from quotes', async () => {
@@ -235,22 +239,24 @@ it('drops a late timeline, keeps drafts isolated from a late send, and retries a
 it('searches Session history read-only and opens the precise source event without scanning earlier pages', async () => {
   const app = server(({ op, input }) => {
     if (op === 'timeline') return { items: [message('with-source', 'Recorded answer', { source: { sessionId: record.id, eventSeq: 87 } })] }
-    if (op === 'records') return input.query === 'assistant' ? { items: [record] } : { items: [] }
-    if (op === 'record') return { record, events: [{ seq: input.from ?? 1, kind: 'assistant/message', text: 'Read-only history' }] }
+    if (op === 'records') return input.query === 'assistant' ? { items: [legacyRecord] } : { items: [] }
+    if (op === 'record') return { record: input.sessionId === legacyRecord.id ? legacyRecord : record, events: [{ seq: input.from ?? 1, kind: 'assistant/message', text: 'Read-only history' }] }
   })
   await render(slots().main)
   await click(en.source)
   expect(app.requests.at(-1)).toMatchObject({ op: 'record', input: { sessionId: record.id, from: 87 } })
   expect(node('.as-event-list [data-focused]').textContent).toContain('Source event #87')
   expect(document.querySelector('textarea')).toBeNull()
+  expect(document.body.textContent).toContain(en['role.worker'])
   await back()
   await click(en.records)
   await change(node<HTMLInputElement>('input[type="search"]'), 'assistant')
   await click(en.search)
   expect(app.requests.at(-1)).toMatchObject({ op: 'records', input: { query: 'assistant' } })
   await click(node('.as-record-row'))
-  expect(app.requests.at(-1)).toMatchObject({ op: 'record', input: { sessionId: record.id } })
-  expect(document.body.textContent).toContain(en.readOnly)
+  expect(app.requests.at(-1)).toMatchObject({ op: 'record', input: { sessionId: legacyRecord.id } })
+  expect(document.body.textContent).toContain(en['role.draft-worker'])
+  expect(document.body.textContent).toContain(en.legacyReadOnly)
   expect(app.requests.some(request => request.op === 'send')).toBe(false)
 })
 
@@ -301,7 +307,18 @@ it('opens a pending item’s context, serializes explicit answers, and keeps tex
 
 it('preserves model edits on a revision conflict, rebases explicitly, and sends null for Host defaults', async () => {
   let count = 0
+  let snapshot: ConfigurationSnapshot = { revision: 'a'.repeat(64), writable: true, credentialsWritable: true,
+    config: { stateDir: '/studio-state', studioCwd: '/studio-work', assistantModel: null, leaderModel: null,
+      workerModelRoutes: [{ id: 'analysis-route', provider: 'p1', model: 'm1' }], workerModelDefaults: {},
+      defaultWorkerPermission: 'read-only', feishu: { mode: 'disabled' } },
+    feishu: { state: 'disabled', credential: 'none' } }
   const app = server(({ op, input }) => {
+    if (op === 'configuration') return snapshot
+    if (op === 'saveConfiguration') {
+      expect(input.revision).toBe(snapshot.revision)
+      snapshot = { ...snapshot, revision: 'b'.repeat(64), config: input.config as ConfigurationSnapshot['config'] }
+      return { revision: snapshot.revision }
+    }
     if (op !== 'settings') return
     if (++count === 1) {
       app.state.settings = { ...app.state.settings, revision: 4, leader: { provider: 'p1', model: 'm1', reasoningEffort: 'low' } }
@@ -328,4 +345,22 @@ it('preserves model edits on a revision conflict, rebases explicitly, and sends 
   expect(changes[1]?.input).toEqual({ revision: 4, assistant: { provider: 'p1', model: 'm1', reasoningEffort: 'high' }, leader: null })
   expect(document.body.textContent).toContain(en.settingsSaved)
   expect(document.body.textContent).toContain('Revision 5')
+
+  const tabs = node('.as-settings-nav')
+  expect(Array.from(tabs.querySelectorAll('button'), item => item.textContent)).toEqual([
+    en['section.models'], en['section.workers'], en['section.feishu'], en['section.advanced'],
+  ])
+  await click(en['section.workers'], tabs)
+  const fields = Array.from(node('.as-config-view:not([hidden])').querySelectorAll<HTMLSelectElement>(':scope > fieldset select'))
+  await change(fields[3]!, 'analysis-route')
+  await change(fields[5]!, 'workspace-write')
+  await click(en.applyConfig)
+  expect(node('dialog').textContent).toContain(en['permission.workspace-write'])
+  await click(en.applyConfigConfirm, node('dialog'))
+  expect(app.requests.find(request => request.op === 'saveConfiguration')?.input).toMatchObject({
+    revision: 'a'.repeat(64), allowReload: true, config: { workerModelDefaults: { assistant: 'analysis-route' }, defaultWorkerPermission: 'workspace-write' },
+  })
+  expect(document.body.textContent).toContain(en.configApplied)
+  await click(en['section.feishu'], tabs)
+  expect(Array.from(node<HTMLSelectElement>('.as-config-view:not([hidden]) select').options, item => item.value)).toEqual(['disabled', 'conversation'])
 })

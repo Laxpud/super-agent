@@ -1,167 +1,140 @@
-/** Read Studio conversation provenance and decisions from the existing managed ledgers without granting new authority. */
-import type { DatabaseSync } from 'node:sqlite'
-import { ASSISTANT_CONVERSATION, STUDIO_TEXT_LIMIT, isStudioInternalSession, type StudioArtifact, type StudioPending, type StudioProjectSummary, type StudioSessionRecord } from './protocol.ts'
+/** 只读投影不授予 Bot、会话或任务执行权限。 */
+import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
+import { ASSISTANT_CONVERSATION, STUDIO_PAGE_SIZE, STUDIO_TEXT_LIMIT, type StudioArtifact, type StudioPage, type StudioPending,
+  type StudioProjectSummary, type StudioRecordRole, type StudioSessionRecord, type StudioTaskSummary } from './protocol.ts'
 
-const ASSISTANT = ASSISTANT_CONVERSATION
 const at = (value: unknown) => typeof value === 'string' ? Date.parse(value) || 0 : 0
-const clipped = (value: string, limit: number) => value.slice(0, limit).toWellFormed()
+const nullable = (value: unknown) => typeof value === 'string' ? value : null
+type Row = Record<string, SQLOutputValue>
 
-export type StudioWorkLink = { id: string; type: 'draft' | 'study' | 'work' | 'document' }
-export interface StudioProjectRoute extends StudioProjectSummary { leaderSessionId: string; managementEpoch: number }
-
-export function studioProjects(db: DatabaseSync): StudioProjectSummary[] {
-  return db.prepare('SELECT project_id AS id, name, objective FROM studio_project ORDER BY name COLLATE NOCASE, project_id').all()
-    .map(({ id, name, objective }) => ({ id: String(id), name: String(name), objective: String(objective) }))
+export interface StudioProjectRoute extends StudioProjectSummary {
+  leaderSessionId?: string
+  leaderBotId?: string
+  /** 旧库保留 Leader Bot 和分配历史，原会话只供查阅。 */
+  readonlyLegacy?: boolean
 }
 
-/** Only explicitly bound native identities need a list; Studio-minted ones match the reserved ID namespace. */
-export function studioHiddenIds(db: DatabaseSync): string[] {
-  return db.prepare(`SELECT id FROM agent_studio_session
-    UNION SELECT leader_session_id FROM studio_project_binding
-    UNION SELECT session_id FROM studio_assistant_binding
-    UNION SELECT session_id FROM managed_session_binding
-    UNION SELECT worker_session_id FROM studio_project_dispatch
-    UNION SELECT worker_session_id FROM studio_draft_task
-    UNION SELECT worker_session_id FROM studio_study_step
-    UNION SELECT advisor_session_id FROM studio_advice
-    UNION SELECT worker_session_id FROM studio_feishu_draft ORDER BY 1`).all().flatMap(({ id }) =>
-    typeof id === 'string' && !isStudioInternalSession(id) ? [id] : [])
+function projectRow(row: Row): StudioProjectSummary {
+  return { id: String(row.project_id), name: String(row.name), objective: String(row.objective), workspacePath: nullable(row.workspace_path),
+    state: row.state === 'archived' ? 'archived' : 'active', managementEpoch: Number(row.management_epoch) }
+}
+
+export function studioProjects(db: DatabaseSync): StudioProjectSummary[] {
+  return db.prepare("SELECT * FROM studio_project WHERE state = 'active' ORDER BY name COLLATE NOCASE, project_id").all().map(projectRow)
 }
 
 export function studioProject(db: DatabaseSync, id: string): StudioProjectRoute | undefined {
-  const row = db.prepare(`SELECT p.name, p.objective, p.management_epoch, b.leader_session_id
-    FROM studio_project p JOIN studio_project_binding b USING (project_id, management_epoch) WHERE p.project_id = ?`).get(id)
-  if (row && typeof row.leader_session_id === 'string') return { id, name: String(row.name), objective: String(row.objective),
-    leaderSessionId: row.leader_session_id, managementEpoch: Number(row.management_epoch) }
+  const row = db.prepare(`SELECT p.*, b.session_id, b.leader_bot_id, s.readonly_legacy FROM studio_project p
+    LEFT JOIN studio_project_leader b ON b.project_id = p.project_id AND b.management_epoch = CASE WHEN p.state = 'active' THEN p.management_epoch
+      ELSE (SELECT max(x.management_epoch) FROM studio_project_leader x WHERE x.project_id = p.project_id AND x.management_epoch < p.management_epoch) END
+    LEFT JOIN studio_session s ON s.session_id = b.session_id WHERE p.project_id = ?`).get(id)
+  if (row) return { ...projectRow(row), ...(typeof row.leader_bot_id === 'string' ? { leaderBotId: row.leader_bot_id } : {}),
+    ...(row.state === 'active' && typeof row.session_id === 'string' ? { leaderSessionId: row.session_id } : {}),
+    ...(row.readonly_legacy === 1 ? { readonlyLegacy: true } : {}) }
 }
 
-/** Cross-room lookups are never used for replies. A reply to a published result follows its original request. */
-export function studioRelatedWork(db: DatabaseSync, room: string, requestId: string, messageId: string): StudioWorkLink | undefined {
-  const row = room === ASSISTANT
-    ? db.prepare(`SELECT task_id AS id, 'draft' AS type FROM studio_draft_task WHERE source_request_id = ?1 AND source_message_id = ?2
-      UNION ALL SELECT task_id, 'study' FROM studio_study WHERE source_request_id = ?1 AND source_message_id = ?2
-      UNION ALL SELECT task_id, 'document' FROM studio_document_continuation_claim
-        WHERE request_id = ?1 AND message_id = ?2 AND task_id IS NOT NULL LIMIT 1`).get({ '1': requestId, '2': messageId })
-    : db.prepare(`SELECT coalesce(d.task_id,w.work_id) AS id, CASE WHEN d.task_id IS NOT NULL THEN 'document' ELSE 'work' END AS type
-      FROM studio_project_work w JOIN studio_project_binding b USING (leader_session_id)
-      LEFT JOIN studio_project_document d USING (work_id)
-      WHERE b.project_id = ? AND w.source_request_id = ? AND w.source_message_id = ? LIMIT 1`).get(room, requestId, messageId)
-  if (!row || typeof row.id !== 'string') return
-  const type = row.type
-  if (type === 'draft' || type === 'study' || type === 'work' || type === 'document') return { id: row.id, type }
+export function studioHiddenIds(db: DatabaseSync): string[] {
+  return db.prepare('SELECT session_id AS id FROM studio_session UNION SELECT id FROM agent_studio_session ORDER BY id').all()
+    .map(row => String(row.id))
 }
 
-/** Prefer the permanent role/dispatch binding over a display title or transient Agent preset. */
-export function studioSession(db: DatabaseSync, id: string): StudioSessionRecord | undefined {
-  const row = db.prepare(`SELECT project_id AS room, 'leader' AS role, bound_at AS created FROM studio_project_binding WHERE leader_session_id = ?1
-    UNION ALL SELECT project_id, 'draft-worker', NULL FROM studio_project_dispatch WHERE worker_session_id = ?1
-    UNION ALL SELECT conversation_id, 'draft-worker', NULL FROM agent_studio_revision WHERE worker_session_id = ?1
-    UNION ALL SELECT project_id, 'advisor', NULL FROM studio_advice WHERE advisor_session_id = ?1
-    UNION ALL SELECT d.project_id, 'document-worker', NULL FROM managed_session_binding b
-      LEFT JOIN studio_project_document d USING (task_id) WHERE b.session_id = ?1
-    UNION ALL SELECT NULL, 'assistant', NULL FROM studio_assistant_binding WHERE session_id = ?1
-    UNION ALL SELECT NULL, 'draft-worker', NULL FROM studio_draft_task WHERE worker_session_id = ?1
-    UNION ALL SELECT NULL, 'draft-worker', NULL FROM studio_study_step WHERE worker_session_id = ?1
-    UNION ALL SELECT NULL, 'draft-worker', NULL FROM studio_feishu_draft WHERE worker_session_id = ?1 LIMIT 1`).get({ '1': id })
-  if (row && typeof row.role === 'string') return { id, conversationId: typeof row.room === 'string' ? row.room : ASSISTANT,
-    role: row.role as StudioSessionRecord['role'], createdAt: at(row.created) }
-}
-
-function resultArtifact(title: string, sessionId: unknown, text: unknown, eventSeq: unknown): StudioArtifact | undefined {
-  if (typeof sessionId !== 'string' || typeof text !== 'string' || !text.trim() || typeof eventSeq !== 'number' || !Number.isSafeInteger(eventSeq)) return
-  return { title, text: clipped(text, STUDIO_TEXT_LIMIT), source: { sessionId, eventSeq } }
-}
-
-function decodeResult(title: string, sessionId: unknown, json: unknown) {
-  if (typeof json !== 'string' || json.length > 6 * STUDIO_TEXT_LIMIT + 16_384) return
-  const data = JSON.parse(json) as { text?: unknown; eventSeq?: unknown }
-  return resultArtifact(title, sessionId, data.text, data.eventSeq)
-}
-
-/** Only results explicitly handed to the owner belong here. Never forward a tool transcript or a protected evidence copy. */
-export function studioArtifacts(db: DatabaseSync, room: string, requestId: string, messageId: string): StudioArtifact[] {
-  if (room === ASSISTANT) {
-    const draft = db.prepare(`SELECT worker_session_id, result_text, result_event_seq FROM studio_draft_task d
-      WHERE d.source_request_id = ? AND d.source_message_id = ? AND d.state = 'completed'
-      AND NOT EXISTS (SELECT 1 FROM studio_draft_preference p WHERE p.task_id = d.task_id)`).get(requestId, messageId)
-    if (draft) {
-      const artifact = resultArtifact('Worker result', draft.worker_session_id, draft.result_text, draft.result_event_seq)
-      return artifact ? [artifact] : []
-    }
-    const study = db.prepare(`SELECT p.worker_session_id, p.result_json FROM studio_study s JOIN studio_study_step p ON p.study_task_id = s.task_id
-      WHERE s.source_request_id = ? AND s.source_message_id = ? AND s.state = 'completed' AND p.kind = 'synthesis' AND p.state = 'completed'`)
-      .get(requestId, messageId)
-    if (study) {
-      const artifact = decodeResult('Study result', study.worker_session_id, study.result_json)
-      return artifact ? [artifact] : []
-    }
-  } else {
-    const work = db.prepare(`SELECT d.worker_session_id, d.result_json FROM studio_project_work w JOIN studio_project_binding b USING (leader_session_id)
-      JOIN studio_project_dispatch d USING (work_id)
-      WHERE b.project_id = ? AND w.source_request_id = ? AND w.source_message_id = ? AND d.state = 'completed'
-      AND NOT EXISTS (SELECT 1 FROM studio_project_work_fact f WHERE f.work_id = w.work_id)
-      AND NOT EXISTS (SELECT 1 FROM studio_project_work_result_use r WHERE r.work_id = w.work_id)`).get(room, requestId, messageId)
-    if (work) {
-      const artifact = decodeResult('Project Worker result', work.worker_session_id, work.result_json)
-      return artifact ? [artifact] : []
-    }
+export function studioRecordRole(value: unknown): StudioRecordRole {
+  switch (value) {
+    case 'assistant': case 'leader': case 'worker': case 'document-worker': case 'draft-worker':
+    case 'study-worker': case 'advisor': case 'subagent': return value
+    default: return 'legacy'
   }
-  const advice = db.prepare(`SELECT advisor_session_id, result_json FROM studio_advice
-    WHERE source_request_id = ? AND source_message_id = ? AND state = 'completed' AND project_id IS ? AND evidence_quote IS NULL AND work_id IS NULL`)
-    .get(requestId, messageId, room === ASSISTANT ? null : room)
-  const opinion = advice && decodeResult('Advisor result', advice.advisor_session_id, advice.result_json)
-  return opinion ? [opinion] : []
 }
 
-/** Project blocks and document reviews remain owned by their original ledger. These are status views, not new grants. */
+function sessionRow(row: Row): StudioSessionRecord {
+  return { id: String(row.session_id), conversationId: nullable(row.project_id) ?? ASSISTANT_CONVERSATION,
+    role: studioRecordRole(row.role), createdAt: at(row.created_at), ...(row.readonly_legacy === 1 ? { readonlyLegacy: true } : {}) }
+}
+
+export function studioSession(db: DatabaseSync, id: string): StudioSessionRecord | undefined {
+  const row = db.prepare('SELECT * FROM studio_session WHERE session_id = ?').get(id)
+  return row && sessionRow(row)
+}
+
+function page<T>(rows: Row[], decode: (row: Row) => T): StudioPage<T> {
+  const items = rows.slice(0, STUDIO_PAGE_SIZE)
+  return { items: items.map(decode), ...(rows.length > items.length ? { next: Number(items.at(-1)?.cursor) } : {}) }
+}
+
+export function studioRecords(db: DatabaseSync, query?: string, before?: number): StudioPage<StudioSessionRecord> {
+  const term = query?.trim().toLowerCase() ?? ''
+  return page(db.prepare(`SELECT rowid AS cursor, * FROM studio_session WHERE (?1 = '' OR instr(lower(session_id), ?1) > 0
+    OR instr(lower(coalesce(project_id, 'assistant')), ?1) > 0 OR instr(lower(role), ?1) > 0)
+    AND (?2 IS NULL OR rowid < ?2) ORDER BY rowid DESC LIMIT ${STUDIO_PAGE_SIZE + 1}`).all({ '1': term, '2': before ?? null }), sessionRow)
+}
+
+const TASK_SELECT = `SELECT t.rowid AS cursor, t.*, e.session_id, e.result_event_seq FROM studio_task t
+  LEFT JOIN studio_task_execution e ON e.task_id = t.task_id AND e.execution_epoch = (
+    SELECT max(last.execution_epoch) FROM studio_task_execution last WHERE last.task_id = t.task_id)`
+
+function json(value: unknown, fallback: unknown): unknown {
+  if (typeof value === 'string') try { return JSON.parse(value) as unknown } catch { /* 扩展数据不影响基础任务读取。 */ }
+  return fallback
+}
+
+function taskRow(row: Row): StudioTaskSummary {
+  const summary = nullable(row.result_summary)
+  const source = typeof row.session_id === 'string' && typeof row.result_event_seq === 'number'
+    ? { sessionId: row.session_id, eventSeq: row.result_event_seq } : undefined
+  const saved = json(row.artifacts, [])
+  const artifacts = Array.isArray(saved) ? saved.filter((item: unknown): item is StudioArtifact => {
+    const artifact = item as Partial<StudioArtifact> | null
+    return typeof artifact?.title === 'string' && typeof artifact.text === 'string' && typeof artifact.source?.sessionId === 'string'
+      && Number.isSafeInteger(artifact.source.eventSeq)
+  }) : []
+  return { taskId: String(row.task_id), projectId: nullable(row.project_id), sourceMessageId: nullable(row.source_message_id),
+    requesterBotId: nullable(row.requester_bot_id), assigneeBotId: nullable(row.assignee_bot_id), workspacePath: nullable(row.workspace_path),
+    permission: row.permission as StudioTaskSummary['permission'], authorizationVersion: Number(row.authorization_version),
+    status: row.status as StudioTaskSummary['status'], title: String(row.title), requestText: String(row.request_text),
+    resultSummary: summary, checkResult: nullable(row.check_result), artifacts, externalJob: json(row.external_job, null),
+    createdAt: at(row.created_at), updatedAt: at(row.updated_at), ...(source ? { source } : {}) }
+}
+
+export function studioTask(db: DatabaseSync, id: string): StudioTaskSummary | undefined {
+  const row = db.prepare(`${TASK_SELECT} WHERE t.task_id = ?`).get(id)
+  return row && taskRow(row)
+}
+
+export function studioTasks(db: DatabaseSync, room?: string, before?: number): StudioPage<StudioTaskSummary> {
+  return page(db.prepare(`${TASK_SELECT} WHERE (? = 0 OR t.project_id IS ?) AND (? IS NULL OR t.rowid < ?)
+    ORDER BY t.rowid DESC LIMIT ${STUDIO_PAGE_SIZE + 1}`)
+    .all(Number(room !== undefined), room === ASSISTANT_CONVERSATION ? null : room ?? null, before ?? null, before ?? null), taskRow)
+}
+
+/** 这里只读取已经交付的当前任务输出，不读取旧工作表，也不把内部日志当成结果转发。 */
+export function studioArtifacts(db: DatabaseSync, room: string, messageId: string): StudioArtifact[] {
+  return db.prepare(`${TASK_SELECT} WHERE t.project_id IS ? AND t.source_message_id = ? AND t.status = 'delivered'`)
+    .all(room === ASSISTANT_CONVERSATION ? null : room, messageId).map(taskRow).flatMap(task => [
+      ...(task.resultSummary && task.source ? [{ title: 'Worker result', text: task.resultSummary.slice(0, STUDIO_TEXT_LIMIT).toWellFormed(), source: task.source }] : []),
+      ...task.artifacts,
+    ])
+}
+
+const BLOCK_PREFIX = 'task-block:'
 export function studioBlockingItems(db: DatabaseSync): StudioPending[] {
-  const blocked = db.prepare(`SELECT b.block_id, b.work_id, b.project_id, b.reason, b.resume_when, b.recorded_at, p.name
-    FROM studio_project_work_block b JOIN studio_project p USING (project_id)
-    WHERE NOT EXISTS (SELECT 1 FROM studio_project_work_block_clear c WHERE c.block_id = b.block_id)
-    ORDER BY b.seq DESC`).all()
-  const docs = db.prepare(`SELECT i.instruction_id, i.task_id, i.received_at, d.project_id, p.name
-    FROM studio_document_effective_pending i JOIN managed_document x USING (task_id)
-    LEFT JOIN studio_project_document d USING (task_id) LEFT JOIN studio_project p USING (project_id)
-    WHERE x.document_version = 1 ORDER BY i.seq DESC`).all()
-  const jobs = db.prepare(`SELECT c.candidate_id, c.project_id, c.work_id, c.recorded_at, p.name
-    FROM studio_project_job_candidate c JOIN studio_project p USING (project_id)
-    WHERE c.seq = (SELECT MAX(other.seq) FROM studio_project_job_candidate other WHERE other.work_id = c.work_id)
-      AND NOT EXISTS (SELECT 1 FROM studio_project_job j WHERE j.work_id = c.work_id) ORDER BY c.seq DESC`).all()
-  const holds = db.prepare(`SELECT incident_id, pool_id, session_id, noticed_at FROM studio_quota_incident
-    WHERE cleared_at IS NULL ORDER BY noticed_at DESC`).all()
-  return [
-    ...holds.map(row => {
-      const subject = typeof row.session_id === 'string' ? studioSession(db, row.session_id) : undefined
-      return { id: `quota-hold:${String(row.incident_id)}`, conversationId: subject?.conversationId ?? ASSISTANT,
-        requester: 'Agent Studio', title: `Model quota pool stopped: ${String(row.pool_id)}`,
-        detail: 'The pool remains stopped until the owner verifies recovery. Check the quota status and record independent recovery evidence; this notice does not restart model calls.',
-        createdAt: at(row.noticed_at), acceptsText: false }
-    }),
-    ...blocked.map(row => ({ id: `work-block:${String(row.block_id)}`, conversationId: String(row.project_id),
-      taskId: String(row.work_id), requester: `Leader · ${String(row.name)}`, title: 'Project work is blocked',
-      detail: `${String(row.reason)}\n\nResume when: ${String(row.resume_when)}`, createdAt: at(row.recorded_at),
-      acceptsText: true })),
-    ...docs.map(row => ({ id: `document-review:${String(row.instruction_id)}`, conversationId: String(row.project_id ?? ASSISTANT),
-      taskId: String(row.task_id), requester: row.name ? `Document Worker · ${String(row.name)}` : 'Document Worker',
-      title: 'Review a pending document instruction', detail: 'A document write is held for review. Use the document review controls; replying here does not change authorization.',
-      createdAt: at(row.received_at), acceptsText: false })),
-    ...jobs.map(row => ({ id: `job-check:${String(row.candidate_id)}`, conversationId: String(row.project_id),
-      taskId: String(row.work_id), requester: `Leader · ${String(row.name)}`, title: 'Verify the external job reference',
-      detail: 'Studio has a saved clue but has not confirmed the external job. Review the exact reference before allowing dispatch.',
-      createdAt: at(row.recorded_at), acceptsText: false })),
-  ].map(item => ({ ...item, kind: 'blocked', mobile: 'unsupported', state: 'pending', options: [] }))
+  return db.prepare("SELECT * FROM studio_task WHERE status = 'blocked' ORDER BY rowid DESC").all().map(row => ({
+    id: `${BLOCK_PREFIX}${String(row.task_id)}:${String(row.authorization_version)}`, kind: 'blocked', taskId: String(row.task_id),
+    conversationId: nullable(row.project_id) ?? ASSISTANT_CONVERSATION, requester: 'Agent Studio', title: String(row.title || 'Studio task is blocked'),
+    detail: nullable(row.check_result) ?? 'Confirm the blocking condition has been resolved. Clearing does not rerun the task.',
+    options: [], acceptsText: true, mobile: 'unsupported', state: 'pending', createdAt: at(row.updated_at),
+  }))
 }
 
-/** Link a diagnosed item to an actual native log, which must still be opened read-only by the record endpoint. */
+export function studioBlockTarget(id: string): { taskId: string; version: number } | undefined {
+  const match = /^task-block:([^:]+):([1-9]\d*)$/u.exec(id)
+  if (match?.[1] && Number.isSafeInteger(Number(match[2]))) return { taskId: match[1], version: Number(match[2]) }
+}
+
 export function studioPendingRecord(db: DatabaseSync, pendingId: string): string | undefined {
-  const separator = pendingId.indexOf(':')
-  if (separator < 0) return
-  const kind = pendingId.slice(0, separator)
-  const key = pendingId.slice(separator + 1)
-  const row = kind === 'document-review' ? db.prepare(`SELECT b.session_id FROM studio_document_instruction i
-    JOIN managed_task t USING (task_id) JOIN managed_session_binding b USING (task_id, execution_epoch) WHERE i.instruction_id = ?`).get(key)
-    : kind === 'work-block' ? db.prepare(`SELECT leader_session_id AS session_id FROM studio_project_work_block WHERE block_id = ?`).get(key)
-      : kind === 'job-check' ? db.prepare(`SELECT leader_session_id AS session_id FROM studio_project_job_candidate WHERE candidate_id = ?`).get(key)
-        : kind === 'quota-hold' ? db.prepare(`SELECT session_id FROM studio_quota_incident WHERE incident_id = ?`).get(key) : undefined
+  const target = studioBlockTarget(pendingId)
+  if (!target) return
+  const row = db.prepare(`SELECT e.session_id FROM studio_task t JOIN studio_task_execution e USING (task_id)
+    WHERE t.task_id = ? AND t.authorization_version = ? AND t.status = 'blocked' ORDER BY e.execution_epoch DESC LIMIT 1`)
+    .get(target.taskId, target.version)
   return typeof row?.session_id === 'string' ? row.session_id : undefined
 }

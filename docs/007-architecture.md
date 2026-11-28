@@ -353,84 +353,15 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
-| `src/managed-worker/index.ts` | The opt-in Studio host: keeps its roles read-only, registers Web commands, and guards the one allowed managed document action without running GitHub setup |
-| `src/managed-worker/assistant.ts` | Runs restricted text Workers or Advisors, checks pinned routes and protected relays at the native stream boundary, and captures the exact admitted turn's result |
-| `src/managed-worker/result-tool-names.ts` | Shares Studio result tool wire names between Host registration and Web presentation |
-| `src/managed-worker/text-worker-model-policy.ts` | Validates separate text Worker defaults and inclusive role bounds against a shared, owner-ordered allow-list, then confirms and pins the actual dispatch tuple without a fallback |
-| `src/managed-worker/advisor.ts` | Uses an opt-in model route to obtain a separate Advisor opinion on a scoped owner question, without dispatching work or granting actions |
-| `src/managed-worker/advisor-store.ts` | Captures the question, exact evidence and Advisor provenance; rechecks management authority at reservation and admission and retains opinions across handoffs |
-| `src/managed-worker/study.ts` | Coordinates bounded investigations and a separate synthesis Worker for one owner message; presents saved results without asking the Assistant to rewrite them |
-| `src/managed-worker/study-store.ts` | Retains exact study inputs and Worker evidence, gates synthesis on completed investigations, and never replays interrupted steps |
-| `src/managed-worker/project.ts` | Owner controls for project work and document links, with Leader tools to register and dispatch text work and inspect saved evidence |
-| `src/managed-worker/project-intake.ts` | Presents a source-bound Assistant proposal to the native Web answerer; only a positive owner answer can establish the project and its Leader Session |
-| `src/managed-worker/project-store.ts` | Persists current management, work and dispatch; rechecks the project, work type and any work block or job hold at reservation and start |
-| `src/managed-worker/project-dispatch-diagnosis.ts` | Explains known saved text dispatch outcomes in current Leader owner detail without exposing arbitrary failure strings, probing live state, or retrying |
-| `src/managed-worker/project-handoff-store.ts` | Captures bounded work coordinates and statuses, including active text work blocks without notes, in the transfer transaction; rechecks only those IDs under the current binding |
-| `src/managed-worker/project-handoff.ts` | Formats a read-only handoff review with historical state and current blockers or result coordinates in separate sections |
-| `src/managed-worker/project-archive.ts` | Handles owner-only commands for selecting, inspecting and tracing project facts without a model |
-| `src/managed-worker/project-archive-store.ts` | Stores fact revisions and excerpt coordinates under the stable project ID; checks management and exact saved Worker evidence before writes and reads |
-| `src/managed-worker/project-fact-request.ts` | Parses one exact project, fact key, and revision from a reserved owner input, preserving the task text below it |
-| `src/managed-worker/project-fact-intake.ts` | Binds a fresh native owner message to one pending work item before model admission |
-| `src/managed-worker/project-fact-use-store.ts` | Pins one fact revision to registered work without copying its excerpt; retains the native owner event and protects the immutable link |
-| `src/managed-worker/project-result-use-store.ts` | Pins one exact slice of a completed independent result to pending work in the same project; stores coordinates and a source fingerprint, not the text |
-| `src/managed-worker/project-work-model-store.ts` | Records native model choices and withdrawals for pending text work, and spends the exact choice alongside the one authorized dispatch epoch |
-| `src/managed-worker/project-work-block-store.ts` | Records native owner holds and exact clears on unstarted text work; atomically releases reservations and exposes status without copying decision notes |
-| `src/managed-worker/project-work-termination-store.ts` | Retains one durable native transport end for the exact standalone project dispatch; projects coordinates without settling or restarting work |
-| `src/managed-worker/bot-experience.ts` | Handles owner-only commands for recording a reusable method and inspecting its applicability and provenance |
-| `src/managed-worker/bot-experience-store.ts` | Keys method revisions by stable Leader Bot and checks their exact project fact parents without returning source project text |
-| `src/managed-worker/project-document-store.ts` | Links project work to one authorized document task, reads its exact audited commit, and includes correction history only in an authorized owner detail read |
-| `src/managed-worker/project-document-decision-store.ts` | Projects recent applied scope corrections after attachment, with original source and Worker coordinates, without copying message or document text |
-| `src/managed-worker/project-job.ts` | Owner controls to retain an unconfirmed reference, pin a verified external job, observe it, and authorize or pause its post-processing without stopping the job |
-| `src/managed-worker/project-job-monitor.ts` | Checks bounded batches of pinned jobs without Agents, then defers automatic dispatch to the exact active Leader and approved model route |
-| `src/managed-worker/project-job-candidate-store.ts` | Retains unconfirmed invocation references separately from verified attachments, holding dispatch until the exact reference is verified |
-| `src/managed-worker/project-job-store.ts` | Stores one pinned invocation per work item, preserving the first confirmed terminal observation and independent authorization versions |
-| `src/managed-worker/project-job-auto-store.ts` | Keeps one-use continuation permits bound to management, authorization and route; spends the permit atomically with its exact reservation |
-| `src/managed-worker/project-job-start-store.ts` | Captures the pinned job and authorization at the stored start transition; compares start evidence with exact owner pause records without inferring adapter activity |
-| `src/managed-worker/systemd-job.ts` | Reads a bounded snapshot of one supported local user service invocation; unknown or mismatched evidence never reports completion |
-| `src/managed-worker/instructions.ts` | Records Web inputs before model reads, reviews Web and Feishu corrections against their exact versions, and sends current approved text to the bound Worker |
-| `src/managed-worker/document-intent.ts` | Recognizes a small grammar of unambiguous pause or line-subset requests; it has no authority to change them into actions |
-| `src/managed-worker/document-continuation-intent.ts` | Matches one standalone request to continue existing work, without interpreting a correction or a request to lift a pause |
-| `src/managed-worker/document-continuation-store.ts` | Claims verified Web and Feishu request coordinates once and retains the selected document execution and authorization without copying text |
-| `src/managed-worker/document-continuation.ts` | Resolves a single native owner request, shows ambiguous candidates, and uses the existing versioned relay to the current document Worker |
-| `src/managed-worker/owner-confirmation.ts` | Checks the explicit answer to a live native Web owner question; timeout and delayed or mismatched replies cannot confirm a change |
-| `src/managed-worker/memory.ts` | Handles model-free preference and citation commands and verifies the exact persisted native command before mutation |
-| `src/managed-worker/memory-store.ts` | Maintains scoped preference revisions and terminal forget records; resolves citations only at the active source revision in the selected context |
-| `src/managed-worker/memory-citation-store.ts` | Stores append-only citation coordinates and native command provenance without copying preference text |
-| `src/managed-worker/draft-preference-request.ts` | Recognizes an explicit citation on the first line of the owner's original standalone assignment; rejects ambiguous markers |
-| `src/managed-worker/draft-preference-store.ts` | Pins a standalone draft to one unprojected citation and verifies its exact current source before any preference or derived result is read |
-| `src/managed-worker/preference-intake.ts` | Verifies a fresh owner message and tool call in the persisted active turn, requests a native decision, and rechecks the input before saving |
-| `src/managed-worker/preference-intent.ts` | Recognizes a small, explicit set of durable preference requests and extracts only the original text |
-| `src/managed-worker/preference-proposal-store.ts` | Retains a proposal's source and one-use decision; requires its exact initial preference revision and closes abandoned questions on restart |
-| `src/managed-worker/preference-query-intent.ts` | Parses bounded standalone preference questions with exact keys, optional project scope and historical revision |
-| `src/managed-worker/preference-query.ts` | Resolves a verified standalone owner query and publishes a log-only read result before model admission |
-| `src/managed-worker/owner-inbox-input.ts` | Matches a fresh owner input to its exact native inbox insertion and publishes history-only receipts with that source |
-| `src/managed-worker/preference-correction-intent.ts` | Parses a standalone correction's exact preference key, revision, scope and replacement text |
-| `src/managed-worker/preference-correction.ts` | Confirms a correction, restriction or forget request in the live owner UI before model admission; rechecks the exact persisted input and target revision |
-| `src/managed-worker/preference-correction-store.ts` | Journals one correction for an exact active revision and run; binds the terminal decision to the matching new revision in the same transaction |
-| `src/managed-worker/preference-scope-change-intent.ts` | Recognizes a standalone restriction or forget request with exact preference and project identifiers |
-| `src/managed-worker/preference-scope-change-store.ts` | Stores one-use scope decisions without preference text and binds confirmation to its exact journal transition |
-| `src/managed-worker/feishu-inbox.ts` | Routes the configured owner's private-chat events from the SDK to existing text, review or continuation paths, and sends best-effort plain-text receipts |
-| `src/managed-worker/feishu-text.ts` | Routes explicit single-message text commands to a restricted Worker or exact result retrieval without rerunning completed work |
-| `src/managed-worker/feishu-draft-store.ts` | Preserves Feishu input, task and Worker identities, and result provenance; deduplicates deliveries under the shared SQLite run fence |
-| `src/managed-worker/feishu-delivery-store.ts` | Claims text commands in both inbox modes and document deliveries in the combined inbox; retains the first route across restarts and mode changes |
-| `src/managed-worker/instruction-store.ts` | Preserves Feishu task links, original deliveries and review receipts, including replacements narrowed to a subset of approved changes; pending inputs hold writes even when the listeners are off |
-| `src/managed-worker/document-command.ts` | Owner-only commands for inspecting, creating and editing a shared document, and for selecting a task's exact base revision |
-| `src/managed-worker/document-guard.ts` | Distinguishes scope refusals, state holds and unconfirmed checks in tool feedback; formats owner-only evidence queries |
-| `src/managed-worker/document-guard-store.ts` | Retains bounded, immutable coordinates and exact native call links for document guard evidence, without storing document text or granting permits |
-| `src/managed-worker/document-guard-review.ts` | Confirms the original call in the durable Worker log and requests an independent comparison against the same approved scope without replaying the call |
-| `src/managed-worker/document-guard-review-store.ts` | Records one immutable corrective comparison per task and authorization version, pinned to the original denial and native call |
-| `src/managed-worker/document-recovery.ts` | Correlates a verified document continuation with its native terminal error and requests live owner consent to replace that execution once |
-| `src/managed-worker/document-recovery-store.ts` | Pins failure evidence to the current Host, task, execution and authorization; spends it atomically with a paused transfer and audit receipt |
-| `src/managed-worker/document-failure-notices.ts` | Wakes on confirmed document failures or a verified Feishu connection and sends bounded evidence references to the configured owner without inference |
-| `src/managed-worker/document-failure-notice-store.ts` | Claims one Feishu attempt for each eligible document failure and retains its confirmed or unknown outcome independently of recovery |
-| `src/managed-worker/shared-document-store.ts` | Immutable shared document revisions, exact task base links, and provenance for owner and Worker writes; a shared commit cannot update only a task's private snapshot |
-| `src/managed-worker/quota.ts` | Stops configured inference pools before adapter dispatch, cancels affected native Agent turns even during retry backoff, and exposes model-free owner controls |
-| `src/managed-worker/quota-store.ts` | Persists one active stop per pool and the owner evidence that clears it; an unconfirmed stop cannot end a Host run cleanly |
-| `src/managed-worker/quota-notices.ts` | Sends a deterministic status notice through the verified Feishu bot, without a model or a second account |
-| `src/managed-worker/quota-notice-store.ts` | Claims one durable channel attempt per incident and preserves delivered or ambiguous outcomes across restarts |
-| `src/managed-worker/watchdog.ts` | Renders owner-only health evidence, distinguishing progress concerns, recorded failures, and unobserved Sessions without polling or recovery |
-| `src/managed-worker/watchdog-store.ts` | Reads bounded authorization, job, execution and quota metadata, including distinct scope refusals for a current document approval, without opening business text or changing state |
-| `src/managed-worker/store.ts` | The run-fenced SQLite store for Studio Bot identities, draft results, managed documents, project state and preferences; checks shared revisions together with write authority and recovery |
+| `src/managed-worker/index.ts` | The opt-in single-owner Studio Host: opens its own store, admits the three active roles, and mounts owner Web and optional Feishu operations independently of Ticket orchestration |
+| `src/managed-worker/assistant.ts` | Registers Assistant and Leader delegation and result tools, verifies exact native owner input, and runs a dedicated tool-free Worker whose result is tied to its execution epoch |
+| `src/managed-worker/text-worker-model-policy.ts` | Validates stable model route IDs and role defaults, accepts legacy model input aliases, and confirms the selected model before dispatch |
+| `src/managed-worker/project.ts` | Owner project lifecycle commands and task reads; creates passive native Leader Sessions before changing project management |
+| `src/managed-worker/project-intake.ts` | Turns an exact Assistant proposal into a project only after single-owner confirmation through the shared pending broker |
+| `src/managed-worker/project-store.ts` | Stores project state, optional workspace paths and Leader bindings by management epoch; changes of scope invalidate active task authority in the same transaction |
+| `src/managed-worker/project-archive.ts`, `project-archive-store.ts` | Owner commands and storage for each project's decisions, progress and open issues; archived projects cannot be edited |
+| `src/managed-worker/memory.ts`, `memory-store.ts` | Explicit owner commands and revisioned storage for global or project preferences, without automatic extraction or references |
+| `src/managed-worker/store.ts` | Migrates the Studio SQLite database to V1, preserving legacy Sessions as read-only; owns current Bot identities, unified tasks and executions, and the Host run fence shared by the dialogue and domain stores |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
@@ -454,32 +385,32 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
-| `src/studio/protocol.ts` | Browser-safe contracts for stable conversations, native source coordinates, settings and pending items |
-| `src/studio/source.ts` | Reserved native Session identities and exact attribution for a Studio owner input or supplemental context |
-| `src/studio/store.ts` | Holds the shared SQLite timeline, topics, model defaults, Session record index, pending states and Feishu delivery claims; no distinct per-channel conversation |
-| `src/studio/domain.ts` | Reads the existing project, execution and hold ledgers to resolve the current Leader, provenance and owner work without changing its authority |
-| `src/studio/sessions.ts` | Runs independent Assistant turns without sharing a live native Session, applies scoped interruption, and anchors background results and source records to their original input |
-| `src/studio/router-work.ts` | Hands an already registered task from its exact Assistant turn to the Host's independently managed background execution |
-| `src/studio/revision-store.ts` | Reserves and settles a new text revision on the original task after verifying the owner reply or redirection and its native management scope |
-| `src/studio/owner-text.ts` | Recognizes owner text queries, scoped decisions, and route controls without granting new authority from a model |
-| `src/studio/pending.ts` | Persists an exact Host confirmation and accepts a single current decision through text or buttons |
-| `src/studio/models.ts` | Builds the Studio role catalog and verifies concrete model and reasoning-effort combinations |
-| `src/studio/service.ts` | Joins Web and Feishu intake to one conversation, task and pending-item API |
-| `src/studio/http.ts` | Browser-owner-authenticated Studio operations with validated input and bounded responses |
-| `src/studio/feishu.ts` | Maintains one verified private-chat connection and mirrors visible text, topic replies and exact pending-card states |
-| `src/studio/feishu-binding.ts` | Defines and validates the bot and owner private-chat binding and preserves the serialized scope used by existing SQLite records |
-| `src/studio/feishu-sdk.ts` | Connects one Feishu application through the official Node SDK, verifies the bot, and validates outbound receipts without logging credentials or payloads |
-| `src/studio/settings-protocol.ts`, `settings-schema.ts` | Defines the full owner settings view and validates versioned changes and private-chat verification requests |
-| `src/studio/configuration.ts` | Checks effective revisions and runtime constraints, then applies Studio settings through the DSH profile configuration editor |
-| `src/studio/feishu-setup.ts` | Confirms the bot and private chat using an expiring owner challenge without dispatching or recording it in the conversation |
-| `src/studio/settings-credentials.ts`, `settings-directory.ts` | Uses DSH credentials for Feishu and prepares verified SQLite copies or explicitly empty data directories after a clean stop |
-| `src/studio-web/index.tsx` | Adds the standalone sidebar entry and main panel, preserving the native tool-result presentation |
+| `src/studio/protocol.ts` | Browser-safe conversation, task, project, pending-item and Session record contracts, with active and historical tool wire names |
+| `src/studio/source.ts` | Allocates native Studio Session IDs and marks exact owner input separately from supplemental context |
+| `src/studio/store.ts` | The shared timeline, model CAS, pending decisions and Feishu delivery claims, with recovery that does not replay in-flight sends |
+| `src/studio/domain.ts` | Read-only SQLite projections of projects, task and execution results, versioned human blockers and current or historical Session records |
+| `src/studio/sessions.ts` | Runs isolated Assistant and Leader turns, hands exact input to independent background execution, stops invalidated work, and delivers results with native source coordinates |
+| `src/studio/owner-text.ts` | Recognizes bounded owner text queries, confirmation decisions, explicit task clearance and scoped stop or redirect commands |
+| `src/studio/pending.ts` | Persists pending confirmations and settles the exact live decision through supported channels |
+| `src/studio/models.ts` | Builds the model catalog and verifies a concrete model and reasoning effort |
+| `src/studio/service.ts` | Shares the Assistant conversation between Web and one Feishu private chat, exposes project and task reads, and resolves task blockers without replaying execution |
+| `src/studio/http.ts` | Validates owner cookie admission, same-origin request requirements and input schemas for Studio operations |
+| `src/studio/feishu.ts` | Maintains one verified private-chat connection and mirrors visible text, topic replies and pending-card states |
+| `src/studio/feishu-binding.ts` | Validates the bot and owner private-chat binding and retains the stable scope used by existing SQLite records |
+| `src/studio/feishu-sdk.ts` | Uses the official Node SDK to verify the bot, listen for private-chat events and validate delivery receipts without logging credentials or payloads |
+| `src/studio/settings-protocol.ts`, `settings-schema.ts` | Defines and validates the versioned Host settings contract and one-time Feishu verification requests; secrets are never returned in configuration snapshots |
+| `src/studio/configuration.ts` | Applies reviewed Host changes with revision checks through the DSH profile editor, validating model routes, binding evidence and a separate data directory switch |
+| `src/studio/feishu-setup.ts` | Verifies the exact bot and private chat with an expiring owner challenge outside the conversation timeline |
+| `src/studio/settings-credentials.ts`, `settings-directory.ts` | Keeps Feishu secrets in DSH credentials and prepares a verified database copy or explicitly empty directory after a clean stop |
+| `src/studio-web/index.tsx` | Adds a standalone sidebar entry and main panel, with literal-text tool cards for current Worker tools and historical Draft results |
 | `src/studio-web/workspaces.ts` | Keeps implicit and explicitly bound Studio Sessions out of the browser catalog presentation without changing Host storage |
-| `src/studio-web/studio.tsx`, `conversation.tsx`, `records.tsx`, `pending.tsx`, `settings.tsx` | Studio navigation, Assistant and Leader chats, record reader, shared pending actions and role defaults |
-| `src/studio-web/api.ts`, `drafts.ts`, `query.ts` | Validated same-origin API calls, independent conversation drafts and cancellable view queries |
-| `src/studio-web/configuration.tsx`, `settings-sections.tsx` | Stages and reviews edits across settings groups, reads back their effect, and handles the separate data directory confirmation |
-| `src/studio-web/settings-feishu.tsx` | Starts a bounded Feishu verification without keeping the secret in a saved draft, and shows the exact binding and connection state |
-| `src/studio-web/settings-fields.tsx`, `settings-locales.ts` | Accessible settings fields, confirmation dialogs and localized recovery guidance |
+| `src/studio-web/studio.tsx`, `conversation.tsx` | Standalone navigation, Assistant and active project conversations, topics, quotes and result provenance |
+| `src/studio-web/records.tsx`, `pending.tsx` | Read-only current and historical Session records, shared confirmation actions and task blocker clearance |
+| `src/studio-web/api.ts`, `drafts.ts`, `query.ts` | Validated same-origin API calls including task operations, independent conversation drafts and cancellable view queries |
+| `src/studio-web/settings.tsx` | Conversation-model CAS, shared model catalog and settings navigation that keeps drafts when switching sections |
+| `src/studio-web/configuration.tsx`, `settings-sections.tsx` | Review and read back Host settings, choose Worker defaults by route ID and permission, and confirm data directory changes separately |
+| `src/studio-web/settings-feishu.tsx` | Configures the single optional conversation binding; verifies bot and owner identity and reads back credential and connection states without displaying secrets |
+| `src/studio-web/settings-fields.tsx`, `settings-locales.ts` | Accessible settings fields, confirmation dialogs and bilingual configuration feedback |
 | `src/studio-web/ui.tsx`, `locales.ts`, `styles.ts` | Shared Studio view controls, bilingual strings and Host theme tokens |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
@@ -521,7 +452,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
-| `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the agent preset of Executor Sessions it defines |
+| `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the Ticket Executor and Router presets, and the opt-in Studio role presets |
 | `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |
 | `tests/passes.spec.ts` | Passes: one at a time, the ones asked for during a pass run as one after it, and the runtime health a failed pass reports |
 | `tests/outbox.spec.ts` | The Outbox on a running Runtime: messages wait while processing is paused or their Source is not installed |
@@ -550,10 +481,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx` | The settings groups, drafts and history, the prompts, the Deployment page, and the panel's search, glossary and route memory |
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
-| `tests/studio-store.spec.ts`, `studio-revision-store.spec.ts` | Shared timeline, pending and delivery recovery; exact same-task revisions and stale management fencing |
-| `tests/studio-service.spec.ts`, `studio-feishu.spec.ts` | Shared conversation intake, topic and card addressing, SDK payloads and Feishu binding with offline network fixtures |
-| `tests/studio-web.spec.tsx`, `studio-workspace.spec.ts` | Sidebar/main entry, owner view flows and reversible projection of Studio Sessions out of the browser catalog |
-| `tests/fixtures/studio-runtime.smoke.mjs` | Opt-in installed DSH rc.5 Host smoke test using native authorization, SQLite and Session lifecycle with a local deterministic model adapter |
+| `tests/studio-store.spec.ts` | Shared timeline, provenance, model CAS, V1 historical Session roles, run fencing, and pending and Feishu delivery recovery |
+| `tests/studio-service.spec.ts`, `studio-feishu.spec.ts` | Shared conversation intake, topic and confirmation addressing, task blocker clearance, SDK payloads and Feishu binding with offline network fixtures |
+| `tests/studio-web.spec.tsx`, `studio-workspace.spec.ts` | Sidebar/main entry, literal tool output, read-only history, settings CAS and owner flows, and reversible hiding of Studio Sessions from the browser catalog |
+| `tests/fixtures/studio-runtime.smoke.mjs` | Opt-in installed DSH rc.5 Host smoke test for native Web authorization, exact provenance, isolated Leader contexts and unified task delivery, using a local deterministic model adapter |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
 

@@ -1,6 +1,5 @@
 // 使用当前安装的 rc.5 验证 Studio 的真实 Web 授权、Session 生命周期和合成模型流程。
 // 启动单独的进程：env -i PATH=/usr/bin:/bin HOME="$HOME" DSH_INSTALL_DIR="$DSH_INSTALL_DIR" "$DSH_NODE_EXECUTABLE" tests/fixtures/studio-runtime.smoke.mjs
-// 要验证已编译的文字修订流程，在命令最后添加 --revision。
 import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -36,11 +35,10 @@ const plans = [
 const greeting = 'Offline smoke: confirm the Studio timeline can preserve this text.'
 const replies = { greeting: 'Offline Studio fixture reply.', confirm: 'Offline Studio project decision recorded.' }
 const conversationId = 'assistant'
-const exerciseRevision = process.argv.includes('--revision')
-const draftRequest = 'Draft one sentence using the name Alpine and two details: blue door, late bus.'
-const draftBody = 'Alpine saw the blue door and took the late bus.'
-const correction = 'Please revise the previous draft: rename Alpine to Birch, keeping both details.'
-const revisedBody = 'Birch saw the blue door and took the late bus.'
+const taskRequest = 'Write one sentence using the name Alpine and two details: blue door, late bus.'
+const taskResult = 'Alpine saw the blue door and took the late bus.'
+const readRequest = 'Read the exact saved result from the offline Worker task.'
+let knownTaskId
 const calls = []
 let runtime
 let origin
@@ -132,6 +130,8 @@ try {
   const proposed = new Set()
   const contentText = message => message.content.filter(block => block.type === 'text').map(block => block.text)
   const plannedMessages = plans.flatMap(({ first, next }) => [first, ...(next ? [next] : [])])
+  let readResult = false
+  /** 离线适配器仅响应合成输入，不接触 Studio 之外的服务。 */
   class OfflineAdapter extends LlmAdapter {
     listModels(id) {
       assert.equal(id, provider)
@@ -151,27 +151,25 @@ try {
       const tools = options.tools?.map(tool => tool.name) ?? []
       calls.push({ model: options.model, reasoningEffort: options.reasoningEffort, texts, contextText, tools })
       const newest = texts.findLast(text => plans.some(plan => plan.intent === text) || plannedMessages.includes(text)
-        || text === greeting || text === draftRequest || text === correction)
+        || text === greeting || text === taskRequest || text === readRequest)
       const proposal = plans.find(plan => plan.intent === newest)
-      const revisionInput = exerciseRevision && texts.find(text => text.startsWith('Revise the previous saved result only as requested'))
       let block
-      if (revisionInput) {
-        assert.deepEqual(tools, [], 'The revision Worker has no tools')
-        const evidence = JSON.parse(revisionInput.slice(revisionInput.indexOf('\n\n') + 2))
-        assert.deepEqual(evidence, { previousResult: draftBody, ownerCorrection: correction })
-        assert.ok(!contextText.includes(greeting), 'The revision Worker receives only the bounded correction, not the Assistant room')
-        block = textBlock(revisedBody)
-      } else if (exerciseRevision && newest === correction) {
-        assert.ok(tools.includes('studio_revise_text'), 'The Assistant must offer the native topic-revision tool')
-        block = { type: 'tool-call', id: 'offline-revise-call', name: 'studio_revise_text', arguments: '{}' }
-      } else if (exerciseRevision && newest === draftRequest) {
+      if (newest === taskRequest) {
         if (tools.length) {
-          assert.ok(tools.includes('studio_delegate_draft'))
-          block = { type: 'tool-call', id: 'offline-draft-call', name: 'studio_delegate_draft', arguments: '{}' }
+          assert.ok(tools.includes('studio_delegate_task'))
+          block = { type: 'tool-call', id: 'offline-delegate-call', name: 'studio_delegate_task', arguments: '{}' }
         } else {
-          assert.ok(!contextText.includes(greeting), 'The original Worker receives only its exact assigned text')
-          block = textBlock(draftBody)
+          const inputs = options.messages.filter(message => message.role === 'user'
+            && !(message.source?.kind === 'runtime-context' && message.source.form === 'snapshot'))
+          assert.deepEqual(inputs.map(message => [message.source?.kind, contentText(message)]), [['agent-studio', [taskRequest]]],
+            'The Worker receives exactly its assigned business input alongside required native runtime context')
+          assert.ok(!contextText.includes(greeting), 'The Worker receives no Assistant history')
+          block = textBlock(taskResult)
         }
+      } else if (newest === readRequest && !readResult) {
+        assert.ok(tools.includes('studio_read_task'))
+        readResult = true
+        block = { type: 'tool-call', id: 'offline-read-call', name: 'studio_read_task', arguments: JSON.stringify({ taskId: knownTaskId }) }
       } else if (proposal && !proposed.has(proposal.name)) {
         assert.ok(options.tools?.some(tool => tool.name === 'studio_propose_project'), 'Native Assistant exposes the Studio proposal tool')
         proposed.add(proposal.name)
@@ -220,6 +218,10 @@ try {
   assert.deepEqual((await post('models', {})).map(item => [item.model, item.reasoningEfforts]),
     [model, assistantModel, leaderModel].map(id => [id, [low, high]]))
   assert.deepEqual((await post('records', {})).items, [])
+  assert.deepEqual(await post('tasks', {}), { items: [] })
+  const configuration = await post('configuration', {})
+  assert.equal(configuration.config.defaultWorkerPermission, 'read-only')
+  assert.deepEqual(configuration.config.feishu, { mode: 'disabled' })
   process.stdout.write('OK signed browser cookie, CSRF/origin gate, separate API Peer rejection, initial state/catalog\n')
 
   const submitted = await invoke('smoke-request-1', greeting)
@@ -280,6 +282,9 @@ try {
     const { projects } = await post('state', {})
     assert.deepEqual(projects.map(({ name, objective }) => [name, objective]), plans.slice(0, index + 1).map(({ name, objective }) => [name, objective]))
     const project = projects.find(entry => entry.name === plan.name)
+    assert.equal(project.workspacePath, null)
+    assert.equal(project.state, 'active')
+    assert.equal(project.managementEpoch, 1)
     const { items } = await post('records', {})
     const leader = items.find(item => item.role === 'leader' && item.conversationId === project.id)
     assert.ok(leader, 'Confirmed project has a visible Studio record for its passive Leader')
@@ -327,57 +332,57 @@ try {
   await leaderTurn(alpha, alpha.next, [beta.first], alpha.first)
   process.stdout.write('OK separate current Leader models, durable project context, and Assistant/project isolation\n')
 
-  if (exerciseRevision) {
-    // 通过 GUI 回复修订已交付的原成果，再用本轮临时账本检查同一任务的原派工和独立的新 Worker。
-    const beforeDraft = calls.length
-    const draft = await completed((await invoke('smoke-draft-original', draftRequest)).id)
-    await until('original Assistant teardown', () => !ctx.agents.get(sessionId))
-    assert.equal(draft.source.sessionId, sessionId)
-    const main = await post('timeline', { conversationId })
-    const delivered = main.items.find(item => item.replyTo === draft.id && item.text === draftBody)
-    assert.equal(delivered?.artifacts?.[0]?.title, 'Worker result')
-    assert.equal(delivered.artifacts[0].text, draftBody)
-    const parent = delivered.artifacts[0].source
-    assert.notEqual(parent.sessionId, sessionId)
-    assert.equal(calls.length, beforeDraft + 2, 'Assistant delegates once and only the dedicated Worker calls the model again')
-    assert.ok(calls[beforeDraft].tools.includes('studio_delegate_draft'))
-    assert.deepEqual(calls[beforeDraft + 1].tools, [])
-    assert.ok(calls[beforeDraft + 1].texts.includes(draftRequest))
-
-    const replyInput = { conversationId, requestId: 'smoke-draft-correction', text: correction, replyTo: delivered.id }
-    const request = await post('send', replyInput)
-    assert.equal(request.topicId, delivered.id)
-    const fixed = await completed(request.id)
-    assert.equal(fixed.source.sessionId, sessionId)
-    await until('revision Assistant teardown', () => !ctx.agents.get(sessionId))
-    assert.equal(calls.length, beforeDraft + 4, 'Correction uses the Assistant and one new Worker, and invokes neither again')
-    assert.ok(calls[beforeDraft + 2].tools.includes('studio_revise_text'))
-    assert.deepEqual(calls[beforeDraft + 3].tools, [])
-    const topic = await post('timeline', { conversationId, topicId: delivered.id })
-    const revised = topic.items.find(item => item.replyTo === fixed.id && item.text === revisedBody)
-    assert.equal(revised?.artifacts?.[0]?.title, 'Revised result')
-    assert.equal(revised.artifacts[0].text, revisedBody)
-    const current = revised.artifacts[0].source
-    assert.equal(new Set([sessionId, parent.sessionId, current.sessionId]).size, 3)
-    for (const [source, expected] of [[parent, draftBody], [current, revisedBody]]) {
-      const detail = await post('record', { sessionId: source.sessionId })
-      assert.equal(detail.record.role, 'draft-worker')
-      assert.equal(detail.events.find(event => event.seq === source.eventSeq)?.text, expected)
-      assert.equal(ctx.agents.get(source.sessionId), undefined)
+  // 登记与交付分开核对；任务列表、详情和原对话必须使用同一个结果及来源。
+  const beforeTask = calls.length
+  const inputTask = await completed((await invoke('smoke-task', taskRequest)).id)
+  assert.equal(inputTask.source.sessionId, sessionId)
+  const task = await until('Worker result delivery', async () => {
+    const current = (await post('tasks', { conversationId })).items.find(item => item.requestText === taskRequest)
+    if (current && ['blocked', 'interrupted', 'cancelled'].includes(current.status)) {
+      const observed = calls.slice(beforeTask).map(({ tools }) => tools)
+      throw new Error(`Worker task ended ${current.status}; native call tool lists: ${JSON.stringify(observed)}.`)
     }
-    assert.equal((await post('send', replyInput)).id, request.id)
-    assert.equal(calls.length, beforeDraft + 4)
-    const { DatabaseSync } = await import('node:sqlite')
-    const ledger = new DatabaseSync(join(fixture, 'studio', 'managed-worker.sqlite'), { readOnly: true })
-    try {
-      const drafts = ledger.prepare('SELECT task_id, source_request_id, worker_session_id, state FROM studio_draft_task').all()
-      const revisions = ledger.prepare('SELECT work_id, origin_request_id, request_id, worker_session_id, state FROM agent_studio_revision').all()
-      assert.deepEqual(drafts.map(row => [row.source_request_id, row.worker_session_id, row.state]), [[draft.id, parent.sessionId, 'completed']])
-      assert.deepEqual(revisions.map(row => [row.work_id, row.origin_request_id, row.request_id, row.worker_session_id, row.state]),
-        [[drafts[0].task_id, draft.id, fixed.id, current.sessionId, 'completed']])
-    } finally { ledger.close() }
-    process.stdout.write('OK original draft, topical correction on the same task, and independent tool-free Worker provenance\n')
-  }
+    return current?.status === 'delivered' ? current : undefined
+  })
+  knownTaskId = task.taskId
+  assert.deepEqual(await post('task', { taskId: knownTaskId }), task)
+  assert.equal(task.projectId, null)
+  assert.equal(task.sourceMessageId, `agent-studio-owner:${inputTask.id}`)
+  assert.equal(task.permission, 'read-only')
+  assert.equal(task.resultSummary, taskResult)
+  assert.deepEqual(await post('tasks', { conversationId: alpha.id }), { items: [] })
+  const delivery = await until('task result in its original timeline', async () => (await post('timeline', { conversationId })).items
+    .find(item => item.replyTo === inputTask.id && item.text === taskResult))
+  assert.deepEqual(delivery.artifacts, [{ title: 'Worker result', text: taskResult, source: task.source }])
+  assert.notEqual(task.source.sessionId, sessionId)
+  assert.equal(calls.length, beforeTask + 2, 'Assistant delegates once and only the dedicated Worker calls the model again')
+  assert.ok(calls[beforeTask].tools.includes('studio_delegate_task'))
+  assert.deepEqual(calls[beforeTask + 1].tools, [])
+  await until('delegating Assistant teardown', () => !ctx.agents.get(sessionId))
+
+  const workerRecord = await post('record', { sessionId: task.source.sessionId })
+  assert.equal(workerRecord.record.role, 'worker')
+  assert.equal(workerRecord.record.readonlyLegacy, undefined)
+  assert.equal(workerRecord.events.find(event => event.seq === task.source.eventSeq)?.text, taskResult)
+  assert.ok(!ctx.agents.get(task.source.sessionId), 'The Worker record read does not reopen its Agent')
+  assert.equal((await invoke('smoke-task', taskRequest)).id, inputTask.id)
+  assert.equal(calls.length, beforeTask + 2)
+  assert.equal((await post('stopTask', { taskId: knownTaskId }, { expected: 409 })).code, 'TASK_NOT_ACTIVE')
+
+  const { DatabaseSync } = await import('node:sqlite')
+  const ledger = new DatabaseSync(join(fixture, 'studio', 'managed-worker.sqlite'), { readOnly: true })
+  try {
+    const rows = ledger.prepare(`SELECT task_id, status, source_message_id, session_id, result_event_seq, outcome
+      FROM studio_task JOIN studio_task_execution USING (task_id)`).all()
+    assert.deepEqual(rows.map(row => Object.values(row)),
+      [[knownTaskId, 'delivered', task.sourceMessageId, task.source.sessionId, task.source.eventSeq, 'delivered']])
+  } finally { ledger.close() }
+  const readInput = await completed((await invoke('smoke-read-task', readRequest)).id)
+  await until('result-reading Assistant teardown', () => !ctx.agents.get(sessionId))
+  assert.equal(readResult, true)
+  const history = await post('record', { sessionId, from: readInput.source.eventSeq })
+  assert.ok(history.events.some(event => event.kind === 'tool/result' && event.text.includes(taskResult)), 'The read tool returns the exact saved result')
+  process.stdout.write('OK unified task registration, delivery, read-only Worker provenance, result lookup and no replay\n')
 } catch (error) {
   // 诊断只打印断言和测试阶段，不由运行时转储请求、认证数据或环境。
   console.error(error instanceof Error ? error.stack?.split('\n').slice(0, 9).join('\n') : 'Studio smoke failed')

@@ -56,6 +56,12 @@ export function namesConfirmation(target: string, item: StudioPending, projectNa
 
 export interface TextRouteControl { kind: 'stop' | 'redirect'; target: string }
 
+/** 阻塞解除必须明示任务 ID 和已核实的条件；不会根据普通对话推断。 */
+export function readTaskUnblock(raw: string): { taskId: string; detail: string } | undefined {
+  const match = /^(?:解除阻塞|unblock)\s+([a-f0-9-]{36})\s*[:：]\s*([\s\S]{1,1000})$/iu.exec(raw.trim())
+  if (match?.[1] && match[2]) return { taskId: match[1].toLowerCase(), detail: match[2] }
+}
+
 /** 只将明确的控制词交给快速路径；未匹配的普通指令继续由 Router 理解。 */
 export function readRouteControl(raw: string): TextRouteControl | undefined {
   const text = key(raw)

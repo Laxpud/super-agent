@@ -38,7 +38,8 @@ export function Records({ view }: { view: HistoryView }) {
         <button className="as-record-row" type="button" onClick={() => open({ kind: 'record', sessionId: item.id })}>
           <strong>{item.id}</strong>
           <span className="as-meta">
-            <span>{chatTitle(t, state, item.conversationId)}</span><span>{t(`role.${item.role}`)}</span><Time value={item.createdAt} />
+            <span>{chatTitle(t, state, item.conversationId)}</span><span>{t(`role.${item.role}`)}</span>
+            {item.readonlyLegacy && <span className="as-pill">{t('legacyReadOnly')}</span>}<Time value={item.createdAt} />
           </span>
         </button>
       </li>)}
@@ -58,7 +59,7 @@ export function RecordDetail({ view }: { view: RecordView }) {
   useEffect(() => { if (result.data) target.current?.focus() }, [result.data])
   return <section className="as-detail">
     <PageHeading title={t('record')} detail={sessionId}>
-      <span className="as-pill">{t('readOnly')}</span>
+      <span className="as-pill">{t(result.data?.record.readonlyLegacy ? 'legacyReadOnly' : 'readOnly')}</span>
     </PageHeading>
     {result.data?.record && <div className="as-meta">
       <strong>{chatTitle(t, state, result.data.record.conversationId)}</strong><span>{t(`role.${result.data.record.role}`)}</span>

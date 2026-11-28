@@ -24,8 +24,9 @@ export const en = {
   openTopic: 'Open topic · {count} replies', openTopicOne: 'Open topic · 1 reply',
   reply: 'Reply', quote: 'Quote', quoting: 'Quoting', removeQuote: 'Remove quote',
   replyingTo: 'Replying to', clearReply: 'Reply to topic instead', source: 'View source',
-  'role.user': 'You', 'role.assistant': 'Assistant', 'role.leader': 'Leader',
+  'role.user': 'You', 'role.assistant': 'Assistant', 'role.leader': 'Leader', 'role.worker': 'Worker',
   'role.document-worker': 'Document Worker', 'role.draft-worker': 'Draft Worker', 'role.advisor': 'Advisor', 'role.subagent': 'Subagent',
+  'role.study-worker': 'Study Worker', 'role.legacy': 'Legacy Session', legacyReadOnly: 'Legacy · read only',
   'channel.gui': 'From GUI', 'channel.feishu': 'From Feishu', 'channel.studio': 'Agent Studio',
   'status.queued': 'Queued', 'status.running': 'Running', 'status.completed': 'Completed', 'status.failed': 'Failed',
   'status.interrupted': 'Interrupted', 'delivery.pending': 'Waiting to sync to Feishu', 'delivery.sent': 'Sent to Feishu',
@@ -39,6 +40,7 @@ export const en = {
   'pendingState.pending': 'Waiting for you', 'pendingState.resolved': 'Handled', 'pendingState.expired': 'Expired',
   'mobile.card': 'Feishu: can be answered via card', 'mobile.topic': 'Feishu: can be answered in its topic',
   'mobile.unsupported': 'Still pending in Feishu · handle in Studio',
+  unblockLabel: 'What did you verify?', unblockHint: 'Clearing the block does not rerun the task.', unblockAction: 'Confirm clearance',
   answerLabel: 'Your answer', answer: 'Submit answer', answering: 'Submitting…', answerSaved: 'Answer recorded.',
   'answerFrom.gui': 'Answered in GUI', 'answerFrom.feishu': 'Answered in Feishu', olderItems: 'Older items', newerItems: 'Newer items',
   recordsIntro: 'Search Studio Sessions. Reading history does not start or resume a Session.',
@@ -53,7 +55,6 @@ export const en = {
   settingsSaved: 'Settings saved.', settingsChanged: 'Settings were changed elsewhere. Review the latest revision before saving your edits.',
   rebaseSettings: 'Keep edits on latest revision', discardSettings: 'Discard edits',
   feishuConnection: 'Feishu connection',
-  feishuScope: 'Only text, replies and topics after binding are shared with the bound Assistant private chat. Project and Worker execution logs are not shared.',
   feishuLimits: 'Mobile actions require the Studio Host to stay running and connected to Feishu. You can close the GUI; the Web UI does not have to be public. A sent Feishu message is not proof that Studio received or executed it.',
 } as const
 
@@ -77,8 +78,9 @@ export const zh: Record<keyof typeof en, string> = {
   openTopicOne: '打开话题 · 1 条回复',
   reply: '回复', quote: '引用', quoting: '正在引用', removeQuote: '移除引用',
   replyingTo: '正在回复', clearReply: '改为回复话题', source: '查看来源',
-  'role.user': '你', 'role.assistant': 'Assistant', 'role.leader': 'Leader',
+  'role.user': '你', 'role.assistant': 'Assistant', 'role.leader': 'Leader', 'role.worker': 'Worker',
   'role.document-worker': '文档 Worker', 'role.draft-worker': '草稿 Worker', 'role.advisor': '顾问', 'role.subagent': '子代理',
+  'role.study-worker': '研究 Worker', 'role.legacy': '历史会话', legacyReadOnly: '历史记录 · 只读',
   'channel.gui': '来自 GUI', 'channel.feishu': '来自飞书', 'channel.studio': 'Agent Studio',
   'status.queued': '已排队', 'status.running': '执行中', 'status.completed': '已完成', 'status.failed': '失败',
   'status.interrupted': '已中断', 'delivery.pending': '等待同步到飞书', 'delivery.sent': '已发送到飞书',
@@ -92,6 +94,7 @@ export const zh: Record<keyof typeof en, string> = {
   'pendingState.pending': '等待处理', 'pendingState.resolved': '已处理', 'pendingState.expired': '已失效',
   'mobile.card': '可在飞书卡片处理', 'mobile.topic': '可在飞书话题中处理',
   'mobile.unsupported': '飞书仍待确认 · 请在 Studio 处理',
+  unblockLabel: '你已核实的情况', unblockHint: '解除阻塞不会重新执行原任务。', unblockAction: '确认解除阻塞',
   answerLabel: '你的回答', answer: '提交回答', answering: '正在提交…', answerSaved: '已记录回答。',
   'answerFrom.gui': '在 GUI 处理', 'answerFrom.feishu': '在飞书处理', olderItems: '更早的事项', newerItems: '更新的事项',
   recordsIntro: '查找 Studio 底层 Session。回看记录不会启动或继续该 Session。',
@@ -106,7 +109,6 @@ export const zh: Record<keyof typeof en, string> = {
   settingsSaved: '已保存设置。', settingsChanged: '设置已在其他位置修改。请检查最新修订版本后再保存你的更改。',
   rebaseSettings: '保留编辑并使用最新版本', discardSettings: '放弃编辑',
   feishuConnection: '飞书连接',
-  feishuScope: '仅同步绑定后 Assistant 私聊中的文字、回复和话题，不同步项目和 Worker 的执行日志。',
   feishuLimits: '手机处理需要 Studio 宿主保持运行并连接飞书。可以关闭 GUI，无需将网页暴露到公网。飞书显示已发送不等于 Studio 已收到或执行。',
 }
 

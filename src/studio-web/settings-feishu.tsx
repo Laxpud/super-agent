@@ -1,10 +1,10 @@
 /** 飞书配置只使用一次性检查回执。密钥输入不会进入设置草稿、浏览器持久存储或查询。 */
 import { useEffect, useRef, useState } from 'react'
 import { feishuBinding, sameBinding, type ConfigurationSnapshot, type FeishuBinding, type FeishuCheckResult, type FeishuConfiguration, type FeishuMode } from '../studio/settings-protocol.ts'
-import { blankModel, ConfigurationFailure, configurationReason, ModelEditor, SettingSelect, SettingText, SettingToggle, type ModelCatalog } from './settings-fields.tsx'
+import { ConfigurationFailure, configurationReason, SettingSelect, SettingText } from './settings-fields.tsx'
 import { Button, useStudio } from './ui.tsx'
 
-const MODES = ['off', 'conversation', 'document', 'text'] as const
+const MODES = ['disabled', 'conversation'] as const satisfies readonly FeishuMode[]
 const EMPTY: FeishuBinding = { appId: '', botOpenId: '', ownerOpenId: '', chatId: '' }
 const inProgress = (result: FeishuCheckResult | undefined) => result?.state === 'waiting' || result?.state === 'connecting'
 const keys = ['appId', 'botOpenId', 'ownerOpenId', 'chatId'] as const
@@ -12,8 +12,8 @@ const labels = ['feishuApp', 'feishuBot', 'feishuOwner', 'feishuChat'] as const
 const patterns = [/^cli_[a-fA-F0-9]{16}$/u, /^ou_[a-zA-Z0-9]+$/u, /^ou_[a-zA-Z0-9]+$/u, /^oc_[a-zA-Z0-9]+$/u]
 export type VerifiedFeishu = Extract<FeishuCheckResult, { state: 'verified' }>
 
-export function FeishuSettings({ snapshot, value, models, change, verify, transient, reload, disabled }: {
-  snapshot: ConfigurationSnapshot; value: FeishuConfiguration; models?: ModelCatalog; change: (next: FeishuConfiguration) => void;
+export function FeishuSettings({ snapshot, value, change, verify, transient, reload, disabled }: {
+  snapshot: ConfigurationSnapshot; value: FeishuConfiguration; change: (next: FeishuConfiguration) => void;
   verify: (value: VerifiedFeishu | undefined) => void; transient: (dirty: boolean) => void; reload: () => void; disabled: boolean
 }) {
   const { call, t, dates } = useStudio()
@@ -61,7 +61,7 @@ export function FeishuSettings({ snapshot, value, models, change, verify, transi
         setCheck(result)
         if (result.state === 'verified') {
           const current = changeResult.current
-          if (current.value.mode !== 'off') {
+          if (current.value.mode === 'conversation') {
             current.change({ ...current.value, binding: result.binding })
             current.verify(result)
           }
@@ -85,11 +85,8 @@ export function FeishuSettings({ snapshot, value, models, change, verify, transi
 
   function useMode(mode: FeishuMode) {
     if (mode === value.mode) return
-    if (mode === 'off') { cancelCheck(); setSecret(''); change({ mode }); return }
-    const next = binding ?? active ?? EMPTY
-    const original = snapshot.config.feishu
-    change(mode === 'text' ? original.mode === 'text' ? { ...original, binding: next }
-      : { mode, binding: next, cwd: '', route: blankModel, documentCorrections: false } : { mode, binding: next })
+    if (mode === 'disabled') { cancelCheck(); setSecret(''); change({ mode }); return }
+    change({ mode, binding: active ?? EMPTY })
   }
 
   async function start() {
@@ -121,16 +118,16 @@ export function FeishuSettings({ snapshot, value, models, change, verify, transi
     </div>
     <p className="as-muted">{t('feishuPreparation')}</p>
     <fieldset className="as-setting-panel as-fields" disabled={disabled || working}>
-      <SettingSelect label={t('feishuMode')} value={value.mode} change={mode => useMode(mode as FeishuMode)}>
+      <SettingSelect label={t('feishuMode')} value={value.mode} change={mode => { if (mode === 'disabled' || mode === 'conversation') useMode(mode) }}>
         {MODES.map(mode => <option key={mode} value={mode}>{t(`mode.${mode}`)}</option>)}
       </SettingSelect><p>{t(`modeHint.${value.mode}`)}</p>
-      {binding && value.mode !== 'off' && <>
+      {value.mode === 'conversation' && <>
         <fieldset className="as-model-fields as-fields" disabled={pending}>
           <legend>{t('feishuBinding')}</legend>
           <p className="as-muted">{t('feishuAutoIds')}</p>
           <div className="as-model-grid">
-            {keys.map((key, index) => <SettingText key={key} label={t(labels[index]!)} value={binding[key]} maxLength={256}
-              change={text => { cancelCheck(); change({ ...value, binding: { ...binding, [key]: text } }) }} />)}
+            {keys.map((key, index) => <SettingText key={key} label={t(labels[index]!)} value={value.binding[key]} maxLength={256}
+              change={text => { cancelCheck(); change({ ...value, binding: { ...value.binding, [key]: text } }) }} />)}
           </div>
           {snapshot.credentialsWritable ? <SettingText label={t('feishuSecret')} type="password" autoComplete="new-password" maxLength={256}
             value={secret} placeholder={t(hasSecret ? 'feishuSecretReplace' : 'feishuSecretEnter')} hint={t('feishuSecretHint')}
@@ -138,14 +135,8 @@ export function FeishuSettings({ snapshot, value, models, change, verify, transi
           <div className="as-actions"><Button disabled={!snapshot.credentialsWritable || !goodIds || (!secret.trim() && !hasSecret)}
             onClick={() => void start()}>{t(working ? 'feishuStartPending' : 'feishuStartCheck')}</Button></div>
         </fieldset>
-        {value.mode === 'text' && <>
-          <SettingText label={t('feishuTextCwd')} value={value.cwd} change={cwd => change({ ...value, cwd })} maxLength={4096} />
-          <ModelEditor title={t('feishuTextModel')} options={models} value={value.route} change={route => { if (route) change({ ...value, route }) }} />
-          <SettingToggle label={t('feishuCombined')} hint={t('feishuCombinedHint')} checked={value.documentCorrections}
-            change={documentCorrections => change({ ...value, documentCorrections })} />
-        </>}
       </>}
-      {active && value.mode !== 'off' && <div className="as-actions"><Button onClick={() => useMode('off')}>{t('feishuUnbind')}</Button></div>}
+      {active && value.mode === 'conversation' && <div className="as-actions"><Button onClick={() => useMode('disabled')}>{t('feishuUnbind')}</Button></div>}
     </fieldset>
     {failure !== undefined && <ConfigurationFailure error={failure} />}
     {check?.state === 'connecting' && <p role="status">{t('feishuCheckConnecting')}</p>}
