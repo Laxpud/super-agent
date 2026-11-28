@@ -44,6 +44,13 @@ const session = (value: unknown) => object(value) && text(value.id) && text(valu
   && choice(value.role, roles) && optional(value.readonlyLegacy, boolean)
 const project = (value: unknown) => object(value) && text(value.id) && text(value.name) && text(value.objective)
   && nullableText(value.workspacePath) && choice(value.state, ['active', 'archived']) && whole(value.managementEpoch)
+const archive = (value: Record<string, unknown>) => [value.projectId, value.decisions, value.progress, value.openIssues].every(text)
+  && nullableText(value.updatedAt) && boolean(value.readonly)
+const preference = (value: unknown) => object(value) && [value.preferenceId, value.key, value.text, value.updatedAt].every(text)
+  && nullableText(value.projectId) && choice(value.state, ['active', 'forgotten']) && positiveWhole(value.version)
+const forward = (value: unknown) => value === null || (object(value)
+  && [value.forwardId, value.projectId, value.projectName, value.projectMessageId].every(text)
+  && choice(value.status, ['registered', 'running', 'delegated', 'delivered', 'failed', 'interrupted']))
 const artifact = (value: unknown) => object(value) && text(value.title) && text(value.text) && source(value.source)
 const checkReceipt = (value: unknown) => nullableText(value) || (object(value) && value.version === 1
   && choice(value.overallCheckStatus, ['passed', 'failed', 'not_run'])
@@ -54,10 +61,13 @@ const checkReceipt = (value: unknown) => nullableText(value) || (object(value) &
   && optional(value.omittedChecks, positiveWhole) && optional(value.omittedChangedFiles, positiveWhole))
 const task = (value: unknown) => object(value) && [value.taskId, value.title, value.requestText].every(text)
   && [value.projectId, value.sourceMessageId, value.requesterBotId, value.assigneeBotId, value.workspacePath, value.resultSummary].every(nullableText)
-  && checkReceipt(value.checkResult)
+  && [value.projectName, value.sourceSessionId, value.workerSessionId].every(field => optional(field, nullableText))
+  && optional(value.conversationId, text) && checkReceipt(value.checkResult)
   && permission(value.permission) && whole(value.authorizationVersion) && whole(value.createdAt) && whole(value.updatedAt)
   && choice(value.status, ['queued', 'running', 'waiting_approval', 'blocked', 'interrupted', 'cancelled', 'delivered'])
   && items(value.artifacts, artifact) && Object.hasOwn(value, 'externalJob') && optional(value.source, source)
+const intake = (value: Record<string, unknown>) => boolean(value.accepted) && nullableText(value.messageId) && forward(value.forward)
+  && (value.messageStatus === null || choice(value.messageStatus, ['queued', 'running', 'completed', 'failed', 'interrupted'])) && items(value.tasks, task)
 const pending = (value: unknown) => object(value) && [value.id, value.conversationId, value.title, value.detail, value.requester].every(text)
   && [value.messageId, value.topicId, value.taskId, value.recordSessionId, value.answer].every(field => optional(field, text))
   && whole(value.createdAt) && typeof value.acceptsText === 'boolean' && items(value.options, text)
@@ -75,10 +85,11 @@ const message = (value: unknown) => object(value) && [value.id, value.conversati
 function readable(op: StudioOp, value: unknown): boolean {
   if (op === 'models') return items(value, option => object(option) && text(option.provider) && text(option.model)
     && text(option.label) && items(option.reasoningEfforts, text))
+  if (op === 'preferences') return items(value, preference)
   if (!object(value)) return false
   switch (op) {
     case 'state': return whole(value.pendingCount) && settings(value.settings) && feishuState(value.feishu)
-      && items(value.projects, project)
+      && items(value.projects, project) && optional(value.archivedProjects, list => items(list, project))
       && optional(value.hiddenSessionIds, list => items(list, text))
     case 'configuration': return revision(value.revision) && optional(value.profile, text) && typeof value.writable === 'boolean'
       && typeof value.credentialsWritable === 'boolean' && configuration(value.config) && object(value.feishu)
@@ -91,6 +102,11 @@ function readable(op: StudioOp, value: unknown): boolean {
     case 'settings': return settings(value)
     case 'timeline': return page(value, message)
     case 'message': case 'send': return message(value)
+    case 'messageStatus': return intake(value)
+    case 'feishuMessageStatus': case 'resubmitFeishuMessage': return text(value.feishuMessageId) && intake(value)
+    case 'createProject': case 'updateProject': case 'replaceProjectLeader': case 'archiveProject': case 'reopenProject': return project(value)
+    case 'projectArchive': case 'updateProjectArchive': return archive(value)
+    case 'savePreference': case 'updatePreference': case 'forgetPreference': return preference(value)
     case 'tasks': return page(value, task)
     case 'task': case 'stopTask': return task(value)
     case 'pending': return page(value, pending)
@@ -103,7 +119,7 @@ function readable(op: StudioOp, value: unknown): boolean {
 
 export const callStudio: StudioCall = async (op, input, signal) => {
   // 请求有上限，避免网络挂起后阻塞轮询，也避免写入未应答时自动重发。
-  const timeout = AbortSignal.timeout(op === 'saveConfiguration' ? 120_000 : op === 'send' || op === 'answer' || op === 'settings' || op === 'stopTask' ? 30_000 : 15_000)
+  const timeout = AbortSignal.timeout(op === 'saveConfiguration' ? 120_000 : op === 'send' || op === 'answer' || op === 'settings' || op === 'stopTask' || op === 'feishuMessageStatus' || op === 'resubmitFeishuMessage' ? 35_000 : 15_000)
   const bounded = signal ? AbortSignal.any([signal, timeout]) : timeout
   let response: Response | undefined
   let data: unknown

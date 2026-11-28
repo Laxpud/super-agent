@@ -18,7 +18,7 @@ import { StudioFeishuConversation } from '../studio/feishu.ts'
 import { StudioFeishuSetup } from '../studio/feishu-setup.ts'
 import { registerStudioHttp } from '../studio/http.ts'
 import { StudioError } from '../studio/pending.ts'
-import { isStudioInternalSession, LIST_PROJECTS, PROPOSE_PROJECT, WORKER_DELEGATE, WORKER_READ, type FeishuState,
+import { FORWARD_PROJECT, isStudioInternalSession, LIST_PROJECTS, PROPOSE_PROJECT, WORKER_DELEGATE, WORKER_READ, type FeishuState,
   type StudioModel, type StudioRole, type StudioWorkerPermission } from '../studio/protocol.ts'
 import { StudioService } from '../studio/service.ts'
 import { StudioCredentials } from '../studio/settings-credentials.ts'
@@ -88,7 +88,7 @@ interface CommandResult { kind: 'success' | 'error'; text: string }
 interface StudioScope { role: StudioRole; dispose(): void }
 const presets: Record<StudioRole, string> = { assistant: ASSISTANT_PRESET, leader: LEADER_PRESET, worker: WORKER_PRESET }
 const roleForPreset = (preset: string | null) => (Object.keys(presets) as StudioRole[]).find(role => presets[role] === preset)
-const studioTools = new Set([WORKER_DELEGATE, WORKER_READ, LIST_PROJECTS, PROPOSE_PROJECT, STUDIO_LIST_DIRECTORY])
+const studioTools = new Set([WORKER_DELEGATE, WORKER_READ, LIST_PROJECTS, PROPOSE_PROJECT, FORWARD_PROJECT, STUDIO_LIST_DIRECTORY])
 const denied = 'Studio tool denied: INVALID_EXECUTION'
 const revokedWorker = { code: 'STUDIO_EXECUTION_INACTIVE', reason: 'Studio tool denied (STUDIO_EXECUTION_INACTIVE): Worker authorization was revoked.',
   needsOwnerDecision: false } as const
@@ -226,6 +226,7 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
   const projects = new StudioProjectControl(store, sessions, ready)
   if (binding && feishuSdk) channel = new StudioFeishuConversation(feishuSdk, binding, service.feishu, channelReady,
     message => ctx.logger.warn('%s', message), value => setup.receive(value))
+  if (channel) service.bindFeishuLookup(channel)
   // 仅密钥不可用不代表用户解绑，保留同一已发布 binding 的切换边界。
   store.studio.deactivateFeishu(binding ? feishuSourceScope(binding) : undefined)
 
@@ -277,9 +278,10 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
         finally { wake() }
       })
       try {
-        store.recordGuardInterception(execution.execution, refusal,
+        const result = store.recordGuardInterception(execution.execution, refusal,
           guardActionFingerprint(exec.name, exec.arguments, refusal.code), summarizeGuardAction(exec.name),
           sessions.taskOrigin(execution.execution.taskId), execution.evidence.result())
+        if (result.recorded) sessions.notifyForwardTask(execution.execution.taskId, !!result.pendingId)
       } catch { ctx.logger.warn('Studio could not persist the full Worker guard interception') }
     }
     return refusal
@@ -296,14 +298,14 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
     try {
       const record = store.studioSession(agent.id)
       const role = record?.role === 'worker' ? 'worker' : scopes.get(agent)?.role ?? inferred(agent)
-      if (!role && !record && !isStudioInternalSession(agent.id)) return undefined
+      if (!role && !record && !isStudioInternalSession(agent.id)) return studioTools.has(exec.name) ? denied : undefined
       if (role === 'worker') {
         const refusal = workerRefusal(agent, exec)
         return refusal ? workerGuardResult(refusal) : undefined
       }
       if (!role || exec.parent !== undefined || !ready(agent, role) || !sessions.canAsk(agent)) return denied
       if (exec.name === WORKER_READ || (role === 'assistant' && exec.name === LIST_PROJECTS)) return undefined
-      if (!sessions.isExistingTaskReply(agent) && (exec.name === WORKER_DELEGATE || (role === 'assistant' && exec.name === PROPOSE_PROJECT))) return undefined
+      if (!sessions.isExistingTaskReply(agent) && (exec.name === WORKER_DELEGATE || (role === 'assistant' && (exec.name === PROPOSE_PROJECT || exec.name === FORWARD_PROJECT)))) return undefined
       return denied
     } catch { return 'Studio tool denied: could not verify role or authorization' }
   }))
@@ -314,11 +316,15 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
   }
   toolEvents.on('tools/execute', async (exec, next) => {
     const { agent } = exec
+    if (exec.name === FORWARD_PROJECT && (!agent || exec.parent !== undefined || !ready(agent, 'assistant') || !sessions.canAsk(agent)
+      || sessions.isExistingTaskReply(agent))) throw new StudioError('EXPECTED_EXACT_OWNER_REQUEST', 'Studio forwarding requires the exact current Assistant owner request.')
     if (agent && revokedExecutions.has(agent)) throw new StudioError(revokedWorker.code, revokedWorker.reason)
     if (agent && (scopes.get(agent)?.role === 'worker' || inferred(agent) === 'worker' || assistant.workerAuthority(agent))) {
       const refusal = workerRefusal(agent, exec)
       if (refusal) throw new StudioError(refusal.code, refusal.reason)
       assistant.observeDispatch(exec)
+    } else if (agent && (scopes.get(agent)?.role === 'leader' || inferred(agent) === 'leader') && !sessions.activeLeader(agent)) {
+      throw new StudioError('STALE_LEADER', 'The current Leader binding changed.')
     }
     return next()
   })

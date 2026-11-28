@@ -2,7 +2,7 @@
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
 import { z } from 'zod'
 import { ASSISTANT_CONVERSATION, isStudioInternalSession, STUDIO_PAGE_SIZE, STUDIO_TEXT_LIMIT, type StudioArtifact, type StudioCheckResult, type StudioPage,
-  type StudioPending, type StudioProjectSummary, type StudioRecordRole, type StudioSessionRecord, type StudioTaskSummary } from './protocol.ts'
+  type StudioPending, type StudioProjectSummary, type StudioRecordRole, type StudioSessionRecord, type StudioTaskScope, type StudioTaskStatus, type StudioTaskSummary } from './protocol.ts'
 
 const at = (value: unknown) => typeof value === 'string' ? Date.parse(value) || 0 : 0
 const nullable = (value: unknown) => typeof value === 'string' ? value : null
@@ -20,8 +20,8 @@ function projectRow(row: Row): StudioProjectSummary {
     state: row.state === 'archived' ? 'archived' : 'active', managementEpoch: Number(row.management_epoch) }
 }
 
-export function studioProjects(db: DatabaseSync): StudioProjectSummary[] {
-  return db.prepare("SELECT * FROM studio_project WHERE state = 'active' ORDER BY name COLLATE NOCASE, project_id").all().map(projectRow)
+export function studioProjects(db: DatabaseSync, state: StudioProjectSummary['state'] = 'active'): StudioProjectSummary[] {
+  return db.prepare("SELECT * FROM studio_project WHERE state = ? ORDER BY name COLLATE NOCASE, project_id").all(state).map(projectRow)
 }
 
 export function studioProject(db: DatabaseSync, id: string): StudioProjectRoute | undefined {
@@ -75,7 +75,8 @@ export function studioRecords(db: DatabaseSync, query?: string, before?: number)
     AND (?2 IS NULL OR rowid < ?2) ORDER BY rowid DESC LIMIT ${STUDIO_PAGE_SIZE + 1}`).all({ '1': term, '2': before ?? null }), sessionRow)
 }
 
-const TASK_SELECT = `SELECT t.rowid AS cursor, t.*, e.session_id, e.result_event_seq FROM studio_task t
+const TASK_SELECT = `SELECT t.rowid AS cursor, t.*, p.name AS project_name, e.session_id, e.result_event_seq FROM studio_task t
+  LEFT JOIN studio_project p ON p.project_id = t.project_id
   LEFT JOIN studio_task_execution e ON e.task_id = t.task_id AND e.execution_epoch = (
     SELECT max(last.execution_epoch) FROM studio_task_execution last WHERE last.task_id = t.task_id)`
 
@@ -142,7 +143,9 @@ function taskRow(row: Row): StudioTaskSummary {
     return typeof artifact?.title === 'string' && typeof artifact.text === 'string' && typeof artifact.source?.sessionId === 'string'
       && Number.isSafeInteger(artifact.source.eventSeq)
   }) : []
-  return { taskId: String(row.task_id), projectId: nullable(row.project_id), sourceMessageId: nullable(row.source_message_id),
+  return { taskId: String(row.task_id), projectId: nullable(row.project_id), projectName: nullable(row.project_name),
+    conversationId: nullable(row.project_id) ?? ASSISTANT_CONVERSATION, sourceSessionId: nullable(row.source_session_id),
+    workerSessionId: nullable(row.session_id), sourceMessageId: nullable(row.source_message_id),
     requesterBotId: nullable(row.requester_bot_id), assigneeBotId: nullable(row.assignee_bot_id), workspacePath: nullable(row.workspace_path),
     permission: row.permission as StudioTaskSummary['permission'], authorizationVersion: Number(row.authorization_version),
     status: row.status as StudioTaskSummary['status'], title: String(row.title), requestText: String(row.request_text),
@@ -155,10 +158,16 @@ export function studioTask(db: DatabaseSync, id: string): StudioTaskSummary | un
   return row && taskRow(row)
 }
 
-export function studioTasks(db: DatabaseSync, room?: string, before?: number): StudioPage<StudioTaskSummary> {
+const activeStatuses = "('queued', 'running', 'waiting_approval', 'blocked')"
+export function studioTasks(db: DatabaseSync, room?: string, before?: number, scope: StudioTaskScope = 'all', status?: StudioTaskStatus): StudioPage<StudioTaskSummary> {
+  const scoped = scope === 'all' ? '' : `AND t.status ${scope === 'terminal' ? 'NOT ' : ''}IN ${activeStatuses}`
   return page(db.prepare(`${TASK_SELECT} WHERE (? = 0 OR t.project_id IS ?) AND (? IS NULL OR t.rowid < ?)
-    ORDER BY t.rowid DESC LIMIT ${STUDIO_PAGE_SIZE + 1}`)
-    .all(Number(room !== undefined), room === ASSISTANT_CONVERSATION ? null : room ?? null, before ?? null, before ?? null), taskRow)
+    AND (? IS NULL OR t.status = ?) ${scoped} ORDER BY t.rowid DESC LIMIT ${STUDIO_PAGE_SIZE + 1}`)
+    .all(Number(room !== undefined), room === ASSISTANT_CONVERSATION ? null : room ?? null, before ?? null, before ?? null, status ?? null, status ?? null), taskRow)
+}
+
+export const studioTaskStatusLabel: Record<StudioTaskStatus, string> = {
+  queued: '排队中', running: '执行中', waiting_approval: '等待确认', blocked: '受阻', interrupted: '已中断', cancelled: '已取消', delivered: '已交付',
 }
 
 /** 直接读取全部在途任务的摘要所需字段，不受历史任务列表分页的影响。 */

@@ -1,22 +1,32 @@
 /** Coordinate the owner-facing timeline, native sessions, and the verified private-chat transport. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { studioBlockTarget } from './domain.ts'
+import { studioBlockTarget, studioTaskStatusLabel } from './domain.ts'
 import type { ManagedWorkerStore } from '../managed-worker/store.ts'
+import type { StudioPreference as StoredPreference } from '../managed-worker/memory-store.ts'
+import type { ProjectChange } from '../managed-worker/project-store.ts'
+import { verifyWorkspaceIdentity, WorkspacePathError } from '../managed-worker/workspace.ts'
 import { confirmStudioModel, studioModelOptions } from './models.ts'
 import { StudioError } from './pending.ts'
-import { asksForActiveWork, asksForPending, asksForProjects, confirmationStatusQuery, namesConfirmation, readTextDecision, readRouteControl, readTaskUnblock,
+import { asksForActiveWork, asksForPending, asksForProjects, confirmationStatusQuery, namesConfirmation, readTextDecision, readRouteControl, readTaskUnblock, readWorkQuery,
   refersToThisConfirmation } from './owner-text.ts'
 import { ASSISTANT_CONVERSATION, GUARD_PENDING_CHOICES, GUARD_PENDING_PREFIX, GUARD_PENDING_TEXT_HINT, STUDIO_TEXT_LIMIT,
-  type FeishuState, type StudioMessage, type StudioPending, type StudioSend, type StudioSettings } from './protocol.ts'
+  type FeishuState, type StudioFeishuMessageStatus, type StudioForwardSummary, type StudioMessage, type StudioMessageStatus, type StudioPending,
+  type StudioPreference, type StudioProjectArchive, type StudioProjectCoordinate, type StudioProjectCreate, type StudioProjectSummary, type StudioSend, type StudioSettings } from './protocol.ts'
 import { StudioSessions } from './sessions.ts'
 import type { StudioFeishuInput, StudioFeishuPort } from './feishu.ts'
 import type { StudioHttpOperations } from './http.ts'
 import type { StudioConfigurationOp } from './settings-protocol.ts'
 
+type FeishuLookup = { scope: string; verifiedMessage(id: string, cutover: number, signal: AbortSignal): Promise<StudioFeishuInput> }
+const preferenceView = ({ prefKey, ...value }: StoredPreference): StudioPreference => ({ ...value, key: prefKey })
+const projectView = ({ id, name, objective, workspacePath, state, managementEpoch }: StudioProjectSummary): StudioProjectSummary =>
+  ({ id, name, objective, workspacePath, state, managementEpoch })
+
 /** Offer the same Assistant and pending state to the authorized Web and Feishu entry points. */
 export class StudioService {
   readonly sessions: StudioSessions
+  private feishuLookup?: FeishuLookup
 
   constructor(private readonly ctx: Context, private readonly domain: ManagedWorkerStore, cwd: string,
     defaults: Pick<StudioSettings, 'assistant' | 'leader'>, ready: (agent: Agent, role: 'assistant' | 'leader') => boolean,
@@ -27,13 +37,29 @@ export class StudioService {
 
   private get store() { return this.domain.studio }
 
-  private conversation(id: string): void {
-    if (id !== ASSISTANT_CONVERSATION && !this.domain.studioProject(id)) throw new StudioError('PROJECT_NOT_FOUND', 'This Studio project does not exist.', 404)
+  bindFeishuLookup(lookup: FeishuLookup): void { this.feishuLookup = lookup }
+
+  private project(id: string, state?: StudioProjectSummary['state'], expectedEpoch?: number) {
+    const project = this.domain.studioProject(id)
+    if (!project) throw new StudioError('PROJECT_NOT_FOUND', 'This Studio project does not exist.', 404)
+    if (expectedEpoch !== undefined && project.managementEpoch !== expectedEpoch) {
+      throw new StudioError('PROJECT_EPOCH_CONFLICT', 'Studio project state changed. Reload its management epoch.', 409)
+    }
+    if (state && project.state !== state) throw project.state === 'archived'
+      ? new StudioError('PROJECT_ARCHIVED', 'This project is archived. Reopen it before making changes.', 409)
+      : new StudioError('PROJECT_NOT_ARCHIVED', 'This Studio project is already active.', 409)
+    return project
   }
 
-  private send(input: StudioSend) {
-    this.conversation(input.conversationId)
-    if (this.domain.studioProject(input.conversationId)?.state === 'archived') throw new StudioError('PROJECT_ARCHIVED', 'This project is archived.', 409)
+  private conversation(id: string): void { if (id !== ASSISTANT_CONVERSATION) this.project(id) }
+
+  private async send(input: StudioSend, signal: AbortSignal) {
+    if (input.conversationId !== ASSISTANT_CONVERSATION) {
+      const project = this.project(input.conversationId, 'active')
+      if (!project.leaderSessionId || project.readonlyLegacy) await this.sessions.ensureProjectLeader(input.conversationId, signal)
+    }
+    signal.throwIfAborted()
+    if (input.conversationId !== ASSISTANT_CONVERSATION) this.project(input.conversationId, 'active')
     const { message, created } = this.store.addUser({ ...input, channel: 'gui' })
     if (created) {
       this.ownerInput(message, message.replyTo ? this.store.pendingItem(message.replyTo) : undefined)
@@ -60,8 +86,20 @@ export class StudioService {
         : 'Assistant 当前没有在处理的请求。')
       return
     }
+    const workQuery = readWorkQuery(text)
+    if (workQuery) { this.ownerWorkQuery(message, workQuery); return }
     const query = confirmationStatusQuery(text)
     if (query) { this.publishDecisions(message.id, query.target, direct); return }
+    // 精确任务 ID 的停止优先于回复卡片解释；它绝不选择当前对话中的其他执行。
+    const exactStop = readRouteControl(text)
+    if (exactStop?.kind === 'stop' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(exactStop.target.replace(/^[#＃]/u, ''))) {
+      const task = this.domain.task(exactStop.target.replace(/^[#＃]/u, ''))
+      if (!task || (message.conversationId !== ASSISTANT_CONVERSATION && message.conversationId !== task.projectId)) {
+        this.reply(message.id, '没有找到对应的任务。未停止任何工作。')
+      } else if (this.sessions.stopTask(task.taskId)) this.reply(message.id, `已停止任务 ${task.taskId}，其他任务不受影响。`)
+      else this.reply(message.id, '该任务不再运行，没有改变任何工作。')
+      return
+    }
     const decision = this.guardTextDecision(message, direct) ?? this.textDecision(message, direct)
     if (decision !== undefined) { this.reply(message.id, decision); return }
     const unblocking = readTaskUnblock(text)
@@ -78,7 +116,7 @@ export class StudioService {
       }
       return
     }
-    const control = readRouteControl(text)
+    const control = exactStop
     if (control) {
       const related = this.sessions.relatedWork(message)
       const target = control.target.replace(/^[#＃]/u, '')
@@ -103,6 +141,85 @@ export class StudioService {
   private reply(id: string, text: string): void {
     this.store.addReply(id, text)
     this.store.finishMessage(id, 'completed')
+  }
+
+  private intake(message: StudioMessage | undefined, forward?: StudioForwardSummary): StudioMessageStatus {
+    if (!message || message.role !== 'user') return { accepted: false, messageId: null, messageStatus: null, forward: null, tasks: [] }
+    forward ??= this.store.forwardByOrigin(message.id) ?? this.store.forwardByProjectMessage(message.id)
+    const destination = forward ? this.store.message(forward.projectId, forward.projectMessageId) : message
+    const task = destination && this.domain.taskForInput(destination)
+    return { accepted: true, messageId: message.id, messageStatus: message.status ?? null,
+      forward: forward ? { forwardId: forward.forwardId, projectId: forward.projectId, projectName: forward.projectName,
+        projectMessageId: forward.projectMessageId, status: forward.status } : null, tasks: task ? [task] : [] }
+  }
+
+  private intakeText(status: StudioMessageStatus): string {
+    if (!status.accepted) return 'Studio 尚未受理登记。若是当前飞书私聊的消息，可以用「补交消息 <飞书消息 ID>」手动补交。'
+    const stage = { registered: '排队中', running: '执行中', delegated: '已派发', delivered: '已交付', failed: '处理失败', interrupted: '已中断' } as const
+    const messageStage = { queued: '排队中', running: '执行中', completed: '对话已处理（不等于任务已交付）', failed: '处理失败', interrupted: '已中断' } as const
+    return [`已受理登记（${status.messageId}）${status.messageStatus ? ` · ${messageStage[status.messageStatus]}` : ''}`,
+      ...(status.forward ? [`项目「${status.forward.projectName}」 · ${stage[status.forward.status]}（${status.forward.forwardId}）`] : []),
+      ...status.tasks.map(task => `任务 ${task.taskId} · ${studioTaskStatusLabel[task.status]} · ${task.title}`)].join('\n')
+  }
+
+  private ownerWorkQuery(message: StudioMessage, query: NonNullable<ReturnType<typeof readWorkQuery>>): void {
+    const { kind, id } = query
+    if (kind === 'tasks') {
+      const room = message.conversationId === ASSISTANT_CONVERSATION ? undefined : message.conversationId
+      const tasks = this.domain.tasks(room).items.slice(0, 10)
+      this.reply(message.id, tasks.map(task => `${task.taskId} · ${studioTaskStatusLabel[task.status]} · ${task.title}`).join('\n') || '没有已登记的任务。')
+      return
+    }
+    if (kind === 'task') {
+      const task = id && this.domain.task(id)
+      this.reply(message.id, task && (message.conversationId === ASSISTANT_CONVERSATION || message.conversationId === task.projectId)
+        ? `任务 ${task.taskId} · ${studioTaskStatusLabel[task.status]} · ${task.title}` : '没有找到对应的任务。')
+      return
+    }
+    if (id && /^om_/u.test(id) && message.conversationId === ASSISTANT_CONVERSATION) {
+      void this.feishuStatus(id, kind === 'resubmit', this.stopping).then(status => {
+        if (!this.stopping.aborted) this.reply(message.id, this.intakeText(status))
+      }, error => {
+        if (!this.stopping.aborted) this.reply(message.id, error instanceof StudioError ? error.message : '未能确认飞书消息的受理状态。')
+      }).catch(() => { if (!this.stopping.aborted) this.ctx.logger.warn('Studio could not publish the Feishu intake query') }).finally(() => this.wake())
+      return
+    }
+    if (kind === 'resubmit') { this.reply(message.id, '请在 Assistant 指定精确的飞书消息 ID。'); return }
+    const { conversationId } = message
+    const course = id && this.store.forwardById(id)
+    if (course && (course.projectId === conversationId || conversationId === ASSISTANT_CONVERSATION)) {
+      const source = course.projectId === conversationId ? course.projectMessageId : course.originMessageId
+      this.reply(message.id, this.intakeText(this.intake(this.store.message(conversationId, source), course)))
+      return
+    }
+    let parent = id ?? message.replyTo
+    for (let depth = 0; parent && depth < 64; depth++) {
+      const input = this.store.message(conversationId, parent)
+      if (input?.role === 'user' && input.id !== message.id) { this.reply(message.id, this.intakeText(this.intake(input))); return }
+      parent = input?.replyTo
+    }
+    this.reply(message.id, '没有找到对应的已登记消息。请回复这条消息或指定消息 ID / 受理追踪号。')
+  }
+
+  private async feishuStatus(messageId: string, resubmit: boolean, request: AbortSignal): Promise<StudioFeishuMessageStatus> {
+    const signal = AbortSignal.any([request, this.stopping])
+    signal.throwIfAborted()
+    if (!/^om_[a-zA-Z0-9_-]{1,253}$/u.test(messageId)) throw new StudioError('INVALID_INPUT', 'Expected an exact Feishu message ID.')
+    const lookup = this.feishuLookup
+    if (!lookup) throw new StudioError('FEISHU_LOOKUP_UNAVAILABLE', 'Feishu message lookup requires a configured binding and credentials.', 503)
+    const cutover = this.store.feishuCutover(lookup.scope)
+    if (cutover === undefined) throw new StudioError('FEISHU_LOOKUP_UNAVAILABLE', 'No verified Feishu private chat binding is active.', 503)
+    const received = () => this.store.feishuInput(lookup.scope, messageId)
+    const prior = received()
+    if (prior) return { feishuMessageId: messageId, ...this.intake(prior) }
+    const source = await lookup.verifiedMessage(messageId, cutover, signal)
+    signal.throwIfAborted()
+    if (lookup !== this.feishuLookup || this.store.feishuCutover(lookup.scope) !== cutover || source.scope !== lookup.scope || source.id !== messageId) {
+      throw new StudioError('FEISHU_BINDING_CHANGED', 'The Feishu binding changed. No message was submitted.', 409)
+    }
+    // 长连接或并行补交可能已登记同一消息；先读当前状态，再复用正式入站路径及幂等键。
+    if (resubmit && !received()) await this.receiveFeishu(source, signal, true)
+    return { feishuMessageId: messageId, ...this.intake(received()) }
   }
 
   private decisionsNamed(target: string): StudioPending[] {
@@ -215,6 +332,7 @@ export class StudioService {
       throw new StudioError('BLOCK_NOT_CURRENT', 'The blocking condition is no longer current.', 409)
     }
     this.sessions.terminateInvalidated([target.taskId])
+    this.sessions.notifyForwardTask(target.taskId)
     const settled = this.store.settlePending(id, 'resolved', value.trim(), channel)
     this.wake()
     return settled ?? item
@@ -240,10 +358,39 @@ export class StudioService {
     return this.scoped(this.store.saveSettings(input))
   }
 
+  private async createProject(input: StudioProjectCreate, signal: AbortSignal): Promise<StudioProjectSummary> {
+    const workspace = input.workspacePath === undefined ? null : this.domain.projects.workspaceBinding(input.workspacePath)
+    const leaderSessionId = await this.sessions.prepareLeader(signal)
+    if (workspace && !verifyWorkspaceIdentity(workspace.root, workspace)) {
+      throw new WorkspacePathError('STUDIO_WORKSPACE_INVALID', 'The workspace changed while preparing the project. No project was created.')
+    }
+    return projectView(this.domain.projects.create({ ...input, workspacePath: workspace?.root ?? null, leaderSessionId }))
+  }
+
+  private changedProject(change: ProjectChange): StudioProjectSummary { this.sessions.projectChanged(change); return projectView(change.project) }
+
+  private async bindLeader({ projectId, expectedEpoch }: StudioProjectCoordinate, reopen: boolean, signal: AbortSignal) {
+    this.project(projectId, reopen ? 'archived' : 'active', expectedEpoch)
+    const id = await this.sessions.prepareLeader(signal)
+    return this.changedProject(reopen ? this.domain.projects.reopen(projectId, expectedEpoch, id)
+      : this.domain.projects.replaceLeader(projectId, expectedEpoch, id))
+  }
+
+  private projectArchive(projectId: string): StudioProjectArchive {
+    const project = this.project(projectId)
+    return { projectId, decisions: '', progress: '', openIssues: '', updatedAt: null, ...this.domain.projectArchive.get(projectId),
+      readonly: project.state === 'archived' }
+  }
+
+  private preferenceResult(item: StoredPreference | undefined): StudioPreference {
+    if (!item) throw new StudioError('PREFERENCE_CONFLICT', 'This preference changed or was forgotten. Reload before making changes.', 409)
+    return preferenceView(item)
+  }
+
   readonly operations: Omit<StudioHttpOperations, StudioConfigurationOp> = {
     state: () => {
       this.refreshBlockers()
-      return { projects: this.domain.studioProjects(), pendingCount: this.store.pendingCount(), settings: this.scoped(this.sessions.settings),
+      return { projects: this.domain.studioProjects(), archivedProjects: this.domain.studioProjects('archived'), pendingCount: this.store.pendingCount(), settings: this.scoped(this.sessions.settings),
         feishu: this.feishuState(), hiddenSessionIds: this.domain.studioHiddenIds() }
     },
     models: (_input, signal) => studioModelOptions(this.ctx, AbortSignal.any([signal, this.stopping])),
@@ -259,10 +406,45 @@ export class StudioService {
       if (!message) throw new StudioError('MESSAGE_NOT_FOUND', 'Studio message not found.', 404)
       return message
     },
-    send: input => this.send(input),
-    tasks: ({ conversationId, before }) => {
+    send: (input, signal) => this.send(input, signal),
+    messageStatus: ({ conversationId, id }) => {
+      this.conversation(conversationId)
+      const message = this.store.message(conversationId, id)
+      if (!message || message.role !== 'user') throw new StudioError('MESSAGE_NOT_FOUND', 'Studio owner message not found.', 404)
+      return this.intake(message)
+    },
+    feishuMessageStatus: ({ messageId }, signal) => this.feishuStatus(messageId, false, signal),
+    resubmitFeishuMessage: ({ messageId }, signal) => this.feishuStatus(messageId, true, signal),
+    createProject: (input, signal) => this.createProject(input, signal),
+    updateProject: ({ projectId, expectedEpoch, ...changes }) => this.changedProject(this.domain.projects.update(projectId, expectedEpoch, changes)),
+    replaceProjectLeader: (input, signal) => this.bindLeader(input, false, signal),
+    archiveProject: ({ projectId, expectedEpoch }) => this.changedProject(this.domain.projects.archive(projectId, expectedEpoch)),
+    reopenProject: (input, signal) => this.bindLeader(input, true, signal),
+    projectArchive: ({ projectId }) => this.projectArchive(projectId),
+    updateProjectArchive: ({ projectId, ...fields }) => {
+      this.project(projectId, 'active')
+      return { ...this.domain.projectArchive.update(projectId, fields), readonly: false }
+    },
+    preferences: ({ projectId }) => {
+      if (projectId !== undefined) this.project(projectId)
+      return this.domain.memory.list(projectId).map(preferenceView)
+    },
+    savePreference: ({ projectId, key, text }) => {
+      if (projectId !== undefined) this.project(projectId, 'active')
+      if (this.domain.memory.get(key, projectId)) return this.preferenceResult(undefined)
+      return preferenceView(this.domain.memory.save(key, text, projectId))
+    },
+    updatePreference: ({ projectId, key, expectedVersion, text }) => {
+      if (projectId !== undefined) this.project(projectId, 'active')
+      return this.preferenceResult(this.domain.memory.update(key, expectedVersion, text, projectId))
+    },
+    forgetPreference: ({ projectId, key, expectedVersion }) => {
+      if (projectId !== undefined) this.project(projectId, 'active')
+      return this.preferenceResult(this.domain.memory.forget(key, expectedVersion, projectId))
+    },
+    tasks: ({ conversationId, before, scope, status }) => {
       if (conversationId !== undefined) this.conversation(conversationId)
-      return this.domain.tasks(conversationId, before)
+      return this.domain.tasks(conversationId, before, scope, status)
     },
     task: ({ taskId }) => this.task(taskId),
     stopTask: ({ taskId }) => {
@@ -292,7 +474,7 @@ export class StudioService {
     catch (error) { if (error instanceof StudioError) return false; throw error }
   }
 
-  private receiveFeishu(input: StudioFeishuInput, signal: AbortSignal): Promise<void> {
+  private receiveFeishu(input: StudioFeishuInput, signal: AbortSignal, recovered = false): Promise<void> {
     signal.throwIfAborted()
     // A callback must point to the exact bound conversation/card; old-history replies are never new assignments.
     const anchors = [...new Set([input.parentId, input.rootId].filter((id): id is string => !!id))]
@@ -301,6 +483,9 @@ export class StudioService {
     const conversationId = ASSISTANT_CONVERSATION
     const parent = anchors.map(id => this.store.feishuMessage(input.scope, id)).find(value => value !== undefined)
       ?? (input.threadId ? this.store.feishuThread(input.scope, input.threadId) : undefined)
+    if (recovered && (item || readRouteControl(input.text) || readWorkQuery(input.text) || readTaskUnblock(input.text) || readTextDecision(input.text))) {
+      throw new StudioError('FEISHU_RECOVERY_CONTROL_UNSUPPORTED', 'Manual submission is only for task or conversation messages. Send a new control or confirmation instead.', 409)
+    }
     if (item?.kind === 'question' && item.conversationId !== conversationId) {
       // 兼容既有的问题卡片；项目消息不加入 Assistant 的时间线。
       if (item.mobile === 'topic' && item.state === 'pending') {
@@ -309,7 +494,10 @@ export class StudioService {
       }
       return Promise.resolve()
     }
-    if ((anchors.length || input.threadId) && !item && !parent) return Promise.resolve()
+    if ((anchors.length || input.threadId) && !item && !parent) {
+      if (recovered) throw new StudioError('FEISHU_MESSAGE_CONTEXT_UNKNOWN', 'The original reply context was not registered. Send a new standalone message.', 409)
+      return Promise.resolve()
+    }
     const replyTo = item?.conversationId === conversationId
       ? (item.kind === 'confirmation' && this.store.message(conversationId, item.id) ? item.id : item.messageId) ?? parent?.id
       : parent?.id

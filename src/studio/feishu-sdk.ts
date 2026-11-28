@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { Agent } from 'node:https'
 import { setTimeout as delay } from 'node:timers/promises'
+import { StudioError } from './pending.ts'
 import { AppType, Client, DefaultCache, Domain, EventDispatcher, LoggerLevel, WSClient, defaultHttpInstance, type HttpInstance } from '@larksuiteoapi/node-sdk'
 
 const REQUEST_TIMEOUT_MS = 15_000
@@ -90,6 +91,20 @@ export class StudioFeishuSdk {
     const id = result?.bot?.open_id
     if (result?.code !== 0 || typeof id !== 'string' || !openIdPattern.test(id)) throw new Error(failure)
     return id
+  }
+
+  /** 只读查询指定消息 ID；调用方按已验证的私聊、所有者和绑定分界继续核验。 */
+  async getMessage(messageId: string, signal: AbortSignal) {
+    if (!messageIdPattern.test(messageId)) throw new StudioError('INVALID_INPUT', 'Expected an exact Feishu message ID.')
+    const messages = this.#client.im?.v1?.message
+    if (typeof messages?.get !== 'function') throw new StudioError('FEISHU_LOOKUP_UNAVAILABLE', 'This Feishu SDK cannot look up an exact message.', 503)
+    const failure = 'Feishu did not confirm the exact message. Check the ID and the application message-read scope.'
+    try {
+      const result = await this.rest(signal, failure, () => messages.get({ path: { message_id: messageId }, params: { user_id_type: 'open_id' } }))
+      const items = result?.data?.items
+      if (result?.code === 0 && items?.length === 1 && items[0]?.message_id === messageId) return items[0]
+    } catch { signal.throwIfAborted() }
+    throw new StudioError('FEISHU_MESSAGE_UNVERIFIED', failure, 422)
   }
 
   /** Own one connection attempt. Report handshake success, then let the caller reverify before retrying a disconnect. */

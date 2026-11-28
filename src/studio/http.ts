@@ -3,16 +3,25 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
-import { STUDIO_API, STUDIO_HEADER, STUDIO_TEXT_LIMIT, type StudioInput, type StudioOp, type StudioResult } from './protocol.ts'
+import { STUDIO_API, STUDIO_HEADER, STUDIO_TASK_STATUSES, STUDIO_TEXT_LIMIT, type StudioInput, type StudioOp, type StudioResult } from './protocol.ts'
 import { StudioError } from './pending.ts'
 import { configurationChange, feishuCheck } from './settings-schema.ts'
 import { StudioStoreError } from './store.ts'
+import { PROJECT_NAME_LIMIT } from '../managed-worker/project-store.ts'
+import { WorkspacePathError } from '../managed-worker/workspace.ts'
 
 // IDs are opaque but bounded; text is kept verbatim so native owner evidence can check exact excerpts.
 const id = z.string().min(1).max(256).refine(value => value.isWellFormed() && !/[\s\0]/u.test(value))
-const text = (max: number) => z.string().min(1).max(max).refine(value => value.isWellFormed() && !value.includes('\0') && !!value.trim())
+const validText = (max: number) => z.string().max(max).refine(value => value.isWellFormed() && !value.includes('\0'))
+const text = (max: number) => validText(max).refine(value => !!value.trim())
 const coord = z.int().nonnegative()
 const model = z.strictObject({ provider: id, model: id, reasoningEffort: id.exactOptional() })
+const projectCoordinate = { projectId: id, expectedEpoch: coord.positive() }
+const projectFields = { name: text(PROJECT_NAME_LIMIT), objective: text(2_000), workspacePath: text(4_096) }
+const preferenceScope = { projectId: id.exactOptional() }
+const preference = { ...preferenceScope, key: z.string().regex(/^[a-z][a-z0-9-]{0,63}$/u) }
+const version = { expectedVersion: coord.positive() }
+const feishuMessage = z.strictObject({ messageId: z.string().max(256).regex(/^om_[a-zA-Z0-9_-]+$/u) })
 const schemas = {
   state: z.strictObject({}),
   models: z.strictObject({}),
@@ -23,7 +32,23 @@ const schemas = {
   timeline: z.strictObject({ conversationId: id, topicId: id.exactOptional(), before: coord.positive().exactOptional() }),
   message: z.strictObject({ conversationId: id, id }),
   send: z.strictObject({ conversationId: id, requestId: id, text: text(STUDIO_TEXT_LIMIT), replyTo: id.exactOptional(), quoteId: id.exactOptional() }),
-  tasks: z.strictObject({ conversationId: id.exactOptional(), before: coord.positive().exactOptional() }),
+  messageStatus: z.strictObject({ conversationId: id, id }),
+  feishuMessageStatus: feishuMessage,
+  resubmitFeishuMessage: feishuMessage,
+  createProject: z.strictObject({ ...projectFields, workspacePath: projectFields.workspacePath.exactOptional() }),
+  updateProject: z.strictObject({ ...projectCoordinate, name: projectFields.name.exactOptional(), objective: projectFields.objective.exactOptional(),
+    workspacePath: projectFields.workspacePath.nullable().exactOptional() }),
+  replaceProjectLeader: z.strictObject(projectCoordinate),
+  archiveProject: z.strictObject(projectCoordinate),
+  reopenProject: z.strictObject(projectCoordinate),
+  projectArchive: z.strictObject({ projectId: id }),
+  updateProjectArchive: z.strictObject({ projectId: id, decisions: validText(8_000).exactOptional(), progress: validText(8_000).exactOptional(), openIssues: validText(8_000).exactOptional() }),
+  preferences: z.strictObject(preferenceScope),
+  savePreference: z.strictObject({ ...preference, text: text(4_000) }),
+  updatePreference: z.strictObject({ ...preference, ...version, text: text(4_000) }),
+  forgetPreference: z.strictObject({ ...preference, ...version }),
+  tasks: z.strictObject({ conversationId: id.exactOptional(), scope: z.enum(['all', 'active', 'terminal']).exactOptional(),
+    status: z.enum(STUDIO_TASK_STATUSES).exactOptional(), before: coord.positive().exactOptional() }),
   task: z.strictObject({ taskId: id }),
   stopTask: z.strictObject({ taskId: id }),
   pending: z.strictObject({ before: coord.positive().exactOptional() }),
@@ -90,6 +115,7 @@ export function registerStudioHttp(ctx: Context, connection: BrowserConnection, 
     } catch (error) {
       if (abort.signal.aborted) return
       if (error instanceof StudioError) send(response, error.status, { error: error.message, code: error.code })
+      else if (error instanceof WorkspacePathError) send(response, 400, { error: error.message, code: error.code })
       else if (error instanceof StudioStoreError) {
         const status = error.code === 'REPLY_PARENT_NOT_FOUND' || error.code === 'QUOTE_NOT_FOUND' ? 404 : 409
         send(response, status, { error: error.message, code: error.code })

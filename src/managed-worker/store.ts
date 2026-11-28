@@ -3,11 +3,11 @@ import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, realpathSync } fr
 import { dirname, resolve } from 'node:path'
 import { backup, DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { studioActiveTasks, studioArtifacts, studioBlockingItems, studioDeliverySummary, studioHiddenIds, studioPendingRecord, studioProject, studioProjects,
-  studioSession, studioTask, studioTasks } from '../studio/domain.ts'
+  studioSession, studioTask, studioTasks, studioTaskStatusLabel } from '../studio/domain.ts'
 import { ASSISTANT_CONVERSATION, GUARD_PENDING_CHOICES, GUARD_PENDING_PREFIX, type StudioCheckResult, type StudioPending, type StudioRecordRole,
-  type StudioRole, type StudioTaskStatus, type StudioWorkerPermission } from '../studio/protocol.ts'
+  type StudioMessage, type StudioProjectSummary, type StudioRole, type StudioTaskScope, type StudioTaskStatus, type StudioWorkerPermission } from '../studio/protocol.ts'
 import { STUDIO_OWNER_PREFIX } from '../studio/source.ts'
-import { STUDIO_SCHEMA, StudioStore } from '../studio/store.ts'
+import { TASK_WRITE_PENDING_PREFIX, STUDIO_SCHEMA, STUDIO_FORWARD_SCHEMA, StudioStore } from '../studio/store.ts'
 import { MemoryStore } from './memory-store.ts'
 import { ProjectArchiveStore } from './project-archive-store.ts'
 import { ProjectStore } from './project-store.ts'
@@ -72,6 +72,8 @@ const V1_TABLES = [
   'agent_studio_assistant', 'agent_studio_settings', 'agent_studio_message', 'agent_studio_parallel_turn', 'agent_studio_route_control',
   'agent_studio_session', 'agent_studio_pending', 'agent_studio_feishu_binding', 'agent_studio_feishu_outbox',
 ] as const
+
+const V2_TABLES = ['studio_project_forward', 'studio_project_forward_notice'] as const
 
 const MIGRATED_AT = new Date(0).toISOString()
 export const studioNow = () => new Date().toISOString()
@@ -279,11 +281,25 @@ function migrateV1(db: DatabaseSync): void {
         BEGIN SELECT RAISE(ABORT, 'Legacy Studio snapshot is read-only'); END`)
     }
   }
-  // 旧快照可能缺少父表；只校验 V1 继续读写的表，且在标记迁移成功前检查完整的现役图。
-  for (const table of V1_TABLES) {
-    if (db.prepare(`PRAGMA foreign_key_check(${quote(table)})`).get()) throw new Error(`Studio V1 migration failed foreign key validation: ${table}`)
+  validateForeignKeys(db, V1_TABLES, 1)
+}
+
+/** V0 和 V1 共用同一次提交；只校验现役图，旧快照允许保留已知的不完整外键。 */
+function migrateV2(db: DatabaseSync): void {
+  db.exec(`ALTER TABLE studio_task ADD COLUMN source_session_id TEXT;
+    ${STUDIO_FORWARD_SCHEMA}`)
+  db.prepare(`UPDATE studio_task AS t SET source_session_id = (
+    SELECT coalesce(m.source_session_id, m.run_session_id) FROM agent_studio_message m
+    WHERE m.id = substr(t.source_message_id, ?) AND m.role = 'user' AND m.conversation_id = coalesce(t.project_id, 'assistant'))
+    WHERE substr(t.source_message_id, 1, ?) = ?`).run(STUDIO_OWNER_PREFIX.length + 1, STUDIO_OWNER_PREFIX.length, STUDIO_OWNER_PREFIX)
+  validateForeignKeys(db, [...V1_TABLES, ...V2_TABLES], 2)
+  db.exec('PRAGMA user_version=2')
+}
+
+function validateForeignKeys(db: DatabaseSync, tables: readonly string[], version: number): void {
+  for (const table of tables) {
+    if (db.prepare(`PRAGMA foreign_key_check(${quote(table)})`).get()) throw new Error(`Studio V${version} migration failed foreign key validation: ${table}`)
   }
-  db.exec('PRAGMA user_version=1')
 }
 
 function privateFile(path: string, create: boolean): void {
@@ -300,6 +316,7 @@ export interface StudioTaskInput {
   workspacePath: string | null; permission: StudioWorkerPermission; requestText: string; title?: string
   /** 项目派工必须在登记事务内再次核验当时的 Leader。 */
   leader?: { sessionId: string; managementEpoch: number }
+  sourceSessionId?: string
 }
 export interface StudioExecution {
   taskId: string; executionEpoch: number; authorizationVersion: number; sessionId: string; runId: string; managementEpoch: number | null
@@ -342,14 +359,16 @@ export class ManagedWorkerStore {
       // 未知版本在写入数据库前即拒绝；锁内再检查一次，避免并发打开重复执行迁移。
       const checkVersion = () => {
         const version = db.prepare('PRAGMA user_version').get()?.user_version
-        if (version !== 0 && version !== 1) throw new Error(`Unsupported Studio SQLite user_version: ${String(version)}`)
+        if (version !== 0 && version !== 1 && version !== 2) throw new Error(`Unsupported Studio SQLite user_version: ${String(version)}`)
         return version
       }
       checkVersion()
       if (db.prepare('PRAGMA journal_mode=WAL').get()?.journal_mode !== 'wal') throw new Error('Cannot enable Studio WAL')
       db.exec('PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON')
       const started = this.#transaction(() => {
-        if (checkVersion() === 0) migrateV1(db)
+        const version = checkVersion()
+        if (version === 0) migrateV1(db)
+        if (version < 2) migrateV2(db)
         const now = studioNow()
         const recovered = this.#interruptAll(now, 'host-restarted')
         db.prepare(`INSERT INTO studio_host_run VALUES (1, ?, 0)
@@ -362,7 +381,8 @@ export class ManagedWorkerStore {
       this.assistantBotId = started.bot
       this.recoveredTasks = started.recovered
       const access = { db, write: <T>(fn: () => T) => this.write(fn), assertActive: () => this.assertActive(),
-        expireGuardInterceptionsInTx: (taskId: string) => this.studio.expireGuardInterceptionsInTx(taskId) }
+        expireTaskConfirmationsInTx: (taskId: string) => this.studio.expireTaskConfirmationsInTx(taskId),
+        interruptProjectInTx: (projectId: string, epoch: number) => this.studio.interruptProjectInTx(projectId, epoch) }
       this.studio = new StudioStore(db, access.assertActive, true)
       this.projects = new ProjectStore(access, this.protectedRoots)
       this.memory = new MemoryStore(access)
@@ -399,11 +419,19 @@ export class ManagedWorkerStore {
     return Number(changes)
   }
 
+  /** 停机时同时结算任务账本和写入确认；重启仍不重放未交付的请求。 */
+  #expireWriteConfirmations() {
+    const ids = this.#db.prepare(`SELECT id FROM agent_studio_pending WHERE state = 'pending' AND substr(id, 1, ?) = ?`)
+      .all(TASK_WRITE_PENDING_PREFIX.length, TASK_WRITE_PENDING_PREFIX)
+    for (const { id } of ids) this.studio.settleTaskPendingInTx(String(id), 'expired')
+  }
+
   /** 宿主先撤销活动执行，再通知原生执行结束。 */
   interruptActiveTasks(): number {
     return this.write(() => {
       const changed = this.#interruptAll(studioNow(), 'host-stopped')
       this.studio.expireGuardInterceptionsInTx()
+      this.#expireWriteConfirmations()
       return changed
     })
   }
@@ -414,6 +442,7 @@ export class ManagedWorkerStore {
     this.write(() => {
       this.#interruptAll(studioNow(), 'host-stopped')
       this.studio.expireGuardInterceptionsInTx()
+      this.#expireWriteConfirmations()
       this.#db.prepare('UPDATE studio_host_run SET clean = 1 WHERE singleton = 1 AND run_id = ?').run(this.#runId)
     })
   }
@@ -442,7 +471,7 @@ export class ManagedWorkerStore {
     return this.#db.prepare('SELECT role FROM studio_session WHERE session_id = ?').get(id)?.role === 'legacy-protected'
   }
 
-  studioProjects() { return studioProjects(this.#db) }
+  studioProjects(state?: StudioProjectSummary['state']) { return studioProjects(this.#db, state) }
   studioProject(id: string) { return studioProject(this.#db, id) }
   studioHiddenIds() { return studioHiddenIds(this.#db) }
   studioSession(id: string) { return studioSession(this.#db, id) }
@@ -450,7 +479,7 @@ export class ManagedWorkerStore {
   studioBlockingItems() { return studioBlockingItems(this.#db) }
   studioPendingRecord(id: string) { return studioPendingRecord(this.#db, id) }
   task(taskId: string) { return studioTask(this.#db, taskId) }
-  tasks(room?: string, before?: number) { return studioTasks(this.#db, room, before) }
+  tasks(room?: string, before?: number, scope?: StudioTaskScope, status?: StudioTaskStatus) { return studioTasks(this.#db, room, before, scope, status) }
   studioActiveTasks() { return studioActiveTasks(this.#db) }
   taskFromMessage(room: string, requestId: string, sourceMessageId: string) {
     const project = room === ASSISTANT_CONVERSATION ? null : room
@@ -459,7 +488,7 @@ export class ManagedWorkerStore {
     return typeof row?.task_id === 'string' ? this.task(row.task_id) : undefined
   }
 
-  registerTask(input: StudioTaskInput): { taskId: string; created: boolean } {
+  registerTask(input: StudioTaskInput, confirmation?: Omit<StudioPending, 'id' | 'taskId'>): { taskId: string; created: boolean } {
     return this.write(() => {
       if (input.projectId !== null) {
         const current = this.projects.currentLeader(input.leader?.sessionId ?? '')
@@ -477,11 +506,65 @@ export class ManagedWorkerStore {
       if (workspace === null && input.permission === 'workspace-write') throw new Error('Studio write tasks require a bound workspace')
       const taskId = randomUUID(), at = studioNow()
       this.#db.prepare(`INSERT INTO studio_task (task_id, project_id, source_message_id, request_key, requester_bot_id, workspace_path,
-        permission, status, title, request_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`)
+        permission, status, title, request_text, created_at, updated_at, source_session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(taskId, input.projectId, input.sourceMessageId, key, input.requesterBotId, workspace,
-          input.permission, input.title ?? input.requestText.slice(0, 120).toWellFormed(), input.requestText, at, at)
+          input.permission, confirmation ? 'waiting_approval' : 'queued', input.title ?? input.requestText.slice(0, 120).toWellFormed(),
+          input.requestText, at, at, input.sourceSessionId ?? input.leader?.sessionId ?? null)
+      if (input.projectId !== null) this.#db.prepare(`UPDATE studio_project_forward SET status = 'delegated'
+        WHERE project_message_id = ? AND project_id = ? AND management_epoch = ? AND status = 'running'`)
+        .run(input.requestId, input.projectId, input.leader?.managementEpoch ?? null)
+      if (confirmation) {
+        this.studio.addPendingInTx({ ...confirmation, id: `${TASK_WRITE_PENDING_PREFIX}${taskId}`, taskId })
+        this.#notifyForwardTaskInTx(taskId, true)
+      }
       return { taskId, created: true }
     })
+  }
+
+  /** 把当前确认与账本状态一起结算；任何晚到的答案都不能恢复已撤销的任务。 */
+  decideTaskWrite(id: string, value: string, channel: 'gui' | 'feishu'): StudioPending | undefined {
+    return this.write(() => {
+      const item = this.studio.pendingItem(id)
+      if (!id.startsWith(TASK_WRITE_PENDING_PREFIX) || item?.state !== 'pending' || !item.taskId || !item.options.includes(value)) return
+      const approved = value === item.options[0]
+      const changed = this.#db.prepare(`UPDATE studio_task SET status = ?, authorization_version = authorization_version + 1, updated_at = ?
+        WHERE task_id = ? AND permission = 'workspace-write' AND status = 'waiting_approval' AND authorization_version = 1`)
+        .run(approved ? 'queued' : 'cancelled', studioNow(), item.taskId)
+      if (!changed.changes) return
+      const settled = this.studio.settleTaskPendingInTx(id, 'resolved', value, channel)
+      if (!settled) throw new Error('Studio write decision lost its pending item')
+      if (!approved) this.#notifyForwardTaskInTx(item.taskId)
+      return settled
+    })
+  }
+
+  /** 用关联的真实 Studio 消息读取任务，不接受前端推测的 Session 或任务坐标。 */
+  taskForInput(message: StudioMessage) { return this.taskFromMessage(message.conversationId, message.id, STUDIO_OWNER_PREFIX + message.id) }
+
+  /** 按转发及任务阶段去重，与账本的原入口及其话题关联。 */
+  notifyForwardTask(taskId: string, skipFeishu = false): boolean {
+    return this.write(() => this.#notifyForwardTaskInTx(taskId, skipFeishu))
+  }
+
+  #notifyForwardTaskInTx(taskId: string, skipFeishu = false): boolean {
+    const task = this.task(taskId)
+    if (!task?.projectId || !task.sourceMessageId?.startsWith(STUDIO_OWNER_PREFIX)
+      || task.status === 'queued' || task.status === 'running') return false
+    const projectMessageId = task.sourceMessageId.slice(STUDIO_OWNER_PREFIX.length)
+    const route = this.studio.forwardByProjectMessage(projectMessageId)
+    if (!route || route.projectId !== task.projectId) return false
+    const status = task.status === 'delivered' ? 'delivered' : task.status === 'interrupted' || task.status === 'cancelled' ? 'interrupted' : 'delegated'
+    const evidence = task.checkResult
+    const detail = task.resultSummary ?? (typeof evidence === 'string' ? evidence : null)
+    // 只回传摘要，完整 Worker 正文、命令输出和原生日志仍通过任务详情查看。
+    const summary = evidence && typeof evidence === 'object'
+      ? `改动 ${evidence.changedFiles.length + (evidence.omittedChangedFiles ?? 0)} 项；检查 ${evidence.checks.length + (evidence.omittedChecks ?? 0)} 项（${evidence.overallCheckStatus}）。`
+        + (task.status === 'delivered' && detail?.includes('Worker 正文（不作为宿主证据）：\n')
+          ? `\n${detail.split('Worker 正文（不作为宿主证据）：\n', 2)[1]?.slice(0, 850).toWellFormed() ?? ''}` : '')
+      : detail?.slice(0, 1_000).toWellFormed()
+    return this.studio.forwardNoticeInTx(route, `${task.taskId}:${task.status}:${task.authorizationVersion}`,
+      `项目「${route.projectName}」｜受理 ${route.forwardId}｜任务 ${task.taskId}：${studioTaskStatusLabel[task.status]}。${summary ? `\n${summary}` : ''}`,
+      status, skipFeishu)
   }
 
   beginExecution(taskId: string, sessionId: string, managementEpoch: number | null, modelRoute: object): StudioExecution | undefined {
@@ -527,6 +610,7 @@ export class ManagedWorkerStore {
         .run(result ? 'delivered' : 'interrupted', summary, checkResult ? JSON.stringify(checkResult) : null, at, execution.taskId)
       db.prepare(`UPDATE studio_task_execution SET ended_at = ?, result_event_seq = ?, outcome = ? WHERE task_id = ? AND execution_epoch = ?`)
         .run(at, result?.eventSeq ?? null, outcome, execution.taskId, execution.executionEpoch)
+      this.#notifyForwardTaskInTx(task.taskId)
       return true
     })
   }
@@ -560,7 +644,7 @@ export class ManagedWorkerStore {
       const id = `${prefix}${shortHash}`
       const count = db.prepare(`SELECT count(*) AS count FROM agent_studio_pending WHERE task_id = ? AND substr(id, 1, ?) = ?`)
         .get(task.taskId, prefix.length, prefix)?.count
-      if (this.studio.pendingItem(id) || Number(count) >= GUARD_PENDING_LIMIT) return
+      if (this.studio.pendingItem(id) || Number(count) >= GUARD_PENDING_LIMIT) { this.#notifyForwardTaskInTx(task.taskId); return }
       const conversationId = task.projectId ?? ASSISTANT_CONVERSATION
       const savedMessageId = task.sourceMessageId?.startsWith(STUDIO_OWNER_PREFIX) ? task.sourceMessageId.slice(STUDIO_OWNER_PREFIX.length) : undefined
       const requestedMessageId = source?.conversationId === conversationId ? source.messageId : undefined
@@ -572,6 +656,7 @@ export class ManagedWorkerStore {
         requester: 'Agent Studio', title: `Worker 操作已拦截（${denial.code}）`,
         detail: `原因：${denial.reason}\n动作：${actionSummary.slice(0, 240).toWellFormed()}\n旧执行已撤权。解除等待不会重放该动作；如需继续，请另发合规范围的新请求。`,
         options: [...GUARD_PENDING_CHOICES], acceptsText: false, mobile: 'card', state: 'pending', createdAt: Date.now() })
+      this.#notifyForwardTaskInTx(task.taskId, true)
       return id
     })
     return { recorded: true, ...(pendingId && { pendingId }) }
@@ -592,6 +677,7 @@ export class ManagedWorkerStore {
       if (!changed.changes) return
       const settled = this.studio.settleTaskPendingInTx(id, 'resolved', value, channel)
       if (!settled) throw new Error('Studio guard decision lost its pending item')
+      this.#notifyForwardTaskInTx(target.taskId)
       return settled
     })
   }
@@ -605,6 +691,7 @@ export class ManagedWorkerStore {
         AND status IN ('queued', 'running', 'waiting_approval')`).run(detail, at, taskId, expectedVersion)
       if (!changes) return false
       this.#db.prepare("UPDATE studio_task_execution SET ended_at = ?, outcome = 'blocked' WHERE task_id = ? AND ended_at IS NULL").run(at, taskId)
+      this.#notifyForwardTaskInTx(taskId)
       return true
     })
   }
@@ -622,7 +709,8 @@ export class ManagedWorkerStore {
         .run(status, at, evidence ? JSON.stringify(evidence) : null, taskId, expectedVersion ?? null, expectedVersion ?? null)
       if (!changed.changes) return false
       db.prepare('UPDATE studio_task_execution SET ended_at = ?, outcome = ? WHERE task_id = ? AND ended_at IS NULL').run(at, status, taskId)
-      this.studio.expireGuardInterceptionsInTx(taskId)
+      this.studio.expireTaskConfirmationsInTx(taskId)
+      this.#notifyForwardTaskInTx(taskId)
       return true
     })
   }
@@ -632,5 +720,6 @@ export interface StudioStoreAccess {
   db: DatabaseSync
   write<T>(operation: () => T): T
   assertActive(): void
-  expireGuardInterceptionsInTx(taskId: string): void
+  expireTaskConfirmationsInTx(taskId: string): void
+  interruptProjectInTx(projectId: string, epoch: number): void
 }

@@ -22,6 +22,20 @@ export function projectText(project: StudioProjectRoute): string {
     + `\nWorkspace: ${project.workspacePath ?? 'not set'}\nLeader Bot: ${project.leaderBotId ?? 'not assigned'}`
 }
 
+/** 轮次绑定的是项目及管理版本，当前 Session 即使在改绑后被继续使用也不是旧轮次的授权。 */
+export function leaderEpochCurrent(project: StudioProjectRoute | undefined, expected: Pick<StudioProjectRoute, 'id' | 'managementEpoch' | 'leaderSessionId'>): boolean {
+  return project?.id === expected.id && project.state === 'active' && project.managementEpoch === expected.managementEpoch
+    && !!expected.leaderSessionId && project.leaderSessionId === expected.leaderSessionId && !project.readonlyLegacy
+}
+
+/** 系统提示词只使用当前项目的档案和偏好，JSON 边界保留原文并避免替代本轮用户输入。 */
+export function leaderPromptContext(store: ManagedWorkerStore, project: StudioProjectRoute): object {
+  const archive = store.projectArchive.get(project.id)
+  return { project: { name: project.name, objective: project.objective, workspacePath: project.workspacePath,
+    decisions: archive?.decisions ?? '', progress: archive?.progress ?? '', openIssues: archive?.openIssues ?? '' },
+  projectPreferences: store.memory.list(project.id).map(item => ({ key: item.prefKey, text: item.text })) }
+}
+
 /** Leader 只能使用项目已经绑定的规范根；模型不能在派工时选择或修复项目绑定。 */
 export function leaderDispatchWorkspace(project: StudioProjectRoute, requested: string | undefined, permission: StudioWorkerPermission,
   protectedRoots: readonly string[]) {
@@ -82,14 +96,14 @@ export class StudioProjectControl {
           name: projectFields.name.exactOptional(), objective: projectFields.objective.exactOptional() }).parse(JSON.parse(value))
         if (!allowed(projectId)) return reject('This project is not managed by the current Leader.')
         const result = this.store.projects.update(projectId, epoch, changes)
-        this.sessions.terminateInvalidated(result.invalidatedTaskIds)
+        this.sessions.projectChanged(result)
         return ok(projectText(result.project))
       }
       if ((verb === 'archive' || verb === 'reopen' || verb === 'replace-leader') && role === 'assistant') {
         const { projectId, epoch, leaderBotId } = z.strictObject({ ...coordinate, leaderBotId: id.exactOptional() }).parse(JSON.parse(value))
         if (verb === 'archive') {
           const result = this.store.projects.archive(projectId, epoch)
-          this.sessions.terminateInvalidated(result.invalidatedTaskIds)
+          this.sessions.projectChanged(result)
           return ok(projectText(result.project))
         }
         const current = this.store.projects.get(projectId)
@@ -98,7 +112,7 @@ export class StudioProjectControl {
         if (!this.ready(agent, role)) return reject('Studio role changed; the project was not changed.')
         const result = verb === 'reopen' ? this.store.projects.reopen(projectId, epoch, session, leaderBotId)
           : this.store.projects.replaceLeader(projectId, epoch, session, leaderBotId)
-        this.sessions.terminateInvalidated(result.invalidatedTaskIds)
+        this.sessions.projectChanged(result)
         return ok(projectText(result.project))
       }
       return reject(`Use /${PROJECT_COMMAND} ${PROJECT_HINT}.`)

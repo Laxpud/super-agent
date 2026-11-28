@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { studioProject, studioProjects, type StudioProjectRoute } from '../studio/domain.ts'
 import { studioNow, type StudioStoreAccess } from './store.ts'
+import { StudioError } from '../studio/pending.ts'
 import { canonicalizeWorkspaceRoot } from './workspace.ts'
 
 export const PROJECT_NAME_LIMIT = 120
@@ -8,7 +9,7 @@ export interface ProjectCreate {
   name: string; objective: string; workspacePath?: string | null; leaderSessionId: string; leaderBotId?: string
 }
 export interface ProjectUpdate { name?: string; objective?: string; workspacePath?: string | null }
-export interface ProjectChange { project: StudioProjectRoute; invalidatedTaskIds: string[] }
+export interface ProjectChange { project: StudioProjectRoute; invalidatedTaskIds: string[]; previous?: StudioProjectRoute }
 
 /** 每个管理 epoch 只绑定一个 Leader；归档、换任与工作区变更会在同一事务撤销旧任务。 */
 export class ProjectStore {
@@ -51,7 +52,7 @@ export class ProjectStore {
       const changedScope = workspace !== current.workspacePath
       const now = studioNow()
       const epoch = expectedEpoch + Number(changedScope)
-      const invalidatedTaskIds = changedScope ? this.#invalidate(id, now) : []
+      const invalidatedTaskIds = changedScope ? this.#invalidate(current, now) : []
       if (changedScope && current.leaderSessionId && current.leaderBotId) {
         this.db.prepare('INSERT INTO studio_project_leader VALUES (?, ?, ?, ?, ?)')
           .run(id, epoch, current.leaderBotId, current.leaderSessionId, now)
@@ -59,7 +60,7 @@ export class ProjectStore {
       this.db.prepare('UPDATE studio_project SET name = ?, objective = ?, workspace_path = ?, management_epoch = ?, updated_at = ? WHERE project_id = ?')
         .run(changes.name === undefined ? current.name : projectField(changes.name, PROJECT_NAME_LIMIT),
           changes.objective === undefined ? current.objective : projectField(changes.objective, 2_000), workspace, epoch, now, id)
-      return { project: studioProject(this.db, id)!, invalidatedTaskIds }
+      return { project: studioProject(this.db, id)!, invalidatedTaskIds, ...(changedScope && { previous: current }) }
     })
   }
 
@@ -69,11 +70,11 @@ export class ProjectStore {
 
   archive(id: string, expectedEpoch: number): ProjectChange {
     return this.access.write(() => {
-      this.#require(id, expectedEpoch, 'active')
-      const now = studioNow(), invalidatedTaskIds = this.#invalidate(id, now)
+      const previous = this.#require(id, expectedEpoch, 'active')
+      const now = studioNow(), invalidatedTaskIds = this.#invalidate(previous, now)
       this.db.prepare("UPDATE studio_project SET state = 'archived', management_epoch = management_epoch + 1, updated_at = ? WHERE project_id = ?")
         .run(now, id)
-      return { project: studioProject(this.db, id)!, invalidatedTaskIds }
+      return { project: studioProject(this.db, id)!, invalidatedTaskIds, previous }
     })
   }
 
@@ -83,18 +84,22 @@ export class ProjectStore {
 
   #changeLeader(id: string, expectedEpoch: number, from: StudioProjectRoute['state'], sessionId: string, leaderBotId?: string): ProjectChange {
     return this.access.write(() => {
-      this.#require(id, expectedEpoch, from)
+      const previous = this.#require(id, expectedEpoch, from)
       const now = studioNow(), epoch = expectedEpoch + 1
       this.#bind(id, epoch, sessionId, leaderBotId, now)
-      const invalidatedTaskIds = this.#invalidate(id, now)
+      const invalidatedTaskIds = this.#invalidate(previous, now)
       this.db.prepare("UPDATE studio_project SET state = 'active', management_epoch = ?, updated_at = ? WHERE project_id = ?").run(epoch, now, id)
-      return { project: studioProject(this.db, id)!, invalidatedTaskIds }
+      return { project: studioProject(this.db, id)!, invalidatedTaskIds, previous }
     })
   }
 
   #require(id: string, expectedEpoch: number, state: StudioProjectRoute['state']): StudioProjectRoute {
     const current = studioProject(this.db, id)
-    if (!current || current.managementEpoch !== expectedEpoch || current.state !== state) throw new Error('Studio project state changed')
+    if (!current) throw new StudioError('PROJECT_NOT_FOUND', 'This Studio project does not exist.', 404)
+    if (current.managementEpoch !== expectedEpoch) throw new StudioError('PROJECT_EPOCH_CONFLICT', 'Studio project state changed. Reload its management epoch.', 409)
+    if (current.state !== state) throw current.state === 'archived'
+      ? new StudioError('PROJECT_ARCHIVED', 'Studio project state changed: this project is archived. Reopen it before making changes.', 409)
+      : new StudioError('PROJECT_NOT_ARCHIVED', 'This Studio project is already active.', 409)
     return current
   }
 
@@ -110,13 +115,15 @@ export class ProjectStore {
     this.db.prepare('INSERT INTO studio_project_leader VALUES (?, ?, ?, ?, ?)').run(id, epoch, botId, sessionId, at)
   }
 
-  #invalidate(id: string, at: string): string[] {
+  #invalidate(previous: StudioProjectRoute, at: string): string[] {
+    const id = previous.id
     const rows = this.db.prepare(`UPDATE studio_task SET status = 'interrupted', authorization_version = authorization_version + 1, updated_at = ?
       WHERE project_id = ? AND status IN ('queued', 'running', 'waiting_approval', 'blocked') RETURNING task_id`).all(at, id)
     this.db.prepare(`UPDATE studio_task_execution SET ended_at = ?, outcome = 'project-authority-changed' WHERE ended_at IS NULL
       AND task_id IN (SELECT task_id FROM studio_task WHERE project_id = ?)`).run(at, id)
     const ids = rows.map(row => String(row.task_id))
-    for (const taskId of ids) this.access.expireGuardInterceptionsInTx(taskId)
+    for (const taskId of ids) this.access.expireTaskConfirmationsInTx(taskId)
+    this.access.interruptProjectInTx(id, previous.managementEpoch)
     return ids
   }
 }

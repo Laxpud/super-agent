@@ -126,9 +126,9 @@ function seedV0(db: DatabaseSync) {
 }
 
 describe('Studio V1 SQLite ledger', () => {
-  it('installs the V1 schema, enforces foreign keys on Host writes and uses one seven-state task table', () => {
+  it('installs the V2 schema, enforces foreign keys on Host writes and uses one seven-state task table', () => {
     const f = fixture(), store = f.open(), db = f.sql()
-    expect(db.prepare('PRAGMA user_version').get()?.user_version).toBe(1)
+    expect(db.prepare('PRAGMA user_version').get()?.user_version).toBe(2)
     expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([])
     db.exec(`CREATE TRIGGER reject_orphan_probe AFTER INSERT ON studio_task WHEN NEW.source_message_id = 'message-orphan'
       BEGIN UPDATE studio_task SET project_id = 'does-not-exist' WHERE task_id = NEW.task_id; END`)
@@ -213,7 +213,7 @@ function legacyRecordReader(store: ManagedWorkerStore, cwd: string) {
   return { flush, open, record: (sessionId: string) => service.operations.record({ sessionId }, signal) }
 }
 
-describe('Studio V0 to V1 migration', () => {
+describe('Studio V0 to V2 migration', () => {
   it('preserves published state, snapshots legacy Sessions and never projects a protected result', async () => {
     const f = fixture(), db = f.sql()
     seedV0(db)
@@ -223,7 +223,7 @@ describe('Studio V0 to V1 migration', () => {
     const bindingBefore = rows('SELECT * FROM agent_studio_feishu_binding')
     const outboxBefore = rows('SELECT * FROM agent_studio_feishu_outbox ORDER BY sequence')
     const store = f.open()
-    expect(rows('PRAGMA user_version')).toEqual([{ user_version: 1 }])
+    expect(rows('PRAGMA user_version')).toEqual([{ user_version: 2 }])
     expect(rows('PRAGMA foreign_key_check')).toEqual([])
     expect(rows('SELECT * FROM agent_studio_message ORDER BY sequence')).toEqual(messagesBefore)
     expect(rows('SELECT * FROM agent_studio_feishu_binding')).toEqual(bindingBefore)
@@ -331,7 +331,7 @@ describe('Studio V0 to V1 migration', () => {
     expect(store.task(otherTask)?.status).toBe('delivered')
   })
 
-  it('archives residual V0 rows with a missing parent and validates all live V1 tables', () => {
+  it('archives residual V0 rows with a missing parent and validates all live V2 tables', () => {
     const f = fixture(), db = f.sql()
     seedV0(db)
     db.exec('PRAGMA foreign_keys=OFF; DROP TABLE studio_project_binding; PRAGMA foreign_keys=ON')
@@ -341,7 +341,7 @@ describe('Studio V0 to V1 migration', () => {
     clean.open()
     const tables = clean.sql().prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name <> 'sqlite_sequence'").all()
     const store = f.open()
-    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 1 })
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 2 })
     for (const { name } of tables) expect(db.prepare(`PRAGMA foreign_key_check(${String(name)})`).all()).toEqual([])
     expect(violation()).not.toHaveLength(0)
     expect(db.prepare("SELECT work_id FROM studio_project_work WHERE work_id = 'plain-work'").get()).toEqual({ work_id: 'plain-work' })

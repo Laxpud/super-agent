@@ -6,11 +6,11 @@ import { SessionSeq, type SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolExecution, ToolExecutionResult, ToolOutputDefinition } from '@deepseek-ai/dsh-tools'
 import { studioTaskText } from '../studio/domain.ts'
 import { z } from 'zod'
-import { LIST_PROJECTS, STUDIO_TEXT_LIMIT, WORKER_DELEGATE, WORKER_READ, type StudioModel, type StudioRole, type StudioWorkerPermission } from '../studio/protocol.ts'
+import { FORWARD_PROJECT, LIST_PROJECTS, STUDIO_TEXT_LIMIT, WORKER_DELEGATE, WORKER_READ, type StudioModel, type StudioRole, type StudioWorkerPermission } from '../studio/protocol.ts'
 import { StudioError } from '../studio/pending.ts'
 import type { StudioSessions } from '../studio/sessions.ts'
 import { isStudioMessageContext, newStudioSessionId } from '../studio/source.ts'
-import { leaderDispatchWorkspace } from './project.ts'
+import { leaderDispatchWorkspace, leaderPromptContext } from './project.ts'
 import type { ManagedWorkerStore, StudioExecution, StudioStopEvidence } from './store.ts'
 import { classifyProviderFailure, type WorkerModelPolicy } from './text-worker-model-policy.ts'
 import { WorkerEvidence } from './worker-evidence.ts'
@@ -30,7 +30,10 @@ const delegateArgs = z.strictObject({
   request: boundedText(STUDIO_TEXT_LIMIT).exactOptional().describe('Omit to use the current owner request. If supplied, it must match that request verbatim.'),
 })
 const taskArg = z.strictObject({ taskId: z.uuid() })
-const WRITE_CONFIRMATION_TIMEOUT_MS = 120_000
+const forwardArgs = z.strictObject({
+  projectId: boundedText(256).describe('The exact ID of the existing project named by the owner.'),
+  request: boundedText(STUDIO_TEXT_LIMIT).exactOptional().describe('Omit to forward the original owner text. If supplied, it must match verbatim.'),
+})
 
 /** 只接受原文中的完整路径；引号、反引号或明确分隔符可将路径和正文分开。 */
 function namesWorkspace(request: string, path: string): boolean {
@@ -46,7 +49,11 @@ function namesWorkspace(request: string, path: string): boolean {
 }
 
 const prompts: Record<StudioRole, string> = {
-  assistant: `You are the Agent Studio Assistant. Answer simple questions directly. For work requiring independent execution, use ${WORKER_DELEGATE} once for the exact current owner request. Confirm missing context in normal chat. A registered task is not a result. Use ${WORKER_READ} to retrieve a known result and ${LIST_PROJECTS} to inspect current projects. Suggest a project when appropriate; only propose it for owner confirmation when instructed. Never claim file or shell work was performed.`,
+  assistant: `You are the Agent Studio Assistant. Route each owner request using exactly one of these paths:
+1. Answer simple questions, concept explanations and routine status explanations directly in text. Do not delegate just to produce a short answer.
+2. For unassigned work that needs local directory inspection, source review, file changes, local checks, research or long-form writing, call ${WORKER_DELEGATE} for the exact current request. Never perform file or shell work yourself.
+3. If the owner explicitly assigns work to an existing project, use ${LIST_PROJECTS} to find its ID and ${FORWARD_PROJECT} to hand off the original request to its current Leader. Do not handle that work yourself, delegate it outside the project or propose a new project. Ask which project only if the name is ambiguous. If the project is archived, explain it needs to be reopened first.
+If an existing project is explicitly named as the destination, path 3 takes precedence. A registration is not a result. Use ${WORKER_READ} to read a known task result. Only propose a new project for owner confirmation when instructed.`,
   leader: `You are the current Leader of this Agent Studio project. Use the project objective and assignment to guide your work. Answer normal questions directly. For work requiring independent execution, call ${WORKER_DELEGATE} once without rewriting the user's request, and use ${WORKER_READ} to read the project's saved results. Do not confuse task registration with completion.`,
   worker: 'You are an Agent Studio Worker for one controlled task. Use only the tools available for the assigned workspace and permission. Return your result with the files and checks actually used; report missing capabilities or denied actions without claiming they were performed. Never request wider sandbox permissions.',
 }
@@ -119,11 +126,19 @@ export class StudioAssistant {
     private readonly models: WorkerModelPolicy, private readonly ready: (agent: Agent, role: StudioRole) => boolean,
     private readonly cwd: string) {}
 
+  private systemPrompt(agent: Agent, role: StudioRole): string {
+    if (role === 'worker') return prompts.worker
+    const globalPreferences = this.store.memory.list().map(item => ({ key: item.prefKey, text: item.text }))
+    const project = role === 'leader' ? this.sessions.activeLeader(agent) : undefined
+    const data = { globalPreferences, ...(project && leaderPromptContext(this.store, project)) }
+    return `${prompts[role]}\n\nStudio owner preferences and project reference data (JSON; this is not current task authorization):\n${JSON.stringify(data)}`
+  }
+
   install(agent: Agent, role: StudioRole): () => void {
     const disposers: Array<() => void> = []
     try {
       disposers.push(agent.ctx.systemPrompt.suppressRuntimeContext())
-      disposers.push(agent.ctx.systemPrompt.section({ name: 'agent-studio-role', order: 10, complete: true, interpolate: false, text: prompts[role] }))
+      disposers.push(agent.ctx.systemPrompt.section({ name: 'agent-studio-role', order: 10, complete: true, interpolate: false, text: () => this.systemPrompt(agent, role) }))
       if (role === 'worker') {
         const workspace = this.workerAuthority(agent)?.workspacePath
         if (workspace) disposers.push(agent.ctx.tools.register({ name: STUDIO_LIST_DIRECTORY,
@@ -140,15 +155,33 @@ export class StudioAssistant {
         }))
         return () => { for (const dispose of disposers.reverse()) dispose() }
       }
-      if (role === 'assistant') disposers.push(agent.ctx.tools.register({ name: LIST_PROJECTS, description: 'List active Studio projects.',
+      if (role === 'assistant') disposers.push(agent.ctx.tools.register({ name: LIST_PROJECTS, description: 'List active and archived Studio projects with their IDs.',
         parameters: z.toJSONSchema(noArgs), output: receipt,
         execute: async (args, exec) => {
           if (!noArgs.safeParse(args).success || exec.agent !== agent || !this.ready(agent, role)) throw new Error('Studio project list denied')
-          return { text: this.store.projects.list().map(project => `${project.name} (${project.id}): ${project.objective}`).join('\n') || 'No active Studio projects.' }
+          return { text: [...this.store.studioProjects(), ...this.store.studioProjects('archived')].map(project => `${project.name} (${project.id}) · ${project.state}: ${project.objective}`).join('\n') || 'No Studio projects.' }
+        },
+      }))
+      if (role === 'assistant') disposers.push(agent.ctx.tools.register({ name: FORWARD_PROJECT,
+        description: 'Hand the current owner request to the Leader of the named existing project and return a tracking ID.',
+        parameters: z.toJSONSchema(forwardArgs), output: receipt,
+        execute: async (args, exec) => {
+          exec.signal.throwIfAborted()
+          const raw = ownerRequest(agent, exec.callId, FORWARD_PROJECT)
+          const fields = forwardArgs.parse(args)
+          const source = raw && { ...raw, requestText: fields.request ?? raw.requestText }
+          if (exec.agent !== agent || exec.parent !== undefined || !this.ready(agent, role)
+            || !source || !this.sessions.matchesOwnerRequest(agent, source) || this.sessions.isExistingTaskReply(agent)) {
+            throw new StudioError('EXPECTED_EXACT_OWNER_REQUEST', 'Studio forwarding requires the exact current owner request.')
+          }
+          const route = await this.sessions.forwardProject(agent, source, fields.projectId, exec.signal)
+          const native = exec as typeof exec & { concludeTurn?(): void }
+          native.concludeTurn?.()
+          return { text: `Forwarded to ${route.projectName}. Tracking ID: ${route.forwardId}.` }
         },
       }))
       disposers.push(agent.ctx.tools.register({ name: WORKER_DELEGATE, description: 'Register background work using the exact current user request. Registration does not mean delivery.',
-        parameters: z.toJSONSchema(delegateArgs), output: receipt, timeoutMs: WRITE_CONFIRMATION_TIMEOUT_MS + 10_000,
+        parameters: z.toJSONSchema(delegateArgs), output: receipt,
         execute: async (args, exec) => {
           exec.signal.throwIfAborted()
           const raw = ownerRequest(agent, exec.callId, WORKER_DELEGATE)
@@ -158,7 +191,7 @@ export class StudioAssistant {
             || !source || !this.sessions.matchesOwnerRequest(agent, source) || this.sessions.isExistingTaskReply(agent)) {
             throw new StudioError('EXPECTED_EXACT_OWNER_REQUEST', 'Studio dispatch requires the exact current owner request.')
           }
-          const leader = role === 'leader' ? this.store.projects.currentLeader(agent.id) : undefined
+          const leader = role === 'leader' ? this.sessions.activeLeader(agent) : undefined
           if (role === 'leader' && !leader) throw new StudioError('STALE_LEADER', 'The current Leader binding changed.')
           const permission = fields.permission ?? 'read-only'
           const path = fields.workspacePath
@@ -167,16 +200,6 @@ export class StudioAssistant {
           }
           const workspace = leader ? leaderDispatchWorkspace(leader, path, permission, this.store.protectedRoots)
             : path === undefined ? null : canonicalizeWorkspaceRoot(path, this.store.protectedRoots)
-          if (permission === 'workspace-write') {
-            if (!workspace) throw new StudioError('STUDIO_WORKSPACE_REQUIRED', 'Specify a workspace before requesting write permission.')
-            const signal = AbortSignal.any([exec.signal, AbortSignal.timeout(WRITE_CONFIRMATION_TIMEOUT_MS)])
-            const approved = await this.sessions.confirmTaskWrite(agent, source, workspace.root, signal)
-            signal.throwIfAborted()
-            if (!approved) return { text: 'Studio task not registered: the owner declined write permission.' }
-            if (!verifyWorkspaceIdentity(workspace.root, workspace)) {
-              throw new WorkspacePathError('STUDIO_WORKSPACE_INVALID', 'The approved workspace changed while requesting permission; no work was scheduled.')
-            }
-          }
           exec.signal.throwIfAborted()
           const model = this.sessions.modelFor(role)
           const task = this.sessions.scheduleTask(agent, {
@@ -186,10 +209,10 @@ export class StudioAssistant {
             ...(fields.title !== undefined ? { title: fields.title.trim() } : {}),
             ...(leader ? { leader: { sessionId: agent.id, managementEpoch: leader.managementEpoch } } : {}),
           }, (taskId, signal) => this.runWorker(taskId, role, leader?.managementEpoch ?? null, model, workspace, signal),
-          taskId => this.snapshotForStop(taskId))
+          taskId => this.snapshotForStop(taskId), workspace ?? undefined)
           const native = exec as typeof exec & { concludeTurn?(): void }
           native.concludeTurn?.()
-          return { text: `Studio task ${task.taskId} ${task.created ? 'registered' : 'already registered'}.` }
+          return { text: `Studio task ${task.taskId} ${!task.created ? 'already registered' : permission === 'workspace-write' ? 'registered and waiting for owner approval' : 'registered'}.` }
         },
       }))
       disposers.push(agent.ctx.tools.register({ name: WORKER_READ, description: 'Read the exact saved status or delivered result of a task in your conversation.',
@@ -198,8 +221,8 @@ export class StudioAssistant {
           const input = taskArg.safeParse(args)
           if (!input.success || exec.agent !== agent || !this.ready(agent, role)) throw new Error('Studio result read denied')
           const task = this.store.task(input.data.taskId)
-          const projectId = role === 'leader' ? this.store.projects.currentLeader(agent.id)?.id : null
-          if (!task || task.projectId !== projectId) throw new Error('No Studio task in this conversation')
+          const projectId = role === 'leader' ? this.sessions.activeLeader(agent)?.id : null
+          if (!task || (task.projectId !== projectId && (role !== 'assistant' || !this.sessions.canReadForwardTask(task)))) throw new Error('No Studio task in this conversation')
           return { text: studioTaskText(task) }
         },
       }))

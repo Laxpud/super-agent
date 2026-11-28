@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { setImmediate as yieldToHost, setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
 import { feishuSourceScope, validateFeishuInbox, type FeishuBindingConfig } from './feishu-binding.ts'
+import { StudioError } from './pending.ts'
 import type { StudioFeishuCardResponse, StudioFeishuSdk } from './feishu-sdk.ts'
 import { ASSISTANT_CONVERSATION, GUARD_PENDING_PREFIX, GUARD_PENDING_TEXT_HINT, STUDIO_TEXT_LIMIT, type FeishuState, type StudioPending } from './protocol.ts'
 import type { StudioFeishuDelivery, StudioFeishuInput } from './store.ts'
@@ -160,6 +161,28 @@ export class StudioFeishuConversation {
 
   /** 仅唤醒等待中的投递循环；离线积压继续由持久队列保管。 */
   wake(): void { this.wakeDelivery?.() }
+
+  /** 手动补交仅允许查询指定消息；长连接离线时仍可验证 REST 机器人身份，不会拉取任何历史列表。 */
+  async verifiedMessage(id: string, cutover: number, signal: AbortSignal): Promise<StudioFeishuInput> {
+    const available = () => this.ready() && this.state !== 'identity-mismatch'
+    if (!available()) throw new StudioError('FEISHU_LOOKUP_UNAVAILABLE', 'The configured Feishu binding is not available.', 503)
+    let bot: string
+    try { bot = await this.sdk.botOpenId(signal) }
+    catch { signal.throwIfAborted(); throw new StudioError('FEISHU_LOOKUP_UNAVAILABLE', 'Could not verify the configured Feishu bot.', 503) }
+    if (bot !== this.config.botOpenId) throw new StudioError('FEISHU_LOOKUP_UNAVAILABLE', 'The configured Feishu bot identity does not match.', 503)
+    const item = await this.sdk.getMessage(id, signal)
+    signal.throwIfAborted()
+    if (!available()) throw new StudioError('FEISHU_LOOKUP_UNAVAILABLE', 'The configured Feishu binding is no longer available.', 503)
+    // 私聊已在绑定时验证；精确匹配 chat_id 和 open_id，不将 REST 展开的其他记录、应用发送或编辑消息当作原始请求。
+    const input = item.deleted !== true && item.updated !== true && item.sender?.id_type === 'open_id' ? readTextEvent({
+      schema: '2.0', event_type: 'im.message.receive_v1', app_id: this.config.appId,
+      sender: { sender_type: item.sender.sender_type, sender_id: { open_id: item.sender.id } },
+      message: { message_id: item.message_id, chat_id: item.chat_id, chat_type: 'p2p', create_time: item.create_time,
+        message_type: item.msg_type, content: item.body?.content, parent_id: item.parent_id, root_id: item.root_id, thread_id: item.thread_id },
+    }, this.config, this.scope, cutover) : undefined
+    if (!input || input.id !== id) throw new StudioError('FEISHU_MESSAGE_UNVERIFIED', 'Expected a post-binding text message from the owner in the configured Feishu private chat.', 422)
+    return input
+  }
 
   /** 每次重连先验证机器人身份。断开或停止后，不接收新输入，等本次工作全部退出。 */
   async run(signal: AbortSignal): Promise<void> {

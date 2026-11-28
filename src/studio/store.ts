@@ -3,7 +3,7 @@ import type { DatabaseSync } from 'node:sqlite'
 import { studioRecordRole, studioRecords, studioSession } from './domain.ts'
 import {
   ASSISTANT_CONVERSATION, GUARD_PENDING_PREFIX, GUARD_PENDING_TEXT_HINT, STUDIO_PAGE_SIZE, STUDIO_TEXT_LIMIT,
-  type StudioArtifact, type StudioMessage, type StudioModel, type StudioPage, type StudioPending,
+  type StudioArtifact, type StudioForwardStatus, type StudioForwardSummary, type StudioMessage, type StudioModel, type StudioPage, type StudioPending,
   type StudioSend, type StudioSessionRecord, type StudioSettings, type StudioSource,
 } from './protocol.ts'
 
@@ -139,6 +139,39 @@ export const STUDIO_SCHEMA = `
     WHERE state = 'sent' AND kind <> 'pending-update';
 `
 
+export const TASK_WRITE_PENDING_PREFIX = 'task-write:'
+
+/** V2 的转发关系绑定到原始用户消息、目标项目消息及具体管理版本。 */
+export const STUDIO_FORWARD_SCHEMA = `
+  CREATE TABLE studio_project_forward (
+    forward_id TEXT PRIMARY KEY,
+    origin_conversation_id TEXT NOT NULL,
+    origin_message_id TEXT NOT NULL UNIQUE REFERENCES agent_studio_message(id),
+    origin_channel TEXT NOT NULL CHECK (origin_channel IN ('gui', 'feishu')),
+    project_id TEXT NOT NULL REFERENCES studio_project(project_id),
+    management_epoch INTEGER NOT NULL CHECK (management_epoch > 0),
+    project_message_id TEXT NOT NULL UNIQUE REFERENCES agent_studio_message(id),
+    status TEXT NOT NULL CHECK (status IN ('registered', 'running', 'delegated', 'delivered', 'failed', 'interrupted')),
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (project_id, management_epoch) REFERENCES studio_project_leader(project_id, management_epoch)
+  ) STRICT;
+  CREATE INDEX studio_project_forward_epoch ON studio_project_forward(project_id, management_epoch);
+  CREATE TABLE studio_project_forward_notice (
+    forward_id TEXT NOT NULL REFERENCES studio_project_forward(forward_id), notice_key TEXT NOT NULL,
+    PRIMARY KEY (forward_id, notice_key)
+  ) STRICT;
+`
+
+interface ForwardRow {
+  forward_id: string; project_id: string; name: string; project_message_id: string; status: StudioForwardStatus;
+  origin_message_id: string; origin_conversation_id: string; origin_channel: 'gui' | 'feishu'; management_epoch: number
+}
+interface ForwardRoute extends StudioForwardSummary { originMessageId: string; originConversationId: string; managementEpoch: number }
+const FORWARD_SELECT = `SELECT f.*, p.name FROM studio_project_forward f JOIN studio_project p ON p.project_id = f.project_id`
+const decodeForward = (row: ForwardRow): ForwardRoute => ({ forwardId: row.forward_id, projectId: row.project_id, projectName: row.name,
+  projectMessageId: row.project_message_id, status: row.status, originMessageId: row.origin_message_id,
+  originConversationId: row.origin_conversation_id, managementEpoch: row.management_epoch })
+
 interface MessageRow {
   id: string
   sequence: number
@@ -158,6 +191,7 @@ interface MessageRow {
   source_event_seq: number | null
   artifacts: string | null
   feishu_delivery: DeliveryState | null
+  feishu_generation: number | null
 }
 
 interface PendingRow {
@@ -339,7 +373,7 @@ export class StudioStore {
           throw new Error('Studio Feishu input requires the active Assistant binding')
         }
         requireId(feishu.id, 'Feishu message ID')
-        duplicate = this.db.prepare(`${MESSAGES} WHERE m.feishu_scope = ? AND m.feishu_id = ?`)
+        duplicate = this.db.prepare(`${MESSAGES} WHERE m.feishu_scope = ? AND m.feishu_id = ? AND m.channel = 'feishu'`)
           .get(feishu.scope, feishu.id) as unknown as MessageRow | undefined
       } else {
         if (channel !== 'gui' || feishu) throw new Error('Invalid Studio input channel')
@@ -387,6 +421,75 @@ export class StudioStore {
     })
   }
 
+  /** 在同一事务写入确切项目输入、来源与收据，重复调用只读取原登记。 */
+  registerForward(originMessageId: string, projectId: string, epoch: number, leaderSessionId: string) {
+    return this.write(() => {
+      const prior = this.forwardByOrigin(originMessageId)
+      if (prior) {
+        if (prior.projectId !== projectId) throw new StudioStoreError('REQUEST_CONFLICT', 'This request already belongs to a different Studio project.')
+        return { forward: prior, message: this.message(projectId, prior.projectMessageId)!, created: false }
+      }
+      const origin = this.messageRow(originMessageId, ASSISTANT_CONVERSATION)
+      if (origin?.role !== 'user' || (origin.channel !== 'gui' && origin.channel !== 'feishu') || origin.status !== 'running'
+        || !this.db.prepare(`SELECT 1 FROM studio_project p JOIN studio_project_leader b USING(project_id, management_epoch)
+          JOIN studio_session s ON s.session_id = b.session_id WHERE p.project_id = ? AND p.state = 'active'
+          AND p.management_epoch = ? AND b.session_id = ? AND s.readonly_legacy = 0`).get(projectId, epoch, leaderSessionId)) {
+        throw new StudioStoreError('REQUEST_CONFLICT', 'The Studio project or owner request changed. No new request was forwarded.')
+      }
+      const messageId = randomUUID(), forwardId = randomUUID(), now = Date.now()
+      this.db.prepare(`INSERT INTO agent_studio_message (id, conversation_id, role, channel, text, created_at, status)
+        VALUES (?, ?, 'user', 'studio', ?, ?, 'queued')`).run(messageId, projectId, origin.text, now)
+      this.db.prepare(`INSERT INTO studio_project_forward VALUES (?, ?, ?, ?, ?, ?, ?, 'registered', ?)`)
+        .run(forwardId, ASSISTANT_CONVERSATION, originMessageId, origin.channel, projectId, epoch, messageId, now)
+      const forward = this.forwardByOrigin(originMessageId)!
+      this.forwardNoticeInTx(forward, 'accepted', `已受理登记到项目「${forward.projectName}」。追踪号：${forwardId}。结果会回到这里。`)
+      return { forward, message: this.message(projectId, messageId)!, created: true }
+    })
+  }
+
+  private readForward(field: 'origin_message_id' | 'project_message_id' | 'forward_id', id: string): ForwardRoute | undefined {
+    this.assertActive()
+    if (!this.unifiedSessions) return
+    const row = this.db.prepare(`${FORWARD_SELECT} WHERE f.${field} = ?`).get(id) as unknown as ForwardRow | undefined
+    return row && decodeForward(row)
+  }
+
+  forwardByOrigin(id: string) { return this.readForward('origin_message_id', id) }
+  forwardByProjectMessage(id: string) { return this.readForward('project_message_id', id) }
+  forwardById(id: string) { return this.readForward('forward_id', id) }
+
+  /** 仅镜像路由结果，与原入口回复和出箱认领共享原子提交。 */
+  forwardNoticeInTx(route: ForwardRoute, key: string, text: string, status?: StudioForwardStatus, skipFeishu = false): boolean {
+    this.requirePendingTransaction()
+    if (!this.db.prepare(`INSERT INTO studio_project_forward_notice VALUES (?, ?) ON CONFLICT DO NOTHING`).run(route.forwardId, key).changes) return false
+    if (status !== undefined) this.db.prepare(`UPDATE studio_project_forward SET status = ? WHERE forward_id = ?
+      AND status IN ('registered', 'running', 'delegated')`).run(status, route.forwardId)
+    this.addReplyInTx(route.originMessageId, text, undefined, undefined, false, { skipFeishu, forwardOrigin: true })
+    return true
+  }
+
+  finishForward(projectMessageId: string, text: string, status: Extract<StudioForwardStatus, 'delivered' | 'failed' | 'interrupted'>): void {
+    this.write(() => {
+      const route = this.forwardByProjectMessage(projectMessageId)
+      if (route && (route.status === 'running' || route.status === 'registered')) {
+        this.forwardNoticeInTx(route, 'leader-final', `项目「${route.projectName}」｜受理 ${route.forwardId}\n${text}`, status)
+      }
+    })
+  }
+
+  /** 撤权事务同时冻结尚未完成的项目输入及原入口路由；旧会话的晚到结果不能覆盖它。 */
+  interruptProjectInTx(projectId: string, epoch: number): void {
+    this.requirePendingTransaction()
+    this.db.prepare(`UPDATE agent_studio_message SET status = 'interrupted', error = 'Project authority changed.'
+      WHERE conversation_id = ? AND role = 'user' AND status IN ('queued', 'running')`).run(projectId)
+    const rows = this.db.prepare(`${FORWARD_SELECT} WHERE f.project_id = ? AND f.management_epoch = ?
+      AND f.status IN ('registered', 'running', 'delegated')`).all(projectId, epoch) as unknown as ForwardRow[]
+    for (const row of rows) {
+      const route = decodeForward(row)
+      this.forwardNoticeInTx(route, 'authority-ended', `项目「${route.projectName}」｜受理 ${route.forwardId}：项目管理权已变更，未完成的工作已中断。`, 'interrupted')
+    }
+  }
+
   message(conversationId: string, id: string): StudioMessage | undefined {
     this.assertActive()
     const row = this.messageRow(id, conversationId)
@@ -407,6 +510,7 @@ export class StudioStore {
       const { changes } = this.db.prepare(`UPDATE agent_studio_message SET status = 'running', run_session_id = ?
         WHERE id = ? AND status = 'queued'`).run(sessionId, id)
       if (!changes) throw new StudioStoreError('MESSAGE_STATUS_CONFLICT', 'Studio message is not queued')
+      if (this.unifiedSessions) this.db.prepare("UPDATE studio_project_forward SET status = 'running' WHERE project_message_id = ? AND status = 'registered'").run(id)
       // 并行 Session 只拥有这条在途输入，不替换 Assistant 的主 Session 指针或取得历史输入的权限。
       if (parallel) this.db.prepare('INSERT INTO agent_studio_parallel_turn VALUES (?, ?)').run(id, sessionId)
     })
@@ -455,29 +559,40 @@ export class StudioStore {
 
   /** Use the Studio input for addressing, not the Session that supplied the new native output. */
   addReply(requestMessageId: string, text: string, source?: StudioSource, artifacts?: StudioArtifact[], projectReceipt = false): StudioMessage {
-    return this.write(() => {
-      const request = this.messageRow(requestMessageId)
-      if (request?.role !== 'user') throw new Error('Studio input message not found')
-      if (source) {
-        this.validateSource(source)
-        const duplicate = this.messageBySource(source)
-        if (duplicate) {
-          if (duplicate.role === 'user' || duplicate.reply_to !== request.id) throw new Error('Studio reply source already belongs to another message')
-          return decodeMessage(duplicate)
-        }
+    return this.write(() => this.addReplyInTx(requestMessageId, text, source, artifacts, projectReceipt))
+  }
+
+  private addReplyInTx(requestMessageId: string, text: string, source?: StudioSource, artifacts?: StudioArtifact[], projectReceipt = false,
+    delivery?: { skipFeishu: boolean; forwardOrigin: boolean }): StudioMessage {
+    const request = this.messageRow(requestMessageId)
+    if (request?.role !== 'user') throw new Error('Studio input message not found')
+    if (source) {
+      this.validateSource(source)
+      const duplicate = this.messageBySource(source)
+      if (duplicate) {
+        if (duplicate.role === 'user' || duplicate.reply_to !== request.id) throw new Error('Studio reply source already belongs to another message')
+        return decodeMessage(duplicate)
       }
-      const id = randomUUID()
-      const createdAt = Date.now()
-      const assistant = request.conversation_id === ASSISTANT_CONVERSATION
-      this.db.prepare(`INSERT INTO agent_studio_message (id, conversation_id, role, channel, text, created_at, topic_id, reply_to,
-        source_session_id, source_event_seq, artifacts) VALUES (?, ?, ?, 'studio', ?, ?, ?, ?, ?, ?, ?)`)
-        .run(id, request.conversation_id, assistant ? 'assistant' : 'leader', text, createdAt, request.topic_id, request.id,
-          source?.sessionId ?? null, source?.eventSeq ?? null, artifacts === undefined ? null : JSON.stringify(artifacts))
-      const binding = (assistant || projectReceipt) && text.trim() ? this.binding() : undefined
-      // 项目原对话不镜像；只有宿主生成的执行收据可以独立投递，不猜测原消息在飞书的坐标。
-      if (binding && createdAt >= binding.cutover) this.enqueue(binding.generation, 'message', id, null, assistant ? request.id : undefined)
-      return decodeMessage(this.messageRow(id)!)
-    })
+    }
+    const id = randomUUID()
+    const createdAt = Date.now()
+    const assistant = request.conversation_id === ASSISTANT_CONVERSATION
+    this.db.prepare(`INSERT INTO agent_studio_message (id, conversation_id, role, channel, text, created_at, topic_id, reply_to,
+      source_session_id, source_event_seq, artifacts) VALUES (?, ?, ?, 'studio', ?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, request.conversation_id, assistant ? 'assistant' : 'leader', text, createdAt, request.topic_id, request.id,
+        source?.sessionId ?? null, source?.eventSeq ?? null, artifacts === undefined ? null : JSON.stringify(artifacts))
+    const binding = (assistant || projectReceipt) && text.trim() ? this.binding() : undefined
+    // 项目原对话不镜像；只有宿主生成的执行收据可以独立投递，不猜测原消息在飞书的坐标。
+    if (!delivery?.skipFeishu && binding && createdAt >= binding.cutover) {
+      if (!delivery?.forwardOrigin) this.enqueue(binding.generation, 'message', id, null, assistant ? request.id : undefined)
+      // 原飞书消息只允许回到同一绑定代；Web 原入口未镜像到本代时，用已绑定私聊的主聊天。
+      else if (request.channel === 'gui') {
+        const sent = this.db.prepare('SELECT 1 FROM agent_studio_feishu_outbox WHERE generation = ? AND message_id = ?')
+          .get(binding.generation, request.id)
+        this.enqueue(binding.generation, 'message', id, null, sent ? request.id : undefined)
+      } else if (request.feishu_generation === binding.generation) this.enqueue(binding.generation, 'message', id, null, request.id)
+    }
+    return decodeMessage(this.messageRow(id)!)
   }
 
   /** Recover only known facts: live turns stopped, old native prompts cannot grant consent, and claimed sends may have happened. */
@@ -486,6 +601,15 @@ export class StudioStore {
       this.db.exec(`UPDATE agent_studio_message SET status = 'interrupted' WHERE status IN ('queued', 'running');
         DELETE FROM agent_studio_parallel_turn;
         UPDATE agent_studio_feishu_outbox SET state = 'unconfirmed' WHERE state = 'claimed'`)
+      if (this.unifiedSessions) {
+        const arms = this.db.prepare(`${FORWARD_SELECT} WHERE f.status IN ('registered', 'running') OR (f.status = 'delegated'
+          AND EXISTS (SELECT 1 FROM studio_task t WHERE t.source_message_id = 'agent-studio-owner:' || f.project_message_id
+            AND t.project_id = f.project_id AND t.status = 'interrupted'))`).all() as unknown as ForwardRow[]
+        for (const row of arms) {
+          const route = decodeForward(row)
+          this.forwardNoticeInTx(route, 'host-ended', `项目「${route.projectName}」｜受理 ${route.forwardId}：宿主重启，未完成的工作已中断，未自动重跑。`, 'interrupted')
+        }
+      }
       const expired = this.db.prepare(`UPDATE agent_studio_pending SET state = 'expired', answer = NULL, answered_by = NULL
         WHERE state = 'pending' AND kind IN ('confirmation', 'question') RETURNING *`).all() as unknown as PendingRow[]
       for (const row of expired) {
@@ -634,6 +758,13 @@ export class StudioStore {
     for (const row of rows) this.settleTaskPendingInTx(String(row.id), 'expired')
   }
 
+  /** 任务撤权时，初始写入确认与守卫确认同步失效。 */
+  expireTaskConfirmationsInTx(taskId: string): void {
+    this.requirePendingTransaction()
+    const rows = this.db.prepare(`SELECT id FROM agent_studio_pending WHERE state = 'pending' AND kind = 'confirmation' AND task_id = ?`).all(taskId)
+    for (const row of rows) this.settleTaskPendingInTx(String(row.id), 'expired')
+  }
+
   private requirePendingTransaction(): void {
     this.assertActive()
     if (!this.db.isTransaction) throw new Error('Studio pending mutations require an active transaction')
@@ -668,6 +799,16 @@ export class StudioStore {
       this.db.exec('UPDATE agent_studio_feishu_binding SET scope = NULL WHERE singleton = 1')
     })
   }
+
+  /** 状态只能查询当前绑定代的已登记入站消息，不能把机器人出站消息当成用户原文。 */
+  feishuInput(scope: string, remoteId: string): StudioMessage | undefined {
+    this.assertActive()
+    const binding = this.binding(scope)
+    const id = binding && this.inboundId(binding.generation, remoteId)
+    return id ? this.message(ASSISTANT_CONVERSATION, id) : undefined
+  }
+
+  feishuCutover(scope: string): number | undefined { this.assertActive(); return this.binding(scope)?.cutover }
 
   feishuMessage(scope: string, remoteId: string): StudioMessage | undefined {
     this.assertActive()

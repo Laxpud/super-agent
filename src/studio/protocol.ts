@@ -36,6 +36,7 @@ export interface StudioMessage {
 
 export const WORKER_DELEGATE = 'studio_delegate_task'
 export const WORKER_READ = 'studio_read_task'
+export const FORWARD_PROJECT = 'studio_forward_to_project'
 export const LIST_PROJECTS = 'studio_list_projects'
 export const PROPOSE_PROJECT = 'studio_propose_project'
 /** 仅供只读记录渲染旧 Worker 工具调用；宿主不再注册这些工具。 */
@@ -45,7 +46,9 @@ export const DRAFT_READ = 'studio_read_draft'
 export type StudioRole = 'assistant' | 'leader' | 'worker'
 export type StudioRecordRole = StudioRole | 'document-worker' | 'draft-worker' | 'study-worker' | 'advisor' | 'subagent' | 'legacy'
 export type StudioWorkerPermission = 'read-only' | 'workspace-write'
-export type StudioTaskStatus = 'queued' | 'running' | 'waiting_approval' | 'blocked' | 'interrupted' | 'cancelled' | 'delivered'
+export const STUDIO_TASK_STATUSES = ['queued', 'running', 'waiting_approval', 'blocked', 'interrupted', 'cancelled', 'delivered'] as const
+export type StudioTaskStatus = typeof STUDIO_TASK_STATUSES[number]
+export type StudioTaskScope = 'all' | 'active' | 'terminal'
 export interface StudioChangedFile { path: string; action: 'write' | 'edit' }
 export interface StudioCommandCheck {
   command: string
@@ -69,6 +72,10 @@ export interface StudioCheckResult {
 export interface StudioTaskSummary {
   taskId: string
   projectId: string | null
+  projectName: string | null
+  conversationId: string
+  sourceSessionId: string | null
+  workerSessionId: string | null
   sourceMessageId: string | null
   requesterBotId: string | null
   assigneeBotId: string | null
@@ -91,6 +98,28 @@ export interface StudioTaskSummary {
 export interface StudioProjectSummary {
   id: string; name: string; objective: string; workspacePath: string | null; state: 'active' | 'archived'; managementEpoch: number
 }
+export interface StudioProjectCoordinate { projectId: string; expectedEpoch: number }
+export interface StudioProjectCreate { name: string; objective: string; workspacePath?: string }
+export interface StudioProjectUpdate extends StudioProjectCoordinate { name?: string; objective?: string; workspacePath?: string | null }
+export interface StudioProjectArchive {
+  projectId: string; decisions: string; progress: string; openIssues: string; updatedAt: string | null; readonly: boolean
+}
+export interface StudioPreference {
+  preferenceId: string; key: string; projectId: string | null; text: string; state: 'active' | 'forgotten'; version: number; updatedAt: string
+}
+export type StudioForwardStatus = 'registered' | 'running' | 'delegated' | 'delivered' | 'failed' | 'interrupted'
+export interface StudioForwardSummary {
+  forwardId: string; projectId: string; projectName: string; projectMessageId: string; status: StudioForwardStatus
+}
+export interface StudioMessageStatus {
+  accepted: boolean
+  messageId: string | null
+  /** 对话轮次的状态，不代表关联的工作已交付。 */
+  messageStatus: NonNullable<StudioMessage['status']> | null
+  forward: StudioForwardSummary | null
+  tasks: StudioTaskSummary[]
+}
+export interface StudioFeishuMessageStatus extends StudioMessageStatus { feishuMessageId: string }
 export interface StudioModel { provider: string; model: string; reasoningEffort?: string }
 export interface StudioModelOption { provider: string; model: string; label: string; reasoningEfforts: string[] }
 export interface StudioSettings {
@@ -103,6 +132,7 @@ export interface StudioSettings {
 export type FeishuState = 'disabled' | 'connecting' | 'online' | 'offline' | 'identity-mismatch' | 'credential-missing'
 export interface StudioState {
   projects: StudioProjectSummary[]
+  archivedProjects?: StudioProjectSummary[]
   pendingCount: number
   settings: StudioSettings
   feishu: FeishuState
@@ -166,7 +196,21 @@ export interface StudioOperations {
   timeline: { input: { conversationId: string; topicId?: string; before?: number }; result: StudioPage<StudioMessage> }
   message: { input: { conversationId: string; id: string }; result: StudioMessage }
   send: { input: StudioSend; result: StudioMessage }
-  tasks: { input: { conversationId?: string; before?: number }; result: StudioPage<StudioTaskSummary> }
+  messageStatus: { input: { conversationId: string; id: string }; result: StudioMessageStatus }
+  feishuMessageStatus: { input: { messageId: string }; result: StudioFeishuMessageStatus }
+  resubmitFeishuMessage: { input: { messageId: string }; result: StudioFeishuMessageStatus }
+  createProject: { input: StudioProjectCreate; result: StudioProjectSummary }
+  updateProject: { input: StudioProjectUpdate; result: StudioProjectSummary }
+  replaceProjectLeader: { input: StudioProjectCoordinate; result: StudioProjectSummary }
+  archiveProject: { input: StudioProjectCoordinate; result: StudioProjectSummary }
+  reopenProject: { input: StudioProjectCoordinate; result: StudioProjectSummary }
+  projectArchive: { input: { projectId: string }; result: StudioProjectArchive }
+  updateProjectArchive: { input: { projectId: string; decisions?: string; progress?: string; openIssues?: string }; result: StudioProjectArchive }
+  preferences: { input: { projectId?: string }; result: StudioPreference[] }
+  savePreference: { input: { key: string; text: string; projectId?: string }; result: StudioPreference }
+  updatePreference: { input: { key: string; expectedVersion: number; text: string; projectId?: string }; result: StudioPreference }
+  forgetPreference: { input: { key: string; expectedVersion: number; projectId?: string }; result: StudioPreference }
+  tasks: { input: { conversationId?: string; scope?: StudioTaskScope; status?: StudioTaskStatus; before?: number }; result: StudioPage<StudioTaskSummary> }
   task: { input: { taskId: string }; result: StudioTaskSummary }
   stopTask: { input: { taskId: string }; result: StudioTaskSummary }
   pending: { input: { before?: number }; result: StudioPage<StudioPending> }

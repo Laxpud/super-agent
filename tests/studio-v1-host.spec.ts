@@ -163,7 +163,7 @@ it.each(['', ' \t\n'])('boots with legacy blank studioCwd %j but still rejects i
   await apply(host, config)
   expect(register).toHaveBeenCalledOnce()
   using db = new DatabaseSync(join(dir, STUDIO_DB), { readOnly: true })
-  expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 1 })
+  expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 2 })
 })
 
 describe('Studio V1 Worker models', () => {

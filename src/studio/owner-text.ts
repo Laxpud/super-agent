@@ -47,7 +47,7 @@ export function namesConfirmation(target: string, item: StudioPending, projectNa
   if (!sought) return false
   const title = titleKey(item.title)
   const aliases = [item.id, `确认事项 ${item.id}`, title]
-  if (item.taskId) aliases.push(`${item.taskId} 的${title}`, `任务 ${item.taskId} ${title}`, `任务${item.taskId}的${title}`)
+  if (item.taskId) aliases.push(item.taskId, `任务 ${item.taskId}`, `task ${item.taskId}`, `${item.taskId} 的${title}`, `任务 ${item.taskId} ${title}`, `任务${item.taskId}的${title}`)
   if (projectName) aliases.push(`${projectName} ${title}`, `${projectName}的${title}`, `项目 ${projectName} 的${title}`)
   const project = /^Create the ongoing project “(.+)”\?$/u.exec(item.title)?.[1]
   if (project) aliases.push(`创建项目 ${project}`, `创建项目${project}`, `创建项目「${project}」`, `立项 ${project}`, `立项${project}`, `create project ${project}`)
@@ -77,4 +77,16 @@ export function readRouteControl(raw: string): TextRouteControl | undefined {
   if (/^(?:(?:刚才|前面)(?:的)?(?:那个|那条|这一轮|这项任务))?\s*(?:先别.+(?:先|改)|先改(?:成|为)|改成|改为|不对[，,]|更正[：:])\S/u.test(text)) {
     return { kind: 'redirect', target: '' }
   }
+}
+
+/** 受理、任务状态和补交采用明确命令；没有 ID 时只查询回复对象或近期已登记工作。 */
+export function readWorkQuery(raw: string): { kind: 'intake' | 'tasks' | 'task' | 'resubmit'; id?: string } | undefined {
+  const input = raw.trim().replace(/[?？。！!]+$/u, '').trimEnd()
+  const receipt = /^(?:查询受理|受理状态|message status)(?:\s+([\w-]{1,256}))?$/iu.exec(input)
+  if (receipt) return { kind: 'intake', ...(receipt[1] && { id: receipt[1] }) }
+  const resubmit = /^(?:补交消息|resubmit message)\s+(om_[a-zA-Z0-9_-]+)$/iu.exec(input)
+  if (resubmit?.[1]) return { kind: 'resubmit', id: resubmit[1] }
+  const task = /^(?:查询任务|任务状态|task status)\s+([\w-]{1,256})$/iu.exec(input)
+  if (task?.[1]) return { kind: 'task', id: task[1] }
+  if (/^(?:最近任务|查询近期任务|查看近期任务|recent tasks)$/iu.test(input)) return { kind: 'tasks' }
 }

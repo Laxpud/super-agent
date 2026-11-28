@@ -734,7 +734,7 @@ describe('studio_delegate_task workspace grants', () => {
       .toEqual({ ended_at: expect.any(String), outcome: 'cancelled' })
   })
 
-  it('creates no write task before explicit confirmation; rejecting or replaying the approval never starts a Worker', async () => {
+  it('registers a waiting write task; rejecting or replaying the approval never starts a Worker', async () => {
     const f = dispatchFixture()
     const project = f.project({ permission: 'workspace-write' })
     const text = 'Modify this project workspace; this request alone is not the write confirmation.'
@@ -746,14 +746,13 @@ describe('studio_delegate_task workspace grants', () => {
     })
     expect(item.detail).toContain(f.root)
     expect(item.detail).toContain(text)
-    expect(f.domain.tasks().items).toEqual([])
+    expect(f.domain.tasks().items).toMatchObject([{ taskId: item.taskId, status: 'waiting_approval', workerSessionId: null }])
     expect(f.executions).toEqual([])
     expect(() => f.service.operations.answer({ id: item.id, value: 'yes' }, signal)).toThrow()
-    expect(f.domain.tasks().items).toEqual([])
+    expect(f.domain.tasks().items).toMatchObject([{ taskId: item.taskId, status: 'waiting_approval' }])
     await f.service.operations.answer({ id: item.id, value: 'Not now' }, signal)
-    await vi.waitFor(() => expect(f.verdicts[0]?.output).toMatchObject({ text: expect.stringContaining('owner declined') }))
     expect(() => f.service.operations.answer({ id: item.id, value: '允许本任务写入' }, signal)).toThrow()
-    expect(f.domain.tasks().items).toEqual([])
+    expect(f.domain.tasks().items).toMatchObject([{ taskId: item.taskId, status: 'cancelled', workerSessionId: null }])
     expect(f.executions).toEqual([])
   })
 })
