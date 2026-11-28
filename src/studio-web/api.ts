@@ -45,9 +45,16 @@ const session = (value: unknown) => object(value) && text(value.id) && text(valu
 const project = (value: unknown) => object(value) && text(value.id) && text(value.name) && text(value.objective)
   && nullableText(value.workspacePath) && choice(value.state, ['active', 'archived']) && whole(value.managementEpoch)
 const artifact = (value: unknown) => object(value) && text(value.title) && text(value.text) && source(value.source)
+const checkReceipt = (value: unknown) => nullableText(value) || (object(value) && value.version === 1
+  && choice(value.overallCheckStatus, ['passed', 'failed', 'not_run'])
+  && items(value.changedFiles, file => object(file) && text(file.path) && choice(file.action, ['write', 'edit']))
+  && items(value.checks, check => object(check) && [check.command, check.workdir, check.output].every(text) && nullableText(check.signal)
+    && (check.exitCode === null || Number.isSafeInteger(check.exitCode)) && boolean(check.timedOut) && boolean(check.aborted)
+    && choice(check.status, ['passed', 'failed']))
+  && optional(value.omittedChecks, whole) && optional(value.omittedChangedFiles, whole))
 const task = (value: unknown) => object(value) && [value.taskId, value.title, value.requestText].every(text)
-  && [value.projectId, value.sourceMessageId, value.requesterBotId, value.assigneeBotId, value.workspacePath,
-    value.resultSummary, value.checkResult].every(nullableText)
+  && [value.projectId, value.sourceMessageId, value.requesterBotId, value.assigneeBotId, value.workspacePath, value.resultSummary].every(nullableText)
+  && checkReceipt(value.checkResult)
   && permission(value.permission) && whole(value.authorizationVersion) && whole(value.createdAt) && whole(value.updatedAt)
   && choice(value.status, ['queued', 'running', 'waiting_approval', 'blocked', 'interrupted', 'cancelled', 'delivered'])
   && items(value.artifacts, artifact) && Object.hasOwn(value, 'externalJob') && optional(value.source, source)

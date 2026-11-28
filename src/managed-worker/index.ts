@@ -6,11 +6,12 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { isLoopbackHost } from '@deepseek-ai/dsh-host-webserver'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import type { ToolExecution } from '@deepseek-ai/dsh-tools'
+import type { ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import s from '@deepseek-ai/schemastery'
 import { lockSync } from 'proper-lockfile'
 import { currentPresetId } from '../infra/preset-names.ts'
 import { StudioConfigurationControl } from '../studio/configuration.ts'
+import { studioTaskText } from '../studio/domain.ts'
 import { FeishuConversationConfig, feishuSourceScope, validateFeishuInbox, type FeishuBindingConfig } from '../studio/feishu-binding.ts'
 import { StudioFeishuSdk } from '../studio/feishu-sdk.ts'
 import { StudioFeishuConversation } from '../studio/feishu.ts'
@@ -29,7 +30,8 @@ import { LEADER_PRESET, PROJECT_COMMAND, PROJECT_HINT, StudioProjectControl } fr
 import { ManagedWorkerStore } from './store.ts'
 import { LegacyWorkerDefaultsConfig, LegacyWorkerRouteConfig, migrateWorkerModels, WorkerModelDefaultsConfig, WorkerModelPolicy,
   WorkerModelRouteConfig } from './text-worker-model-policy.ts'
-import { evaluateWorkerToolCall, STUDIO_LIST_DIRECTORY, workerSandboxMatches, workerToolAllowlist, type WorkerSandboxPolicy } from './worker-guard.ts'
+import { summarizeGuardAction } from './worker-evidence.ts'
+import { evaluateWorkerToolCall, guardActionFingerprint, STUDIO_LIST_DIRECTORY, workerSandboxMatches, workerToolAllowlist, type WorkerSandboxPolicy } from './worker-guard.ts'
 import { verifyWorkspaceIdentity } from './workspace.ts'
 
 export const name = 'agent-studio-managed-worker'
@@ -57,7 +59,7 @@ const hostFields = s.object({
   workerModelRoutes: s.union([s.const(null), s.array(WorkerModelRouteConfig).max(64)]),
   workerModelDefaults: s.union([s.const(null), WorkerModelDefaultsConfig]),
   defaultWorkerPermission: s.union(['read-only' as const, 'workspace-write' as const]).default('read-only')
-    .description('Default task permission for local tools in a bound Studio workspace.'),
+    .description('Retained for settings compatibility. Dispatch is read-only by default and cannot skip owner approval.'),
   feishuConversation: s.union([s.const(null), FeishuConversationConfig]),
   studioFeishuCredentialId: s.string(),
   studioDirectoryToken: s.string(),
@@ -204,7 +206,7 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
   const service = new StudioService(ctx, store, cwd, defaults, ready, stopping.signal, feishuState, wake, settingsScope)
   studio = service
   const sessions = service.sessions
-  const assistant = new StudioAssistant(ctx, store, sessions, models, config.defaultWorkerPermission, ready, cwd)
+  const assistant = new StudioAssistant(ctx, store, sessions, models, ready, cwd)
   const intake = new StudioProjectIntake(store, sessions)
   const projects = new StudioProjectControl(store, sessions, ready)
   if (binding && feishuSdk) channel = new StudioFeishuConversation(feishuSdk, binding, service.feishu, channelReady,
@@ -245,6 +247,26 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
     } catch (error) { for (const cleanup of dispose.reverse()) cleanup(); throw error }
   }
 
+  function workerRefusal(agent: Agent, exec: Readonly<ToolExecution>) {
+    const execution = roleReady(agent, 'worker') ? assistant.workerExecution(agent) : undefined
+    const refusal = evaluateWorkerToolCall({ name: exec.name, arguments: exec.arguments, parent: exec.parent, signal: exec.signal,
+      execution, sandbox: assistant.workerSandbox(agent), protectedRoots: store.protectedRoots })
+    if (refusal?.needsOwnerDecision && execution?.active) {
+      try {
+        const { recorded } = store.recordGuardInterception(execution.execution, refusal,
+          guardActionFingerprint(exec.name, exec.arguments, refusal.code), summarizeGuardAction(exec.name),
+          sessions.taskOrigin(execution.execution.taskId), execution.evidence.result())
+        if (recorded) queueMicrotask(() => {
+          // SQLite 已提交撤权，取消本身不再是安全边界；即使底层取消失败，旧工具也不会获得授权。
+          try { if (current(agent)) agent.cancel({ kind: 'hook', reason: 'Studio Worker authorization ended after a guard interception.' }) }
+          catch { ctx.logger.warn('Studio could not cancel the intercepted Worker') }
+          finally { wake() }
+        })
+      } catch { ctx.logger.warn('Studio could not persist the Worker guard interception') }
+    }
+    return refusal
+  }
+
   // rc.5 支持结构化拒绝；仓库保留上游 Ticket 的旧版依赖声明，只在此适配 Studio 入口。
   const guards = ctx.tools as unknown as { guard(fn: (exec: Readonly<ToolExecution>) => string
     | { reason: string; info: { name: string; code: string } } | undefined): () => void }
@@ -257,9 +279,7 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
       const role = record?.role === 'worker' ? 'worker' : scopes.get(agent)?.role ?? inferred(agent)
       if (!role && !record && !isStudioInternalSession(agent.id)) return undefined
       if (role === 'worker') {
-        const refusal = evaluateWorkerToolCall({ name: exec.name, arguments: exec.arguments, parent: exec.parent, signal: exec.signal,
-          execution: roleReady(agent, role) ? assistant.workerExecution(agent) : undefined, sandbox: assistant.workerSandbox(agent),
-          protectedRoots: store.protectedRoots })
+        const refusal = workerRefusal(agent, exec)
         return refusal ? { reason: refusal.reason, info: { name: 'StudioToolDenied', code: refusal.code } } : undefined
       }
       if (!role || exec.parent !== undefined || !ready(agent, role) || !sessions.canAsk(agent)) return denied
@@ -268,6 +288,21 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
       return denied
     } catch { return 'Studio tool denied: could not verify role or authorization' }
   }))
+  // 只在 Studio 适配 rc.5 的原生派发和结果事件；上游 Ticket 的依赖声明不随此功能改变。
+  const toolEvents = ctx as unknown as {
+    on(event: 'tools/execute', listener: (exec: ToolExecution, next: () => Promise<ToolExecutionResult>) => Promise<ToolExecutionResult>): () => void
+    on(event: 'tools/result', listener: (exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>) => undefined): () => void
+  }
+  toolEvents.on('tools/execute', async (exec, next) => {
+    const { agent } = exec
+    if (agent && (scopes.get(agent)?.role === 'worker' || inferred(agent) === 'worker' || assistant.workerAuthority(agent))) {
+      const refusal = workerRefusal(agent, exec)
+      if (refusal) throw new StudioError(refusal.code, refusal.reason)
+      assistant.observeDispatch(exec)
+    }
+    return next()
+  })
+  toolEvents.on('tools/result', (exec, result) => { if (available) assistant.observeToolResult(exec, result); return undefined })
   ctx.on('agent/created', ({ agent }) => { if (available && !applyingSettings) configure(agent); return undefined })
   ctx.on('agent/disposed', ({ agent }) => { scopes.get(agent)?.dispose(); scopes.delete(agent) })
   ctx.on('agent-preset/selected', (id, selected) => {
@@ -324,7 +359,7 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
       if (!ready(agent, 'assistant') && !ready(agent, 'leader')) return { kind: 'error', text: 'Use a current Studio Assistant or Leader Session.' }
       const task = store.task(rawInput.trim())
       if (!task || (!ready(agent, 'assistant') && store.projects.currentLeader(agent.id)?.id !== task.projectId)) return { kind: 'error', text: 'Studio task not found.' }
-      return { kind: 'success', text: `${task.taskId}: ${task.status}${task.resultSummary ? `\n\n${task.resultSummary}` : ''}` }
+      return { kind: 'success', text: studioTaskText(task) }
     },
   }))
   if (channel) channelRun = ctx.agents.withoutInitiator(() => channel!.run(stopping.signal))

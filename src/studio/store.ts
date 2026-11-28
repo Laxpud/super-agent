@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
 import { studioRecordRole, studioRecords, studioSession } from './domain.ts'
 import {
-  ASSISTANT_CONVERSATION, STUDIO_PAGE_SIZE, STUDIO_TEXT_LIMIT,
+  ASSISTANT_CONVERSATION, GUARD_PENDING_PREFIX, GUARD_PENDING_TEXT_HINT, STUDIO_PAGE_SIZE, STUDIO_TEXT_LIMIT,
   type StudioArtifact, type StudioMessage, type StudioModel, type StudioPage, type StudioPending,
   type StudioSend, type StudioSessionRecord, type StudioSettings, type StudioSource,
 } from './protocol.ts'
@@ -261,9 +261,10 @@ function quoteSnippet(text: string): string {
 
 /** 网页保留一条可直接回复的确认消息；它与飞书卡片及待处理列表是一项决定，而不是新请求。 */
 function confirmationNotice(item: StudioPending): string {
-  const status = item.state === 'pending' ? '待你确认'
-    : item.state === 'expired' ? '确认事项已失效' : item.answer === item.options[0] ? '已记录批准' : '已记录拒绝'
-  const hint = item.state === 'pending' ? '\n\n可直接回复本条消息说「批准」或「拒绝」。' : ''
+  const guard = item.id.startsWith(GUARD_PENDING_PREFIX)
+  const status = item.state === 'pending' ? '待你确认' : item.state === 'expired' ? '确认事项已失效'
+    : guard ? `已处理：${item.answer ?? ''}` : item.answer === item.options[0] ? '已记录批准' : '已记录拒绝'
+  const hint = item.state === 'pending' ? `\n\n${guard ? GUARD_PENDING_TEXT_HINT : '可直接回复本条消息说「批准」或「拒绝」。'}` : ''
   return `${status} · ${item.requester}\n${item.title}${item.detail ? `\n\n${item.detail}` : ''}${hint}`
     .slice(0, STUDIO_TEXT_LIMIT).toWellFormed()
 }
@@ -453,7 +454,7 @@ export class StudioStore {
   }
 
   /** Use the Studio input for addressing, not the Session that supplied the new native output. */
-  addReply(requestMessageId: string, text: string, source?: StudioSource, artifacts?: StudioArtifact[]): StudioMessage {
+  addReply(requestMessageId: string, text: string, source?: StudioSource, artifacts?: StudioArtifact[], projectReceipt = false): StudioMessage {
     return this.write(() => {
       const request = this.messageRow(requestMessageId)
       if (request?.role !== 'user') throw new Error('Studio input message not found')
@@ -472,8 +473,9 @@ export class StudioStore {
         source_session_id, source_event_seq, artifacts) VALUES (?, ?, ?, 'studio', ?, ?, ?, ?, ?, ?, ?)`)
         .run(id, request.conversation_id, assistant ? 'assistant' : 'leader', text, createdAt, request.topic_id, request.id,
           source?.sessionId ?? null, source?.eventSeq ?? null, artifacts === undefined ? null : JSON.stringify(artifacts))
-      const binding = assistant && text.trim() ? this.binding() : undefined
-      if (binding && createdAt >= binding.cutover) this.enqueue(binding.generation, 'message', id, null, request.id)
+      const binding = (assistant || projectReceipt) && text.trim() ? this.binding() : undefined
+      // 项目原对话不镜像；只有宿主生成的执行收据可以独立投递，不猜测原消息在飞书的坐标。
+      if (binding && createdAt >= binding.cutover) this.enqueue(binding.generation, 'message', id, null, assistant ? request.id : undefined)
       return decodeMessage(this.messageRow(id)!)
     })
   }
@@ -530,36 +532,38 @@ export class StudioStore {
   }
 
   /** Persist each pending item once, including items from conversations whose timeline is not mirrored. */
-  addPending(item: StudioPending): StudioPending {
-    return this.write(() => {
-      requireId(item.id, 'pending item ID')
-      requireId(item.conversationId, 'conversation ID')
-      const existing = this.pendingRow(item.id)
-      if (existing) {
-        if (existing.conversation_id !== item.conversationId) throw new Error('Studio pending item already belongs to another conversation')
-        return decodePending(existing)
-      }
-      requireTime(item.createdAt, 'pending item timestamp')
-      this.db.prepare(`INSERT INTO agent_studio_pending (id, kind, conversation_id, topic_id, message_id, task_id, requester,
-        title, detail, options, accepts_text, mobile, state, created_at, answer, answered_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(item.id, item.kind, item.conversationId, item.topicId ?? null, item.messageId ?? null, item.taskId ?? null, item.requester,
-          item.title, item.detail, JSON.stringify(item.options), Number(item.acceptsText), item.mobile, item.state, item.createdAt,
-          item.answer ?? null, item.answeredBy ?? null)
-      if (item.kind === 'confirmation' && item.messageId) {
-        const request = this.messageRow(item.messageId, item.conversationId)
-        if (request?.role === 'user') this.db.prepare(`INSERT INTO agent_studio_message
-          (id, conversation_id, role, channel, text, created_at, topic_id, reply_to) VALUES (?, ?, ?, 'studio', ?, ?, ?, ?)`)
-          .run(item.id, item.conversationId, item.conversationId === ASSISTANT_CONVERSATION ? 'assistant' : 'leader',
-            confirmationNotice(item), item.createdAt, request.topic_id, request.id)
-      }
-      const binding = this.binding()
-      if (binding && item.createdAt >= binding.cutover) {
-        // 重要确认和实际阻塞必须在私聊主聊天可见，不依赖原话题或其投递回执。
-        const parent = item.kind === 'question' && item.conversationId === ASSISTANT_CONVERSATION ? item.messageId ?? item.topicId : undefined
-        this.enqueue(binding.generation, 'pending', null, item.id, parent)
-      }
-      return decodePending(this.pendingRow(item.id)!)
-    })
+  addPending(item: StudioPending): StudioPending { return this.write(() => this.addPendingInTx(item)) }
+
+  /** 加入调用方的事务，使任务授权、待办与飞书出箱共享同一个提交点。 */
+  addPendingInTx(item: StudioPending): StudioPending {
+    this.requirePendingTransaction()
+    requireId(item.id, 'pending item ID')
+    requireId(item.conversationId, 'conversation ID')
+    const existing = this.pendingRow(item.id)
+    if (existing) {
+      if (existing.conversation_id !== item.conversationId) throw new Error('Studio pending item already belongs to another conversation')
+      return decodePending(existing)
+    }
+    requireTime(item.createdAt, 'pending item timestamp')
+    this.db.prepare(`INSERT INTO agent_studio_pending (id, kind, conversation_id, topic_id, message_id, task_id, requester,
+      title, detail, options, accepts_text, mobile, state, created_at, answer, answered_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(item.id, item.kind, item.conversationId, item.topicId ?? null, item.messageId ?? null, item.taskId ?? null, item.requester,
+        item.title, item.detail, JSON.stringify(item.options), Number(item.acceptsText), item.mobile, item.state, item.createdAt,
+        item.answer ?? null, item.answeredBy ?? null)
+    if (item.kind === 'confirmation' && item.messageId) {
+      const request = this.messageRow(item.messageId, item.conversationId)
+      if (request?.role === 'user') this.db.prepare(`INSERT INTO agent_studio_message
+        (id, conversation_id, role, channel, text, created_at, topic_id, reply_to) VALUES (?, ?, ?, 'studio', ?, ?, ?, ?)`)
+        .run(item.id, item.conversationId, item.conversationId === ASSISTANT_CONVERSATION ? 'assistant' : 'leader',
+          confirmationNotice(item), item.createdAt, request.topic_id, request.id)
+    }
+    const binding = this.binding()
+    if (binding && item.createdAt >= binding.cutover) {
+      // 重要确认和实际阻塞必须在私聊主聊天可见，不依赖原话题或其投递回执。
+      const parent = item.kind === 'question' && item.conversationId === ASSISTANT_CONVERSATION ? item.messageId ?? item.topicId : undefined
+      this.enqueue(binding.generation, 'pending', null, item.id, parent)
+    }
+    return decodePending(this.pendingRow(item.id)!)
   }
 
   pendingItem(id: string): StudioPending | undefined {
@@ -605,16 +609,34 @@ export class StudioStore {
   }
 
   settlePending(id: string, status: PendingDecision, answer?: string, answeredBy?: StudioPending['answeredBy']): StudioPending | undefined {
-    return this.write(() => {
-      if (status !== 'resolved' && status !== 'expired') throw new Error('Invalid Studio pending decision')
-      const row = this.db.prepare(`UPDATE agent_studio_pending SET state = ?, answer = ?, answered_by = ?
-        WHERE id = ? AND state = 'pending' RETURNING *`).get(status, answer ?? null, answeredBy ?? null, id) as unknown as PendingRow | undefined
-      if (!row) return undefined
-      const item = decodePending(row)
-      this.updateConfirmationNotice(item)
-      this.enqueuePendingUpdate(id)
-      return item
-    })
+    return this.write(() => this.settleTaskPendingInTx(id, status, answer, answeredBy))
+  }
+
+  /** 只在外层事务中结算；状态及 Web 通知、飞书更新要么一起生效，要么一起回滚。 */
+  settleTaskPendingInTx(id: string, status: PendingDecision, answer?: string, answeredBy?: StudioPending['answeredBy']): StudioPending | undefined {
+    this.requirePendingTransaction()
+    if (status !== 'resolved' && status !== 'expired') throw new Error('Invalid Studio pending decision')
+    const row = this.db.prepare(`UPDATE agent_studio_pending SET state = ?, answer = ?, answered_by = ?
+      WHERE id = ? AND state = 'pending' RETURNING *`).get(status, answer ?? null, answeredBy ?? null, id) as unknown as PendingRow | undefined
+    if (!row) return undefined
+    const item = decodePending(row)
+    this.updateConfirmationNotice(item)
+    this.enqueuePendingUpdate(id)
+    return item
+  }
+
+  /** 停止任务或项目换权时，旧守卫待办与任务授权同时过期。 */
+  expireGuardInterceptionsInTx(taskId?: string): void {
+    this.requirePendingTransaction()
+    const rows = this.db.prepare(`SELECT id FROM agent_studio_pending WHERE state = 'pending'
+      AND substr(id, 1, ?) = ? AND (? IS NULL OR task_id = ?)`)
+      .all(GUARD_PENDING_PREFIX.length, GUARD_PENDING_PREFIX, taskId ?? null, taskId ?? null)
+    for (const row of rows) this.settleTaskPendingInTx(String(row.id), 'expired')
+  }
+
+  private requirePendingTransaction(): void {
+    this.assertActive()
+    if (!this.db.isTransaction) throw new Error('Studio pending mutations require an active transaction')
   }
 
   private updateConfirmationNotice(item: StudioPending): void {

@@ -1,9 +1,10 @@
 /** 项目生命周期由已认证的所有者控制；模型工具不能换任、归档或改变工作范围。 */
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
-import type { StudioProjectRoute } from '../studio/domain.ts'
+import { studioTaskText, type StudioProjectRoute } from '../studio/domain.ts'
 import type { StudioSessions } from '../studio/sessions.ts'
-import { verifyWorkspaceIdentity, WorkspacePathError } from './workspace.ts'
+import type { StudioWorkerPermission } from '../studio/protocol.ts'
+import { canonicalizeWorkspaceRoot, verifyWorkspaceIdentity, WorkspacePathError } from './workspace.ts'
 import { projectArchiveCommand, PROJECT_ARCHIVE_HINT } from './project-archive.ts'
 import { PROJECT_NAME_LIMIT } from './project-store.ts'
 import type { ManagedWorkerStore } from './store.ts'
@@ -19,6 +20,25 @@ const projectFields = { name: z.string().trim().min(1).max(PROJECT_NAME_LIMIT), 
 export function projectText(project: StudioProjectRoute): string {
   return `${project.name} (${project.id}) · ${project.state} · management epoch ${project.managementEpoch}\nObjective: ${project.objective}`
     + `\nWorkspace: ${project.workspacePath ?? 'not set'}\nLeader Bot: ${project.leaderBotId ?? 'not assigned'}`
+}
+
+/** Leader 只能使用项目已经绑定的规范根；模型不能在派工时选择或修复项目绑定。 */
+export function leaderDispatchWorkspace(project: StudioProjectRoute, requested: string | undefined, permission: StudioWorkerPermission,
+  protectedRoots: readonly string[]) {
+  if (project.workspacePath === null) {
+    if (requested !== undefined || permission === 'workspace-write') {
+      throw new WorkspacePathError('STUDIO_WORKSPACE_INVALID', 'Bind the project workspace before requesting local work.')
+    }
+    return null
+  }
+  const bound = canonicalizeWorkspaceRoot(project.workspacePath, protectedRoots)
+  if (bound.root !== project.workspacePath) {
+    throw new WorkspacePathError('STUDIO_WORKSPACE_INVALID', 'The saved project workspace is no longer canonical; bind it again.')
+  }
+  if (requested !== undefined && canonicalizeWorkspaceRoot(requested, protectedRoots).root !== bound.root) {
+    throw new WorkspacePathError('STUDIO_OUTSIDE_WORKSPACE', 'The requested workspace does not match the project workspace.')
+  }
+  return bound
 }
 
 /** 项目命令和统一任务查询不唤醒模型。需要新 Leader 时先创建被动原生会话，再提交管理权。 */
@@ -45,7 +65,7 @@ export class StudioProjectControl {
         const room = this.store.projects.currentLeader(agent.id)?.id
         if (!value) return ok(this.store.tasks(room).items.map(task => `${task.taskId}: ${task.status} · ${task.title}`).join('\n') || 'No Studio tasks.')
         const task = this.store.task(id.parse(value))
-        return task && (role === 'assistant' || task.projectId === room) ? ok(`${task.taskId}: ${task.status}${task.resultSummary ? `\n\n${task.resultSummary}` : ''}`) : reject('No accessible Studio task.')
+        return task && (role === 'assistant' || task.projectId === room) ? ok(studioTaskText(task)) : reject('No accessible Studio task.')
       }
       const archived = projectArchiveCommand(this.store.projectArchive, verb, value, allowed)
       if (archived !== undefined) return ok(archived)

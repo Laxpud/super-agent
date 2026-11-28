@@ -4,7 +4,7 @@ import { setImmediate as yieldToHost, setTimeout as delay } from 'node:timers/pr
 import { z } from 'zod'
 import { feishuSourceScope, validateFeishuInbox, type FeishuBindingConfig } from './feishu-binding.ts'
 import type { StudioFeishuCardResponse, StudioFeishuSdk } from './feishu-sdk.ts'
-import { ASSISTANT_CONVERSATION, STUDIO_TEXT_LIMIT, type FeishuState, type StudioPending } from './protocol.ts'
+import { ASSISTANT_CONVERSATION, GUARD_PENDING_PREFIX, GUARD_PENDING_TEXT_HINT, STUDIO_TEXT_LIMIT, type FeishuState, type StudioPending } from './protocol.ts'
 import type { StudioFeishuDelivery, StudioFeishuInput } from './store.ts'
 export type { StudioFeishuDelivery, StudioFeishuInput } from './store.ts'
 
@@ -92,6 +92,7 @@ function renderPending(pending: StudioPending, appId: string): object {
     ? pending.options : []
   const textReply = pending.state === 'pending' && pending.mobile === 'topic' && pending.kind === 'question' && pending.acceptsText
   const textDecision = pending.state === 'pending' && pending.kind === 'confirmation'
+  const guard = pending.id.startsWith(GUARD_PENDING_PREFIX)
   const context = pending.conversationId === ASSISTANT_CONVERSATION ? 'Assistant 对话' : `项目对话：${excerpt(pending.conversationId, 120)}`
   const who = `发起人：${excerpt(pending.requester, 120)}`
   const where = pending.taskId ? `${context}\n任务：${excerpt(pending.taskId, 120)}` : context
@@ -99,10 +100,10 @@ function renderPending(pending: StudioPending, appId: string): object {
     : textDecision ? '待你确认' : choices.length || textReply ? '待你处理' : '仍待确认'
   const resolution = pending.state === 'resolved'
     ? `${status}${pending.answeredBy ? ` · 来自 ${pending.answeredBy === 'gui' ? 'GUI' : '飞书'}` : ''}`
-      + (pending.kind === 'confirmation' ? `\n${pending.answer === pending.options[0] ? '已记录批准，动作结果另行回报。' : '已记录拒绝。'}`
+      + (pending.kind === 'confirmation' && !guard ? `\n${pending.answer === pending.options[0] ? '已记录批准，动作结果另行回报。' : '已记录拒绝。'}`
         : pending.answer ? `\n答复：${excerpt(pending.answer, 800)}` : '')
     : pending.state === 'expired' ? '此事项已失效，不能再处理。'
-      : textDecision ? '可直接回复这条消息说「批准」或「拒绝」，或在私聊用文字明确说明事项和决定。'
+      : textDecision ? guard ? `${GUARD_PENDING_TEXT_HINT}\n待办 ID：${pending.id}` : '可直接回复这条消息说「批准」或「拒绝」，或在私聊用文字明确说明事项和决定。'
         : textReply ? '请在话题里直接回复这张卡片，Studio 才能将文字登记到此问题。'
           : choices.length ? '请选择明确的答复。' : '仍待确认：需要按该任务原有的控制流程处理。'
   // 将范围分段显示，不把原先用于限制卡片按钮的简短摘要当作完整确认信息。

@@ -7,7 +7,8 @@ import { confirmStudioModel, studioModelOptions } from './models.ts'
 import { StudioError } from './pending.ts'
 import { asksForActiveWork, asksForPending, asksForProjects, confirmationStatusQuery, namesConfirmation, readTextDecision, readRouteControl, readTaskUnblock,
   refersToThisConfirmation } from './owner-text.ts'
-import { ASSISTANT_CONVERSATION, STUDIO_TEXT_LIMIT, type FeishuState, type StudioMessage, type StudioPending, type StudioSend, type StudioSettings } from './protocol.ts'
+import { ASSISTANT_CONVERSATION, GUARD_PENDING_CHOICES, GUARD_PENDING_PREFIX, GUARD_PENDING_TEXT_HINT, STUDIO_TEXT_LIMIT,
+  type FeishuState, type StudioMessage, type StudioPending, type StudioSend, type StudioSettings } from './protocol.ts'
 import { StudioSessions } from './sessions.ts'
 import type { StudioFeishuInput, StudioFeishuPort } from './feishu.ts'
 import type { StudioHttpOperations } from './http.ts'
@@ -61,7 +62,7 @@ export class StudioService {
     }
     const query = confirmationStatusQuery(text)
     if (query) { this.publishDecisions(message.id, query.target, direct); return }
-    const decision = this.textDecision(message, direct)
+    const decision = this.guardTextDecision(message, direct) ?? this.textDecision(message, direct)
     if (decision !== undefined) { this.reply(message.id, decision); return }
     const unblocking = readTaskUnblock(text)
     if (unblocking) {
@@ -113,7 +114,8 @@ export class StudioService {
 
   private describeDecision(item: StudioPending): string {
     return item.state === 'pending' ? '待你确认' : item.state === 'expired' ? '已失效'
-      : item.answer === item.options[0] ? '已记录批准（不等于动作已执行）' : '已记录拒绝'
+      : item.id.startsWith(GUARD_PENDING_PREFIX) ? `已处理：${item.answer ?? ''}`
+        : item.answer === item.options[0] ? '已记录批准（不等于动作已执行）' : '已记录拒绝'
   }
 
   private publishDecisions(id: string, target: string, direct?: StudioPending): void {
@@ -122,6 +124,29 @@ export class StudioService {
     if (!items.length) { this.reply(id, target ? '没有找到对应的确认事项。' : '目前没有已处理的确认事项。'); return }
     this.reply(id, items.slice(0, 10).map(item => `${item.title}（${item.id}）：${this.describeDecision(item)}${items.length === 1 && item.detail ? `\n${item.detail}` : ''}`)
       .join('\n').slice(0, STUDIO_TEXT_LIMIT).toWellFormed())
+  }
+
+  /** 守卫待办没有「批准」语义。只接受原卡片下的明确动作，或动作加确切待办 ID。 */
+  private guardTextDecision(message: StudioMessage, direct?: StudioPending): string | undefined {
+    const anchor = direct?.id.startsWith(GUARD_PENDING_PREFIX) ? direct : undefined
+    const text = message.text.trim().replace(/[。！!]+$/u, '')
+    const options = /^(取消任务|仅解除等待(?:（不重放被拒动作）)?)(?:\s+[#＃]?(guard-intercept:[^\s]+))?$/u.exec(text)
+    if (!options) return anchor ? GUARD_PENDING_TEXT_HINT : undefined
+    const [, action, id] = options
+    if (!anchor && !id) return undefined
+    if (anchor && id && anchor.id !== id) return '回复对象与指定的拦截事项不一致，未改变任何任务。'
+    const item = anchor ?? (id && this.store.pendingItem(id))
+    if (!item || message.createdAt < item.createdAt) return '没有找到对应的当前拦截事项，未改变任何任务。'
+    const [cancel, clear] = GUARD_PENDING_CHOICES
+    const selected = action === cancel ? cancel : clear
+    try {
+      this.sessions.answer(item.id, selected, message.channel === 'feishu' ? 'feishu' : 'gui', 'text')
+      return selected === cancel ? `已取消任务 ${item.taskId}，原执行不会重启。`
+        : `已解除任务 ${item.taskId} 的等待，不重放被拒动作。如需继续，请另发合规范围的新请求。`
+    } catch (error) {
+      if (error instanceof StudioError) return '该拦截事项已经处理或失效，未改变任何任务。'
+      throw error
+    }
   }
 
   /** 只能用认证用户的原文确定决定与对象。不能把其他文字、模型解释或旧答复当成当前授权。 */
@@ -142,6 +167,7 @@ export class StudioService {
     const item = matches[0]!
     if (item.state !== 'pending') return `没有再次作出决定：${item.title}，${this.describeDecision(item)}。`
     if (message.createdAt < item.createdAt) return '这条消息早于当前确认，未作出决定。'
+    if (item.id.startsWith(GUARD_PENDING_PREFIX)) return GUARD_PENDING_TEXT_HINT
     const selected = item.options[parsed.approve ? 0 : 1]
     if (item.options.length !== 2 || selected === undefined) return '该事项没有可对应的批准或拒绝选项。'
     try {
@@ -168,7 +194,9 @@ export class StudioService {
     const summary = !count ? '目前没有待你处理的事项。' : [`还有 ${count} 项待你处理：`, ...items.map((item, index) =>
       `${index + 1}. ${item.requester} — ${item.title.slice(0, 160)}${item.taskId ? `（任务 ${item.taskId}）` : ''}`
       + (item.kind === 'confirmation' ? ` · 待你确认（${item.id}）` : '')),
-    ...(items.some(item => item.kind === 'confirmation') ? ['可直接回复对应的确认消息说「批准」或「拒绝」，也可以在私聊说清决定和事项。'] : []),
+    ...(items.some(item => item.kind === 'confirmation' && !item.id.startsWith(GUARD_PENDING_PREFIX))
+      ? ['可直接回复对应的确认消息说「批准」或「拒绝」，也可以在私聊说清决定和事项。'] : []),
+    ...(items.some(item => item.id.startsWith(GUARD_PENDING_PREFIX)) ? [GUARD_PENDING_TEXT_HINT] : []),
     ...(count > items.length ? ['这里只显示前 10 项；可说出要查询的确切事项。'] : [])].join('\n')
     this.reply(requestId, summary)
   }

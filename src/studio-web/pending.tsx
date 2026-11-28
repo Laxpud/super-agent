@@ -1,6 +1,6 @@
 /** 待处理事项只对仍有效的明确选项或文本开放回答。 */
 import { useId, useMemo, useRef, useState } from 'react'
-import type { StudioPending } from '../studio/protocol.ts'
+import { GUARD_PENDING_PREFIX, type StudioPending } from '../studio/protocol.ts'
 import { StudioApiError } from './api.ts'
 import { createQuery, nextPage, useQuery } from './query.ts'
 import { Button, chatTitle, FailureNotice, PageHeading, Pager, QueryStatus, Time, useStudio } from './ui.tsx'
@@ -13,6 +13,7 @@ function PendingItem({ item, resolved, refresh }: { item: StudioPending; resolve
   const running = useRef(false)
   const inputId = useId()
   const blocked = item.kind === 'blocked'
+  const guard = item.id.startsWith(GUARD_PENDING_PREFIX)
   const answer = async (value: string) => {
     if (running.current || item.state !== 'pending' || !value.trim()) return
     running.current = true
@@ -51,7 +52,7 @@ function PendingItem({ item, resolved, refresh }: { item: StudioPending; resolve
     <div className="as-actions">
       <Button onClick={source}>{t(item.messageId || item.recordSessionId ? 'source' : item.topicId ? 'topic' : 'openConversation')}</Button>
       {item.state === 'pending' && <span className="as-pill" data-tone={item.kind !== 'confirmation' && item.mobile === 'unsupported' ? 'warn' : undefined}>
-        {t(item.kind === 'confirmation' ? 'decisionText' : `mobile.${item.mobile}`)}</span>}
+        {t(guard ? 'guardDecisionText' : item.kind === 'confirmation' ? 'decisionText' : `mobile.${item.mobile}`)}</span>}
     </div>
     {failure !== undefined && <FailureNotice failure={failure} />}
     {item.state === 'pending' ? <>

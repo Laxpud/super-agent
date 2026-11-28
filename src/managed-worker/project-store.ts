@@ -115,7 +115,9 @@ export class ProjectStore {
       WHERE project_id = ? AND status IN ('queued', 'running', 'waiting_approval', 'blocked') RETURNING task_id`).all(at, id)
     this.db.prepare(`UPDATE studio_task_execution SET ended_at = ?, outcome = 'project-authority-changed' WHERE ended_at IS NULL
       AND task_id IN (SELECT task_id FROM studio_task WHERE project_id = ?)`).run(at, id)
-    return rows.map(row => String(row.task_id))
+    const ids = rows.map(row => String(row.task_id))
+    for (const taskId of ids) this.access.expireGuardInterceptionsInTx(taskId)
+    return ids
   }
 }
 

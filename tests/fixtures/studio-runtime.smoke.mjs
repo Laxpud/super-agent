@@ -159,7 +159,8 @@ try {
           assert.ok(tools.includes('studio_delegate_task'))
           block = { type: 'tool-call', id: 'offline-delegate-call', name: 'studio_delegate_task', arguments: '{}' }
         } else {
-          const inputs = options.messages.filter(message => message.role === 'user'
+          // rc.5 可由宿主附加时间上下文，与原生运行时快照一样不属于 Worker 收到的业务请求。
+          const inputs = options.messages.filter(message => message.role === 'user' && message.source?.kind !== 'time-context'
             && !(message.source?.kind === 'runtime-context' && message.source.form === 'snapshot'))
           assert.deepEqual(inputs.map(message => [message.source?.kind, contentText(message)]), [['agent-studio', [taskRequest]]],
             'The Worker receives exactly its assigned business input alongside required native runtime context')

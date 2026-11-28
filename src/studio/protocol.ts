@@ -46,6 +46,26 @@ export type StudioRole = 'assistant' | 'leader' | 'worker'
 export type StudioRecordRole = StudioRole | 'document-worker' | 'draft-worker' | 'study-worker' | 'advisor' | 'subagent' | 'legacy'
 export type StudioWorkerPermission = 'read-only' | 'workspace-write'
 export type StudioTaskStatus = 'queued' | 'running' | 'waiting_approval' | 'blocked' | 'interrupted' | 'cancelled' | 'delivered'
+export interface StudioChangedFile { path: string; action: 'write' | 'edit' }
+export interface StudioCommandCheck {
+  command: string
+  workdir: string
+  exitCode: number | null
+  signal: string | null
+  timedOut: boolean
+  aborted: boolean
+  status: 'passed' | 'failed'
+  output: string
+}
+export interface StudioCheckResult {
+  version: 1
+  changedFiles: StudioChangedFile[]
+  checks: StudioCommandCheck[]
+  overallCheckStatus: 'passed' | 'failed' | 'not_run'
+  /** 达到收据容量后仍统计省略条数，并用全部检查计算总体状态。 */
+  omittedChecks?: number
+  omittedChangedFiles?: number
+}
 export interface StudioTaskSummary {
   taskId: string
   projectId: string | null
@@ -59,7 +79,8 @@ export interface StudioTaskSummary {
   title: string
   requestText: string
   resultSummary: string | null
-  checkResult: string | null
+  /** 新收据采用结构化格式；旧阻塞说明和历史检查仍可能是纯文本。 */
+  checkResult: StudioCheckResult | string | null
   artifacts: StudioArtifact[]
   externalJob: unknown
   createdAt: number
@@ -88,6 +109,10 @@ export interface StudioState {
   /** Implicit IDs are self-identifying. This list covers adopted native Sessions without a Studio-allocated ID. */
   hiddenSessionIds?: string[]
 }
+
+export const GUARD_PENDING_PREFIX = 'guard-intercept:'
+export const GUARD_PENDING_CHOICES = ['取消任务', '仅解除等待（不重放被拒动作）'] as const
+export const GUARD_PENDING_TEXT_HINT = '直接回复确认消息，或在私聊发送「取消任务 <待办 ID>」或「仅解除等待 <待办 ID>」。解除等待不会重放被拒动作。'
 
 export interface StudioPending {
   id: string

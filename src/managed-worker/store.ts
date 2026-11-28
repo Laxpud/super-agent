@@ -1,14 +1,17 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { backup, DatabaseSync, type SQLOutputValue } from 'node:sqlite'
-import { studioActiveTasks, studioArtifacts, studioBlockingItems, studioHiddenIds, studioPendingRecord, studioProject, studioProjects, studioSession,
-  studioTask, studioTasks } from '../studio/domain.ts'
-import { ASSISTANT_CONVERSATION, type StudioRecordRole, type StudioRole, type StudioTaskStatus, type StudioWorkerPermission } from '../studio/protocol.ts'
+import { studioActiveTasks, studioArtifacts, studioBlockingItems, studioDeliverySummary, studioHiddenIds, studioPendingRecord, studioProject, studioProjects,
+  studioSession, studioTask, studioTasks } from '../studio/domain.ts'
+import { ASSISTANT_CONVERSATION, GUARD_PENDING_CHOICES, GUARD_PENDING_PREFIX, type StudioCheckResult, type StudioPending, type StudioRecordRole,
+  type StudioRole, type StudioTaskStatus, type StudioWorkerPermission } from '../studio/protocol.ts'
+import { STUDIO_OWNER_PREFIX } from '../studio/source.ts'
 import { STUDIO_SCHEMA, StudioStore } from '../studio/store.ts'
 import { MemoryStore } from './memory-store.ts'
 import { ProjectArchiveStore } from './project-archive-store.ts'
 import { ProjectStore } from './project-store.ts'
+import type { WorkerGuardDenial } from './worker-guard.ts'
 import { canonicalizeWorkspaceRoot, protectedHostRoots } from './workspace.ts'
 
 const SCHEMA = `
@@ -301,6 +304,13 @@ export interface StudioTaskInput {
 export interface StudioExecution {
   taskId: string; executionEpoch: number; authorizationVersion: number; sessionId: string; runId: string; managementEpoch: number | null
 }
+export interface GuardInterceptionSource { conversationId: string; messageId?: string; topicId?: string }
+const GUARD_PENDING_LIMIT = 5
+
+function guardPendingTarget(id: string): { taskId: string; version: number } | undefined {
+  const match = /^guard-intercept:([a-z\d-]{36}):([1-9]\d*):[a-f0-9]{20}$/u.exec(id)
+  if (match?.[1] && Number.isSafeInteger(Number(match[2]))) return { taskId: match[1], version: Number(match[2]) }
+}
 
 /** 统一任务、项目和对话账本共用连接和运行栅栏。所有状态更新必须属于当前宿主。 */
 export class ManagedWorkerStore {
@@ -350,11 +360,12 @@ export class ManagedWorkerStore {
       })
       this.assistantBotId = started.bot
       this.recoveredTasks = started.recovered
-      const access = { db, write: <T>(fn: () => T) => this.write(fn), assertActive: () => this.assertActive() }
+      const access = { db, write: <T>(fn: () => T) => this.write(fn), assertActive: () => this.assertActive(),
+        expireGuardInterceptionsInTx: (taskId: string) => this.studio.expireGuardInterceptionsInTx(taskId) }
+      this.studio = new StudioStore(db, access.assertActive, true)
       this.projects = new ProjectStore(access, this.protectedRoots)
       this.memory = new MemoryStore(access)
       this.projectArchive = new ProjectArchiveStore(access)
-      this.studio = new StudioStore(db, access.assertActive, true)
       this.studio.recover()
     } catch (error) {
       try { this.close() } catch { /* 保留启动错误。 */ }
@@ -388,13 +399,20 @@ export class ManagedWorkerStore {
   }
 
   /** 宿主先撤销活动执行，再通知原生执行结束。 */
-  interruptActiveTasks(): number { return this.write(() => this.#interruptAll(studioNow(), 'host-stopped')) }
+  interruptActiveTasks(): number {
+    return this.write(() => {
+      const changed = this.#interruptAll(studioNow(), 'host-stopped')
+      this.studio.expireGuardInterceptionsInTx()
+      return changed
+    })
+  }
 
   /** 在停止接收新操作、排空所有运行句柄后关闭本次写栅栏。 */
   finishRun(): void {
     if (this.#closed || this.#db.prepare('SELECT clean FROM studio_host_run WHERE singleton = 1 AND run_id = ?').get(this.#runId)?.clean === 1) return
     this.write(() => {
       this.#interruptAll(studioNow(), 'host-stopped')
+      this.studio.expireGuardInterceptionsInTx()
       this.#db.prepare('UPDATE studio_host_run SET clean = 1 WHERE singleton = 1 AND run_id = ?').run(this.#runId)
     })
   }
@@ -455,6 +473,7 @@ export class ManagedWorkerStore {
       }
       const workspace = input.workspacePath !== null && input.projectId === null
         ? canonicalizeWorkspaceRoot(input.workspacePath, this.protectedRoots).root : input.workspacePath
+      if (workspace === null && input.permission === 'workspace-write') throw new Error('Studio write tasks require a bound workspace')
       const taskId = randomUUID(), at = studioNow()
       this.#db.prepare(`INSERT INTO studio_task (task_id, project_id, source_message_id, request_key, requester_bot_id, workspace_path,
         permission, status, title, request_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`)
@@ -495,15 +514,80 @@ export class ManagedWorkerStore {
       && execution.runId === this.#runId
   }
 
-  finishExecution(execution: StudioExecution, result: { text: string; eventSeq: number } | undefined, outcome: string): boolean {
+  finishExecution(execution: StudioExecution, result: { text: string; eventSeq: number } | undefined, outcome: string,
+    checkResult?: StudioCheckResult): boolean {
     return this.write(() => {
       if (!this.executionCurrent(execution)) return false
       const db = this.#db, at = studioNow()
-      db.prepare(`UPDATE studio_task SET status = ?, authorization_version = authorization_version + 1, result_summary = ?, updated_at = ?
-        WHERE task_id = ?`).run(result ? 'delivered' : 'interrupted', result?.text ?? null, at, execution.taskId)
+      const task = this.task(execution.taskId)!
+      const summary = checkResult ? studioDeliverySummary(task, checkResult, result?.text) : result?.text ?? null
+      db.prepare(`UPDATE studio_task SET status = ?, authorization_version = authorization_version + 1, result_summary = ?,
+        check_result = coalesce(?, check_result), updated_at = ? WHERE task_id = ?`)
+        .run(result ? 'delivered' : 'interrupted', summary, checkResult ? JSON.stringify(checkResult) : null, at, execution.taskId)
       db.prepare(`UPDATE studio_task_execution SET ended_at = ?, result_event_seq = ?, outcome = ? WHERE task_id = ? AND execution_epoch = ?`)
         .run(at, result?.eventSeq ?? null, outcome, execution.taskId, execution.executionEpoch)
       return true
+    })
+  }
+
+  /** 守卫撤销授权、结束已拦截执行并写入两端待办。任一步不成立时不会留半条记录。 */
+  recordGuardInterception(execution: StudioExecution, denial: WorkerGuardDenial, fingerprint: string, actionSummary: string,
+    source?: GuardInterceptionSource, checkResult?: StudioCheckResult): { recorded: boolean; pendingId?: string } {
+    if (denial.needsOwnerDecision !== true) return { recorded: false }
+    return this.write(() => {
+      if (!this.executionCurrent(execution)) return { recorded: false }
+      const task = this.task(execution.taskId)!, db = this.#db
+      const version = execution.authorizationVersion + 1
+      const prefix = `${GUARD_PENDING_PREFIX}${execution.taskId}:${version}:`
+      const shortHash = createHash('sha256').update(JSON.stringify([execution.executionEpoch, denial.code, fingerprint])).digest('hex').slice(0, 20)
+      const id = `${prefix}${shortHash}`
+      const count = db.prepare(`SELECT count(*) AS count FROM agent_studio_pending WHERE task_id = ? AND substr(id, 1, ?) = ?`)
+        .get(task.taskId, prefix.length, prefix)?.count
+      if (this.studio.pendingItem(id) || Number(count) >= GUARD_PENDING_LIMIT) return { recorded: false }
+
+      const at = studioNow()
+      const changed = db.prepare(`UPDATE studio_task SET status = 'waiting_approval', authorization_version = ?, updated_at = ?,
+        result_summary = coalesce(?, result_summary), check_result = coalesce(?, check_result)
+        WHERE task_id = ? AND status = 'running' AND authorization_version = ?`)
+        .run(version, at, checkResult ? studioDeliverySummary(task, checkResult) : null, checkResult ? JSON.stringify(checkResult) : null,
+          task.taskId, execution.authorizationVersion)
+      if (!changed.changes) return { recorded: false }
+      const ended = db.prepare(`UPDATE studio_task_execution SET ended_at = ?, outcome = 'waiting_approval'
+        WHERE task_id = ? AND execution_epoch = ? AND ended_at IS NULL AND session_id = ? AND run_id = ?`)
+        .run(at, task.taskId, execution.executionEpoch, execution.sessionId, execution.runId)
+      if (ended.changes !== 1) throw new Error('Studio guard interception lost its execution')
+
+      const conversationId = task.projectId ?? ASSISTANT_CONVERSATION
+      const savedMessageId = task.sourceMessageId?.startsWith(STUDIO_OWNER_PREFIX) ? task.sourceMessageId.slice(STUDIO_OWNER_PREFIX.length) : undefined
+      const requestedMessageId = source?.conversationId === conversationId ? source.messageId : undefined
+      const user = savedMessageId && (!requestedMessageId || requestedMessageId === savedMessageId)
+        ? this.studio.message(conversationId, savedMessageId) : undefined
+      const topicId = user?.topicId ?? user?.id
+      this.studio.addPendingInTx({ id, kind: 'confirmation', taskId: task.taskId, conversationId,
+        ...(user?.role === 'user' && (!source?.topicId || source.topicId === topicId) && { messageId: user.id, ...(topicId && { topicId }) }),
+        requester: 'Agent Studio', title: `Worker 操作已拦截（${denial.code}）`,
+        detail: `原因：${denial.reason}\n动作：${actionSummary.slice(0, 240).toWellFormed()}\n旧执行已撤权。解除等待不会重放该动作；如需继续，请另发合规范围的新请求。`,
+        options: [...GUARD_PENDING_CHOICES], acceptsText: false, mobile: 'card', state: 'pending', createdAt: Date.parse(at) })
+      return { recorded: true, pendingId: id }
+    })
+  }
+
+  /** Web 和飞书共用同一条决定；只能终止等待，不能启动执行或恢复旧授权。 */
+  resolveGuardInterception(id: string, value: string, channel: 'gui' | 'feishu'): StudioPending | undefined {
+    const target = guardPendingTarget(id)
+    const [cancel, clear] = GUARD_PENDING_CHOICES
+    if (!target || (value !== cancel && value !== clear)) return
+    return this.write(() => {
+      const item = this.studio.pendingItem(id)
+      if (item?.state !== 'pending' || item.kind !== 'confirmation' || item.taskId !== target.taskId || !item.options.includes(value)) return
+      const status = value === cancel ? 'cancelled' : 'interrupted'
+      const changed = this.#db.prepare(`UPDATE studio_task SET status = ?, authorization_version = authorization_version + 1, updated_at = ?
+        WHERE task_id = ? AND authorization_version = ? AND status = 'waiting_approval'`)
+        .run(status, studioNow(), target.taskId, target.version)
+      if (!changed.changes) return
+      const settled = this.studio.settleTaskPendingInTx(id, 'resolved', value, channel)
+      if (!settled) throw new Error('Studio guard decision lost its pending item')
+      return settled
     })
   }
 
@@ -530,6 +614,7 @@ export class ManagedWorkerStore {
         .run(status, at, taskId, expectedVersion ?? null, expectedVersion ?? null)
       if (!changed.changes) return false
       db.prepare('UPDATE studio_task_execution SET ended_at = ?, outcome = ? WHERE task_id = ? AND ended_at IS NULL').run(at, status, taskId)
+      this.studio.expireGuardInterceptionsInTx(taskId)
       return true
     })
   }
@@ -539,4 +624,5 @@ export interface StudioStoreAccess {
   db: DatabaseSync
   write<T>(operation: () => T): T
   assertActive(): void
+  expireGuardInterceptionsInTx(taskId: string): void
 }

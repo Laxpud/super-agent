@@ -7,11 +7,12 @@ import type {} from '@deepseek-ai/dsh-session-persistence'
 import { ASSISTANT_PRESET, createStudioSession, type OwnerRequest } from '../managed-worker/assistant.ts'
 import { LEADER_PRESET } from '../managed-worker/project.ts'
 import { currentPresetId } from '../infra/preset-names.ts'
-import type { ManagedWorkerStore, StudioTaskInput } from '../managed-worker/store.ts'
+import type { GuardInterceptionSource, ManagedWorkerStore, StudioTaskInput } from '../managed-worker/store.ts'
+import { studioDeliverySummary, studioTaskText } from './domain.ts'
 import { confirmStudioModel, defaultStudioModel } from './models.ts'
 import { StudioError, StudioPendingBroker, type StudioAnswerVia } from './pending.ts'
 import { namesConfirmation, ownerTextKey, type TextRouteControl } from './owner-text.ts'
-import { ASSISTANT_CONVERSATION, STUDIO_TEXT_LIMIT, type StudioMessage, type StudioModel, type StudioRecordEvent,
+import { ASSISTANT_CONVERSATION, GUARD_PENDING_CHOICES, GUARD_PENDING_PREFIX, STUDIO_TEXT_LIMIT, type StudioMessage, type StudioModel, type StudioRecordEvent,
   type StudioSettings, type StudioSource } from './protocol.ts'
 import { STUDIO_CONTEXT_PREFIX, STUDIO_OWNER_PREFIX, isStudioOwnerMessage, newStudioSessionId, studioOwnerMessageId } from './source.ts'
 
@@ -40,6 +41,7 @@ interface NativeTurn {
   related?: { taskId: string }
   scheduled?: boolean
   confirmationAsked?: boolean
+  writeGrant?: OwnerRequest & { workspacePath: string }
   freshSession: boolean
   router?: RouterInput
   done: ReturnType<typeof Promise.withResolvers<TurnEnd>>
@@ -74,7 +76,7 @@ export class StudioSessions {
   private readonly lastSession = new Map<string, string>()
   private readonly onEvent: () => void
   private readonly broker: StudioPendingBroker
-  private readonly background = new Map<string, { control: AbortController; done: Promise<void> }>()
+  private readonly background = new Map<string, { control: AbortController; done: Promise<void>; origin: GuardInterceptionSource }>()
 
   constructor(private readonly ctx: Context, private readonly domain: ManagedWorkerStore, private readonly cwd: string,
     private readonly defaults: Pick<StudioSettings, 'assistant' | 'leader'>,
@@ -159,7 +161,16 @@ export class StudioSessions {
   /** 登记先于前台释放；后台任务只受本任务控制和 Host 生命周期约束，不借用发起的对话轮次。 */
   scheduleTask(agent: Agent, fields: StudioTaskInput, run: (id: string, signal: AbortSignal) => Promise<void>) {
     const turn = this.turns.get(agent.id)
-    if (!turn || turn.scheduled || turn.confirmationAsked || !this.canAsk(agent)) throw new StudioError('TASK_SOURCE_STALE', 'This owner request no longer permits dispatch.', 409)
+    const source = { sourceMessageId: fields.sourceMessageId, sourceRequestId: fields.requestId, requestText: fields.requestText }
+    const grant = turn?.writeGrant
+    const confirmed = grant && fields.workspacePath !== null && grant.workspacePath === fields.workspacePath
+      && grant.sourceMessageId === source.sourceMessageId && grant.sourceRequestId === source.sourceRequestId && grant.requestText === source.requestText
+    if (!turn || turn.scheduled || !this.matchesOwnerRequest(agent, source)
+      || (fields.permission === 'workspace-write' ? !confirmed : turn.confirmationAsked)) {
+      throw new StudioError('TASK_SOURCE_STALE', 'This owner request no longer permits dispatch with the requested workspace permission.', 409)
+    }
+    // 确认只供这次登记使用；旧待办或失败的登记不能再次赋权。
+    delete turn.writeGrant
     const task = this.domain.registerTask(fields)
     if (!task.created) return task
     const control = new AbortController()
@@ -174,7 +185,12 @@ export class StudioSessions {
       const artifacts = this.domain.studioArtifacts(ready.projectId ?? ASSISTANT_CONVERSATION, fields.sourceMessageId)
       if (ready.status === 'delivered' && artifacts.length) {
         for (const artifact of artifacts) this.store.addReply(message.id, artifact.text, artifact.source, [artifact])
-      } else this.store.addReply(message.id, `任务 ${task.taskId}：${ready.status}。`)
+      } else this.store.addReply(message.id, ready.resultSummary ? studioTaskText(ready) : `任务 ${task.taskId}：${ready.status}。`)
+      const evidence = ready.checkResult
+      if (ready.projectId && evidence && typeof evidence === 'object' && (evidence.changedFiles.length || evidence.checks.length)) {
+        // 飞书只镜像项目的宿主收据，不转发项目原始消息、Worker 正文或原生日志。
+        this.store.addReply(message.id, `项目任务 ${task.taskId}：${ready.status}\n\n${studioDeliverySummary(ready, evidence)}`, undefined, undefined, true)
+      }
       this.wake()
     }).catch(() => {
       if (this.stopping.aborted || control.signal.aborted) return
@@ -184,12 +200,16 @@ export class StudioSessions {
         this.wake()
       } catch { /* 保留原账本，不自动重复执行。 */ }
     }).finally(() => this.background.delete(task.taskId))
-    this.background.set(task.taskId, { control, done })
+    this.background.set(task.taskId, { control, done, origin: { conversationId: message.conversationId, messageId: message.id,
+      topicId: message.topicId ?? message.id } })
     this.store.addReply(message.id, `已登记任务 ${task.taskId}。处理结果会回到原对话。`)
     this.wake()
     if (turn.router) { this.releaseForeground(turn.router); this.pumpRouter() }
     return task
   }
+
+  /** 将拦截通知关联到本次派工原始消息，不使用模型提供的坐标。 */
+  taskOrigin(taskId: string): GuardInterceptionSource | undefined { return this.background.get(taskId)?.origin }
 
   stopTask(taskId: string): boolean {
     if (!this.domain.invalidateTask(taskId, 'cancelled')) return false
@@ -219,6 +239,21 @@ export class StudioSessions {
       this.releaseForeground(turn.router)
       this.pumpRouter()
     }).then(answer => answer === fields.approve)
+  }
+
+  /** 将确认绑定到本轮原文和规范目录，授权不进入模型上下文，也不跨轮保留。 */
+  async confirmTaskWrite(agent: Agent, source: OwnerRequest, workspacePath: string, signal: AbortSignal): Promise<boolean> {
+    const turn = this.turns.get(agent.id)
+    if (!turn || !this.matchesOwnerRequest(agent, source)) throw new StudioError('TASK_SOURCE_STALE', 'The owner request is no longer current.', 409)
+    const approved = await this.confirmWithOwner(agent, { title: '允许 Worker 写入此任务的工作区？', approve: '允许本任务写入',
+      detail: `档位：workspace-write\n规范工作区：${JSON.stringify(workspacePath)}\n仅授权下面这条原始请求，不扩大工具的操作范围。\n\n任务原文：\n${source.requestText}` }, signal)
+    signal.throwIfAborted()
+    if (!approved) return false
+    if (this.turns.get(agent.id) !== turn || !this.matchesOwnerRequest(agent, source)) {
+      throw new StudioError('TASK_SOURCE_STALE', 'The approved request is no longer current.', 409)
+    }
+    turn.writeGrant = { ...source, workspacePath }
+    return true
   }
 
   matchesOwnerRequest(agent: Agent, input: OwnerRequest): boolean {
@@ -448,7 +483,19 @@ export class StudioSessions {
     return turn?.agent === agent && this.authority(agent, turn.message.conversationId, turn.router)
   }
 
-  answer(id: string, value: string, channel: 'gui' | 'feishu', via: StudioAnswerVia) { return this.broker.answer(id, value, channel, via) }
+  answer(id: string, value: string, channel: 'gui' | 'feishu', via: StudioAnswerVia) {
+    if (!id.startsWith(GUARD_PENDING_PREFIX)) return this.broker.answer(id, value, channel, via)
+    if (via !== 'gui' && via !== 'card' && via !== 'text') {
+      throw new StudioError('MOBILE_UNSUPPORTED', 'Choose an explicit decision for this guard interception.', 409)
+    }
+    if (!GUARD_PENDING_CHOICES.some(option => option === value)) {
+      throw new StudioError('INVALID_ANSWER', 'Choose a cancellation or clear waiting without replay.')
+    }
+    const settled = this.domain.resolveGuardInterception(id, value, channel)
+    if (!settled) throw new StudioError('QUESTION_EXPIRED', 'The guard interception is no longer current.', 409)
+    this.wake()
+    return settled
+  }
 
   private workAt(input: StudioMessage): NativeTurn['related'] {
     const source = studioOwnerMessageId(input.id)

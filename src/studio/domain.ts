@@ -1,7 +1,8 @@
 /** 只读投影不授予 Bot、会话或任务执行权限。 */
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite'
-import { ASSISTANT_CONVERSATION, isStudioInternalSession, STUDIO_PAGE_SIZE, STUDIO_TEXT_LIMIT, type StudioArtifact, type StudioPage, type StudioPending,
-  type StudioProjectSummary, type StudioRecordRole, type StudioSessionRecord, type StudioTaskSummary } from './protocol.ts'
+import { z } from 'zod'
+import { ASSISTANT_CONVERSATION, isStudioInternalSession, STUDIO_PAGE_SIZE, STUDIO_TEXT_LIMIT, type StudioArtifact, type StudioCheckResult, type StudioPage,
+  type StudioPending, type StudioProjectSummary, type StudioRecordRole, type StudioSessionRecord, type StudioTaskSummary } from './protocol.ts'
 
 const at = (value: unknown) => typeof value === 'string' ? Date.parse(value) || 0 : 0
 const nullable = (value: unknown) => typeof value === 'string' ? value : null
@@ -81,6 +82,53 @@ const TASK_SELECT = `SELECT t.rowid AS cursor, t.*, e.session_id, e.result_event
 function json(value: unknown, fallback: unknown): unknown {
   if (typeof value === 'string') try { return JSON.parse(value) as unknown } catch { /* 扩展数据不影响基础任务读取。 */ }
   return fallback
+}
+
+const checkSchema = z.object({ version: z.literal(1),
+  changedFiles: z.array(z.object({ path: z.string(), action: z.enum(['write', 'edit']) })),
+  checks: z.array(z.object({ command: z.string(), workdir: z.string(), exitCode: z.int().nullable(), signal: z.string().nullable(),
+    timedOut: z.boolean(), aborted: z.boolean(), status: z.enum(['passed', 'failed']), output: z.string() })),
+  overallCheckStatus: z.enum(['passed', 'failed', 'not_run']),
+  omittedChecks: z.int().positive().exactOptional(), omittedChangedFiles: z.int().positive().exactOptional(),
+}) satisfies z.ZodType<StudioCheckResult>
+
+/** 新版收据和旧文本共用 TEXT 列；未知格式不阻止读取已登记的任务。 */
+function taskCheckResult(value: unknown): StudioTaskSummary['checkResult'] {
+  if (typeof value !== 'string') return null
+  const parsed = checkSchema.safeParse(json(value, null))
+  return parsed.success ? parsed.data : value
+}
+
+const excerpt = (text: string, limit: number) => text.length > limit ? `${text.slice(0, limit - 1).toWellFormed()}…` : text
+
+/** 交付先给出宿主事实，再区分 Worker 原文。跨端摘要截取有限条目；任务 API 保留结构化明细。 */
+export function studioDeliverySummary(task: Pick<StudioTaskSummary, 'workspacePath' | 'permission'>, evidence: StudioCheckResult,
+  workerText?: string): string {
+  const omittedFiles = (evidence.omittedChangedFiles ?? 0) + Math.max(0, evidence.changedFiles.length - 16)
+  const omittedChecks = (evidence.omittedChecks ?? 0) + Math.max(0, evidence.checks.length - 8)
+  const host = [
+    `宿主执行收据｜工作区：${excerpt(JSON.stringify(task.workspacePath), 4_096)}｜权限：${task.permission}`,
+    `检查总体状态：${evidence.overallCheckStatus}`,
+    '已观测的文件工具改动（相对于工作区）：',
+    ...(evidence.changedFiles.length ? evidence.changedFiles.slice(0, 16).map(file => `- ${file.action} ${excerpt(JSON.stringify(file.path), 512)}`) : ['- 无']),
+    ...(omittedFiles ? [`- 另有 ${omittedFiles} 项未在摘要中列出。`] : []),
+    '宿主命令收据：',
+    ...(evidence.checks.length ? evidence.checks.slice(0, 8).map(check => {
+      const flags = [check.signal && `信号 ${check.signal}`, check.timedOut && '超时', check.aborted && '已中止'].filter(Boolean)
+      return `- ${check.status}｜退出码 ${check.exitCode ?? '未知'}${flags.length ? `｜${flags.join('、')}` : ''}｜${check.command}`
+        + `\n  workdir: ${excerpt(JSON.stringify(check.workdir), 512)}${check.output ? `\n  输出：${excerpt(check.output, 600)}` : ''}`
+    }) : ['- 未运行']),
+    ...(omittedChecks ? [`- 另有 ${omittedChecks} 项检查未在摘要中列出；总体状态计算包含所有已观测检查。`] : []),
+  ].join('\n')
+  const label = '\n\nWorker 正文（不作为宿主证据）：\n'
+  return workerText ? host + label + excerpt(workerText, Math.min(10_000, STUDIO_TEXT_LIMIT - host.length - label.length)) : host
+}
+
+/** 从统一账本显示状态与已保存的交付，兼容没有收据的历史任务。 */
+export function studioTaskText(task: StudioTaskSummary): string {
+  const detail = task.resultSummary ?? (typeof task.checkResult === 'object' && task.checkResult
+    ? studioDeliverySummary(task, task.checkResult) : task.checkResult)
+  return `${task.taskId}: ${task.status}${detail ? `\n\n${detail}` : ''}`
 }
 
 function taskRow(row: Row): StudioTaskSummary {

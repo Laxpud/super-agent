@@ -3,22 +3,47 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionSeq, type SessionId } from '@deepseek-ai/dsh-session'
-import type { ToolOutputDefinition } from '@deepseek-ai/dsh-tools'
+import type { ToolExecution, ToolExecutionResult, ToolOutputDefinition } from '@deepseek-ai/dsh-tools'
+import { studioTaskText } from '../studio/domain.ts'
 import { z } from 'zod'
 import { LIST_PROJECTS, STUDIO_TEXT_LIMIT, WORKER_DELEGATE, WORKER_READ, type StudioModel, type StudioRole, type StudioWorkerPermission } from '../studio/protocol.ts'
 import { StudioError } from '../studio/pending.ts'
 import type { StudioSessions } from '../studio/sessions.ts'
 import { isStudioMessageContext, newStudioSessionId } from '../studio/source.ts'
+import { leaderDispatchWorkspace } from './project.ts'
 import type { ManagedWorkerStore, StudioExecution } from './store.ts'
 import { classifyProviderFailure, type WorkerModelPolicy } from './text-worker-model-policy.ts'
+import { WorkerEvidence } from './worker-evidence.ts'
 import { evaluateWorkerToolCall, STUDIO_LIST_DIRECTORY, workerSandboxMatches, type WorkerGuardExecution, type WorkerSandboxPolicy } from './worker-guard.ts'
-import { canonicalizeWorkspaceRoot, listWorkspaceDirectory, verifyWorkspaceIdentity, WORKSPACE_LIST_LIMIT, WorkspacePathError } from './workspace.ts'
+import { canonicalizeWorkspaceRoot, listWorkspaceDirectory, verifyWorkspaceIdentity, WORKSPACE_LIST_LIMIT, WorkspacePathError,
+  type WorkspaceBinding } from './workspace.ts'
 
 export const ASSISTANT_PRESET = 'agent-studio-assistant'
 export const WORKER_PRESET = 'agent-studio-managed-worker'
 const WORKER_TIMEOUT_MS = 180_000
 const noArgs = z.strictObject({})
+const boundedText = (max: number) => z.string().min(1).max(max).refine(value => value.isWellFormed() && !value.includes('\0') && !!value.trim())
+const delegateArgs = z.strictObject({
+  workspacePath: boundedText(4_096).exactOptional().describe('Assistant: absolute directory explicitly stated by the owner. Leader: omit to use the project workspace.'),
+  permission: z.enum(['read-only', 'workspace-write']).exactOptional().describe('Defaults to read-only. Workspace write requires a bound workspace and explicit owner confirmation.'),
+  title: boundedText(120).exactOptional().describe('A display label only; do not put directions or permissions in it.'),
+  request: boundedText(STUDIO_TEXT_LIMIT).exactOptional().describe('Omit to use the current owner request. If supplied, it must match that request verbatim.'),
+})
 const taskArg = z.strictObject({ taskId: z.uuid() })
+const WRITE_CONFIRMATION_TIMEOUT_MS = 120_000
+
+/** 只接受原文中的完整路径；引号、反引号或明确分隔符可将路径和正文分开。 */
+function namesWorkspace(request: string, path: string): boolean {
+  const quotes = new Map([['`', '`'], ['"', '"'], ["'", "'"], ['“', '”'], ['‘', '’'], ['「', '」'], ['『', '』']])
+  for (let from = 0; ; ) {
+    const at = request.indexOf(path, from)
+    if (at < 0) return false
+    const before = request.charAt(at - 1), after = request.charAt(at + path.length)
+    if (before && quotes.get(before) === after) return true
+    if ((!before || /[\s(（:：=,，。；;]/u.test(before)) && (!after || /[\s)）:：,，。；;]/u.test(after))) return true
+    from = at + 1
+  }
+}
 
 const prompts: Record<StudioRole, string> = {
   assistant: `You are the Agent Studio Assistant. Answer simple questions directly. For work requiring independent execution, use ${WORKER_DELEGATE} once for the exact current owner request. Confirm missing context in normal chat. A registered task is not a result. Use ${WORKER_READ} to retrieve a known result and ${LIST_PROJECTS} to inspect current projects. Suggest a project when appropriate; only propose it for owner confirmation when instructed. Never claim file or shell work was performed.`,
@@ -70,7 +95,8 @@ export function ownerRequest(agent: Agent, callId: string, toolName: string): Ow
   }
 }
 
-interface WorkerAuthority extends Omit<WorkerGuardExecution, 'active'> { execution: StudioExecution }
+interface WorkerAuthority extends Omit<WorkerGuardExecution, 'active'> { execution: StudioExecution; evidence: WorkerEvidence }
+const observedTools = new Set(['write', 'edit', 'bash', 'pwsh'])
 interface WorkerTurn {
   authority: WorkerAuthority
   message: UserMessage
@@ -78,8 +104,6 @@ interface WorkerTurn {
 }
 interface WorkerHostPolicy {
   sandboxPolicy?: { resolve(input: { session: Agent['session'] }): WorkerSandboxPolicy }
-  approval?: { setApprovalPolicy?(session: Agent['session'], policy: 'never'): void; effectivePolicy?(session: Agent['session']): string }
-  setApprovalPolicy?(session: Agent['session'], policy: 'never'): void
 }
 const directoryArgs = z.strictObject({ path: z.string().min(1).exactOptional(), limit: z.int().min(1).max(WORKSPACE_LIST_LIMIT).exactOptional() })
 const receipt: ToolOutputDefinition = { schema: { type: 'object', required: ['text'], properties: { text: { type: 'string' } } },
@@ -89,10 +113,11 @@ const receipt: ToolOutputDefinition = { schema: { type: 'object', required: ['te
 export class StudioAssistant {
   readonly #authorities = new Map<string, WorkerAuthority>()
   readonly #workers = new Map<Agent, WorkerTurn>()
+  readonly #toolEvidence = new WeakMap<Readonly<ToolExecution>, { authority: WorkerAuthority; workdir?: string }>()
 
   constructor(private readonly ctx: Context, private readonly store: ManagedWorkerStore, private readonly sessions: StudioSessions,
-    private readonly models: WorkerModelPolicy, private readonly defaultPermission: StudioWorkerPermission,
-    private readonly ready: (agent: Agent, role: StudioRole) => boolean, private readonly cwd: string) {}
+    private readonly models: WorkerModelPolicy, private readonly ready: (agent: Agent, role: StudioRole) => boolean,
+    private readonly cwd: string) {}
 
   install(agent: Agent, role: StudioRole): () => void {
     const disposers: Array<() => void> = []
@@ -123,23 +148,44 @@ export class StudioAssistant {
         },
       }))
       disposers.push(agent.ctx.tools.register({ name: WORKER_DELEGATE, description: 'Register background work using the exact current user request. Registration does not mean delivery.',
-        parameters: z.toJSONSchema(noArgs), output: receipt,
+        parameters: z.toJSONSchema(delegateArgs), output: receipt, timeoutMs: WRITE_CONFIRMATION_TIMEOUT_MS + 10_000,
         execute: async (args, exec) => {
           exec.signal.throwIfAborted()
-          const source = ownerRequest(agent, exec.callId, WORKER_DELEGATE)
-          if (!noArgs.safeParse(args).success || exec.agent !== agent || exec.parent !== undefined || !this.ready(agent, role)
+          const raw = ownerRequest(agent, exec.callId, WORKER_DELEGATE)
+          const fields = delegateArgs.parse(args)
+          const source = raw && { ...raw, requestText: fields.request ?? raw.requestText }
+          if (exec.agent !== agent || exec.parent !== undefined || !this.ready(agent, role)
             || !source || !this.sessions.matchesOwnerRequest(agent, source) || this.sessions.isExistingTaskReply(agent)) {
-            throw new Error('Studio dispatch denied: EXPECTED_EXACT_OWNER_REQUEST')
+            throw new StudioError('EXPECTED_EXACT_OWNER_REQUEST', 'Studio dispatch requires the exact current owner request.')
           }
           const leader = role === 'leader' ? this.store.projects.currentLeader(agent.id) : undefined
-          if (role === 'leader' && !leader) throw new Error('Studio dispatch denied: STALE_LEADER')
+          if (role === 'leader' && !leader) throw new StudioError('STALE_LEADER', 'The current Leader binding changed.')
+          const permission = fields.permission ?? 'read-only'
+          const path = fields.workspacePath
+          if (!leader && path !== undefined && !namesWorkspace(source.requestText, path)) {
+            throw new StudioError('STUDIO_WORKSPACE_NOT_REQUESTED', 'Use an exact workspace path explicitly stated in the current owner request.')
+          }
+          const workspace = leader ? leaderDispatchWorkspace(leader, path, permission, this.store.protectedRoots)
+            : path === undefined ? null : canonicalizeWorkspaceRoot(path, this.store.protectedRoots)
+          if (permission === 'workspace-write') {
+            if (!workspace) throw new StudioError('STUDIO_WORKSPACE_REQUIRED', 'Specify a workspace before requesting write permission.')
+            const signal = AbortSignal.any([exec.signal, AbortSignal.timeout(WRITE_CONFIRMATION_TIMEOUT_MS)])
+            const approved = await this.sessions.confirmTaskWrite(agent, source, workspace.root, signal)
+            signal.throwIfAborted()
+            if (!approved) return { text: 'Studio task not registered: the owner declined write permission.' }
+            if (!verifyWorkspaceIdentity(workspace.root, workspace)) {
+              throw new WorkspacePathError('STUDIO_WORKSPACE_INVALID', 'The approved workspace changed while requesting permission; no work was scheduled.')
+            }
+          }
+          exec.signal.throwIfAborted()
           const model = this.sessions.modelFor(role)
           const task = this.sessions.scheduleTask(agent, {
             projectId: leader?.id ?? null, sourceMessageId: source.sourceMessageId, requestId: source.sourceRequestId,
-            requesterBotId: leader?.leaderBotId ?? this.store.assistantBotId, workspacePath: leader?.workspacePath ?? null,
-            permission: this.defaultPermission, requestText: source.requestText,
+            requesterBotId: leader?.leaderBotId ?? this.store.assistantBotId, workspacePath: workspace?.root ?? null,
+            permission, requestText: source.requestText,
+            ...(fields.title !== undefined ? { title: fields.title.trim() } : {}),
             ...(leader ? { leader: { sessionId: agent.id, managementEpoch: leader.managementEpoch } } : {}),
-          }, (taskId, signal) => this.runWorker(taskId, role, leader?.managementEpoch ?? null, model, signal))
+          }, (taskId, signal) => this.runWorker(taskId, role, leader?.managementEpoch ?? null, model, workspace, signal))
           const native = exec as typeof exec & { concludeTurn?(): void }
           native.concludeTurn?.()
           return { text: `Studio task ${task.taskId} ${task.created ? 'registered' : 'already registered'}.` }
@@ -153,7 +199,7 @@ export class StudioAssistant {
           const task = this.store.task(input.data.taskId)
           const projectId = role === 'leader' ? this.store.projects.currentLeader(agent.id)?.id : null
           if (!task || task.projectId !== projectId) throw new Error('No Studio task in this conversation')
-          return { text: `${task.taskId}: ${task.status}${task.resultSummary ? `\n\n${task.resultSummary}` : ''}` }
+          return { text: studioTaskText(task) }
         },
       }))
       return () => { for (const dispose of disposers.reverse()) dispose() }
@@ -183,9 +229,36 @@ export class StudioAssistant {
 
   workerAuthority(agent: Agent): WorkerAuthority | undefined { return this.#authorities.get(agent.id) }
 
-  workerExecution(agent: Agent): WorkerGuardExecution | undefined {
+  workerExecution(agent: Agent): (WorkerAuthority & { active: boolean }) | undefined {
     const authority = this.#workers.get(agent)?.authority
     if (authority) return { ...authority, active: this.executionCurrent(agent) }
+  }
+
+  /** rc.5 可能先准备同批调用再执行。撤权后，同批先前获准的调用也不能再进入工具本体。 */
+  observeDispatch(exec: Readonly<ToolExecution>): void {
+    const agent = exec.agent
+    const authority = agent && this.#workers.get(agent)?.authority
+    if (!agent || !authority || agent.session.id !== authority.execution.sessionId || !this.executionCurrent(agent)
+      || exec.signal.aborted || !this.ready(agent, 'worker')) {
+      throw new StudioError('STUDIO_EXECUTION_INACTIVE', 'The Worker execution is no longer authorized to dispatch tools.')
+    }
+    if (!observedTools.has(exec.name)) return
+    const workdir = authority.evidence.shellWorkdir(exec)
+    this.#toolEvidence.set(exec, { authority, ...(workdir !== undefined ? { workdir } : {}) })
+  }
+
+  /** 只消费先经过 dispatch 的原生结果，排除守卫拒绝、旧轮次和其他 Session 的事件。 */
+  observeToolResult(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>): void {
+    const seen = this.#toolEvidence.get(exec)
+    if (!seen) return
+    this.#toolEvidence.delete(exec)
+    const agent = exec.agent
+    const { execution, evidence } = seen.authority
+    if (!agent || agent.session.id !== execution.sessionId || this.#workers.get(agent)?.authority !== seen.authority
+      || !this.store.executionCurrent(execution)) return
+    const code = result.isError ? result.error.info?.code : undefined
+    if (code === 'ABORTED_BEFORE_DISPATCH' || code === 'UNKNOWN_TOOL') return
+    evidence.observe(exec, result, seen.workdir)
   }
 
   workerSandbox(agent: Agent): WorkerSandboxPolicy | undefined {
@@ -197,22 +270,21 @@ export class StudioAssistant {
   private bindWorkerPolicy(agent: Agent, permission: StudioWorkerPermission): void {
     const host = this.ctx as Context & WorkerHostPolicy
     host.permissionPresets?.set?.(agent.session, permission)
-    const approval = (host.get as ((name: string) => unknown) | undefined)?.call(host, 'approval') as WorkerHostPolicy['approval'] ?? host.approval
-    if (approval?.setApprovalPolicy) approval.setApprovalPolicy(agent.session, 'never')
-    else if (host.setApprovalPolicy) host.setApprovalPolicy(agent.session, 'never')
-    else if (approval?.effectivePolicy && approval.effectivePolicy(agent.session) !== 'never') {
-      const session = agent.session as unknown as { append(type: 'approval/policy', data: { policy: 'never' }): unknown }
-      session.append('approval/policy', { policy: 'never' })
+    // setApprovalPolicy 是 rc.5 模块导出而非 Cordis 服务方法；等价的日志事件不会从 Context 误读未注入字段。
+    if ((host.get as ((name: string) => unknown) | undefined)?.call(host, 'approval')) {
+      const session = agent.session as unknown as { append(type: 'approval/policy', data: { policy: 'never'; source: 'delegation' }): unknown }
+      session.append('approval/policy', { policy: 'never', source: 'delegation' })
     }
   }
 
   private async runWorker(taskId: string, role: Exclude<StudioRole, 'worker'>, epoch: number | null, fallback: StudioModel,
-    caller: AbortSignal): Promise<void> {
+    workspace: WorkspaceBinding | null, caller: AbortSignal): Promise<void> {
     const signal = AbortSignal.any([caller, AbortSignal.timeout(WORKER_TIMEOUT_MS)])
     let handle: StudioAgentHandle | undefined
     let execution: StudioExecution | undefined
     let outcome = 'worker-interrupted'
     let result: { text: string; eventSeq: number } | undefined
+    let authority: WorkerAuthority | undefined
     let taskVersion: number | undefined
     try {
       const task = this.store.task(taskId)
@@ -220,15 +292,14 @@ export class StudioAssistant {
       taskVersion = task.authorizationVersion
       const model = await this.models.pin(this.models.selectModel(role, { task, fallback }), signal)
       signal.throwIfAborted()
-      const workspace = task.workspacePath === null ? null : canonicalizeWorkspaceRoot(task.workspacePath, this.store.protectedRoots)
-      if (workspace && workspace.root !== task.workspacePath) {
+      if ((workspace?.root ?? null) !== task.workspacePath || (workspace && !verifyWorkspaceIdentity(workspace.root, workspace))) {
         throw new WorkspacePathError('STUDIO_WORKSPACE_INVALID', 'The saved workspace path now points to a different directory; bind it again.')
       }
       const id = newStudioSessionId()
       execution = this.store.beginExecution(taskId, id, epoch, model)
       if (!execution) return
-      const authority: WorkerAuthority = { execution, signal, workspacePath: workspace?.root ?? null, permission: task.permission,
-        ...(workspace ? { workspaceIdentity: workspace } : {}) }
+      authority = { execution, signal, workspacePath: workspace?.root ?? null, permission: task.permission,
+        evidence: new WorkerEvidence(task.workspacePath, this.store.protectedRoots), ...(workspace ? { workspaceIdentity: workspace } : {}) }
       // 创建事件先使用同一份任务授权配置工具；只有策略校验通过后才交付模型输入。
       this.#authorities.set(id, authority)
       handle = await createStudioSession(this.ctx, id, WORKER_PRESET, { cwd: workspace?.root ?? this.cwd, model }, signal)
@@ -256,8 +327,9 @@ export class StudioAssistant {
     finally {
       // 原生取消之前先撤销任务授权；正常完成则等待日志落盘后再公开结果来源。
       const mustFence = !!execution && (!result || signal.aborted)
+      const evidence = authority?.evidence.result()
       if (execution) this.#authorities.delete(execution.sessionId)
-      try { if (execution && mustFence) this.store.finishExecution(execution, undefined, outcome) }
+      try { if (execution && mustFence) this.store.finishExecution(execution, undefined, outcome, evidence) }
       finally {
         try { if (handle && signal.aborted) handle.agent.cancel({ kind: 'hook', reason: 'Studio task stopped.' }) }
         finally {
@@ -265,7 +337,7 @@ export class StudioAssistant {
           catch { result = undefined; outcome = 'session-close-unconfirmed' }
         }
       }
-      if (execution && !mustFence) this.store.finishExecution(execution, signal.aborted ? undefined : result, outcome)
+      if (execution && !mustFence) this.store.finishExecution(execution, signal.aborted ? undefined : result, outcome, evidence)
       else if (!execution && this.store.task(taskId)?.status === 'queued') this.store.invalidateTask(taskId, 'interrupted')
     }
   }

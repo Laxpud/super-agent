@@ -242,7 +242,7 @@ describe('Studio V1 Worker models', () => {
   })
 })
 
-it('denies file and shell tools for an unbound Worker even with workspace-write task permission', async () => {
+it('keeps an unbound Worker read-only and denies local tools even with a workspace-write default setting', async () => {
   const dir = mkdtempSync(join(realpathSync(tmpdir()), 'studio-v1-guard-'))
   const effects: Array<() => void | Promise<void>> = []
   onTestFinished(async () => {
@@ -317,8 +317,8 @@ it('denies file and shell tools for an unbound Worker even with workspace-write 
   await handler!(request as unknown as IncomingMessage, response as unknown as ServerResponse)
   expect(response.writeHead).toHaveBeenCalledWith(200, expect.any(Object))
   const { agent, recorded, verdicts } = await reachedWorker.promise
-  expect(recorded).toEqual({ permission: 'workspace-write', status: 'running', session_id: agent.id })
-  expect(host.permissionPresets.set).toHaveBeenCalledWith(agent.session, 'workspace-write')
+  expect(recorded).toEqual({ permission: 'read-only', status: 'running', session_id: agent.id })
+  expect(host.permissionPresets.set).toHaveBeenCalledWith(agent.session, 'read-only')
   // 否决来自 Worker 工具策略，而不是 Session 未登记或授权已失效。
   expect(verdicts).toEqual(tools.map(() => expect.objectContaining({ reason: expect.any(String),
     info: { name: 'StudioToolDenied', code: 'STUDIO_TOOL_FORBIDDEN' } })))
