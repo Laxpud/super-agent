@@ -630,7 +630,7 @@ const oldHash = 'a'.repeat(64), nextHash = 'b'.repeat(64)
 const literalBuild = '<img src=x onerror=bad()>'
 const updateRecord = (phase: StudioSelfUpdateRecord['phase'], overrides: Partial<StudioSelfUpdateRecord> = {}): StudioSelfUpdateRecord => ({
   updateId, kind: 'update', phase, createdAt: at, updatedAt: at, baselineBuildId: 'baseline', baselineFingerprint: oldHash,
-  candidateBuildId: literalBuild, candidateFingerprint: nextHash, logPath: `/home/private-owner/data/updates/${updateId}/controller.log`, ...overrides,
+  candidateBuildId: literalBuild, candidateFingerprint: nextHash, logRef: 'controller.log', ...overrides,
 })
 function updatesServer(handle: (request: Request) => unknown = () => undefined) {
   const current = { version: '0.1.0-fixture', buildId: 'updated-host', artifactFingerprint: oldHash }
@@ -677,7 +677,7 @@ it.each([true, false])('prepares once, polls by update ID and uses the unified a
   const id = `self-update:${updateId}`
   const app = updatesServer(({ op, input }) => {
     if (op === 'prepareSelfUpdate') {
-      const running = updateRecord('prechecking', { logPath: `/private/updates/${updateId}/precheck.log` })
+      const running = updateRecord('prechecking', { logRef: 'precheck.log' })
       app.show(running)
       return running
     }
@@ -716,18 +716,20 @@ it('renders failures and safe log references literally, and requests rollback on
   })
   const panel = await renderUpdates()
   for (const phase of ['failed_precheck', 'rolled_back', 'recovery_required'] as const) {
-    app.show(updateRecord(phase, { failedPhase: phase === 'failed_precheck' ? 'prechecking' : 'starting', exitCode: 7,
-      ...(phase === 'recovery_required' && { logPath: '<script>bad()</script>' }) }))
+    const failureCode = phase === 'failed_precheck' ? 'PRECHECK_FAILED' : phase === 'rolled_back' ? 'ORIGIN_MISMATCH' : 'ROLLBACK_FAILED'
+    const logRef = phase === 'failed_precheck' ? 'precheck.log' : 'controller.log'
+    app.show(updateRecord(phase, { failedPhase: phase === 'failed_precheck' ? 'prechecking' : 'starting', exitCode: 7, failureCode, logRef }))
     await click(en.updateRefreshStatus, panel)
     const card = node('.as-update-record', panel)
     expect(card.textContent).toContain(en[`updatePhase.${phase}`])
     expect(card.textContent).toContain(literalBuild)
     expect(card.querySelector('img, script')).toBeNull()
     expect(card.textContent).not.toMatch(/private-owner|bad\(\)<\/script>/u)
-    expect(card.textContent).toContain(phase === 'recovery_required' ? en.updateLogPrivate : `updates/${updateId}/controller.log`)
+    expect(card.textContent).toContain(`updates/${updateId}/${logRef}`)
+    expect(card.textContent).toContain(en[`updateFailure.${failureCode}`])
     expect(card.textContent).not.toContain(en.updateRequestRollback)
   }
-  expect(button(en.updatePrepare, panel).closest('fieldset')?.disabled).toBe(true)
+  expect(button(en.updatePrepare, panel).closest('fieldset')?.disabled).toBe(false)
   app.show(updateRecord('succeeded'))
   await click(en.updateRefreshStatus, panel)
   expect(panel.textContent).not.toContain(en.updateRequestRollback)

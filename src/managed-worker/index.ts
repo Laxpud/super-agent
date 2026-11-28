@@ -8,10 +8,9 @@ import { isLoopbackHost } from '@deepseek-ai/dsh-host-webserver'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import s from '@deepseek-ai/schemastery'
-import { lockSync } from 'proper-lockfile'
 import { currentPresetId } from '../infra/preset-names.ts'
 import { resolveLoadedBuildInfo } from '../studio/build-info.ts'
-import { openStudioHealthSocket } from '../studio/health.ts'
+import { isStudioLoopbackOrigin, openStudioHealthSocket } from '../studio/health.ts'
 import { StudioSelfUpdate } from '../studio/self-update.ts'
 import type { StudioSelfUpdateConfig } from '../studio/settings-protocol.ts'
 import { StudioConfigurationControl } from '../studio/configuration.ts'
@@ -31,6 +30,7 @@ import { ASSISTANT_PRESET, StudioAssistant, WORKER_PRESET } from './assistant.ts
 import { MEMORY_COMMAND, MEMORY_HINT, memoryCommand } from './memory.ts'
 import { StudioProjectIntake } from './project-intake.ts'
 import { LEADER_PRESET, PROJECT_COMMAND, PROJECT_HINT, StudioProjectControl } from './project.ts'
+import { lockStudioHostDirectory } from './state-lock.ts'
 import { ManagedWorkerStore } from './store.ts'
 import { LegacyWorkerDefaultsConfig, LegacyWorkerRouteConfig, migrateWorkerModels, WorkerModelDefaultsConfig, WorkerModelPolicy,
   WorkerModelRouteConfig } from './text-worker-model-policy.ts'
@@ -130,10 +130,6 @@ function localOwnerComposition(ctx: ManagedHost): boolean {
     && (ctx as unknown as { get(name: string): unknown }).get('liveshareShares') === undefined
 }
 
-function loopbackOrigin(origin: string): boolean {
-  return isLoopbackHost(new URL(origin).hostname.replace(/^\[|\]$/gu, ''))
-}
-
 function localOwnerHost(ctx: Context): ManagedHost {
   const host = ctx as ManagedHost
   const required = [
@@ -180,11 +176,11 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
   let updates: StudioSelfUpdate | undefined
   let directorySwitch: StudioDirectorySwitch | undefined
   const stopping = new AbortController()
-  const unlock = lockSync(stateDir, { stale: 30_000, onCompromised(error) {
+  const unlock = await lockStudioHostDirectory(stateDir, error => {
     available = false
     stopping.abort()
     ctx.logger.error('Agent Studio lost its state directory lock: %s', String(error))
-  } })
+  })
   const profile = credentials.profile
   const hostRoots = [profile?.home, profile?.dir, profile?.patchPath, config.selfUpdate?.installRoot].filter((path): path is string => typeof path === 'string' && isAbsolute(path))
   let store: ManagedWorkerStore
@@ -215,12 +211,14 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
   const presetOf = (agent: Agent) => currentPresetId(ctx.agentPresets.presetForSession(agent.session))
   const current = (agent: Agent) => ctx.agents.get(agent.id) === agent
   const inferred = (agent: Agent) => roleForPreset(presetOf(agent))
-  const channelReady = () => {
-    if (!available || applyingSettings || !localOwnerComposition(ctx)) return false
-    try { return loopbackOrigin(ctx.webServer.getOrigin()) } catch { return false }
+  const webOrigin = () => {
+    try { const origin = ctx.webServer.getOrigin(); return isStudioLoopbackOrigin(origin) ? origin : undefined } catch { return undefined }
   }
+  const channelReady = () => available && !applyingSettings && localOwnerComposition(ctx) && !!webOrigin()
+  const probation = () => updates?.probation === true
+  const writesPaused = () => draining || probation()
   const roleReady = (agent: Agent, role: StudioRole): boolean => {
-    if (!channelReady() || !current(agent) || scopes.get(agent)?.role !== role || presetOf(agent) !== presets[role]) return false
+    if (probation() || !channelReady() || !current(agent) || scopes.get(agent)?.role !== role || presetOf(agent) !== presets[role]) return false
     const record = store.studioSession(agent.id)
     if (record?.readonlyLegacy || (record && record.role !== role)) return false
     return role === 'leader' ? !!store.projects.currentLeader(agent.id) : role === 'worker' ? record?.role === 'worker' : true
@@ -243,15 +241,21 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
   }
 
   const feishuState = (): FeishuState => channel?.state ?? (binding ? 'credential-missing' : 'disabled')
-  const wake = () => channel?.wake()
+  let feishuDeferred = false
+  const syncFeishuBinding = () => store.studio.deactivateFeishu(binding ? feishuSourceScope(binding) : undefined)
+  const wake = () => {
+    if (feishuDeferred && !probation()) { syncFeishuBinding(); feishuDeferred = false }
+    channel?.wake()
+  }
   const defaults = { assistant: config.assistantModel ?? null, leader: config.leaderModel ?? null }
   const settingsScope = createHash('sha256').update(JSON.stringify([stateDir, config.studioDirectoryToken, defaults])).digest('hex')
   const build = resolveLoadedBuildInfo()
   if (config.selfUpdate) updates = new StudioSelfUpdate(store, {
-    canReload: () => process.platform === 'linux' && startupComplete && !!closeHealth && channelReady()
+    canReload: () => process.platform === 'linux' && startupComplete && !!closeHealth && channelReady() && !probation()
       && (!binding || credential.state === 'stored'),
+    origin: () => webOrigin() ?? '',
     enterMaintenance() {
-      if (!channelReady() || draining) throw new StudioError('STUDIO_DRAINING', 'Studio cannot enter maintenance now.', 409)
+      if (!channelReady() || writesPaused()) throw new StudioError('STUDIO_DRAINING', 'Studio cannot enter maintenance now.', 409)
       draining = true
       wake()
       return () => { draining = false; wake() }
@@ -262,7 +266,7 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
     wake, stopping: stopping.signal, warn: message => ctx.logger.warn('%s', message),
   }, { stateDir, hostHome: profile?.home, hostProfile: profile?.name, config: config.selfUpdate, build })
   const service = new StudioService(ctx, store, cwd, defaults, ready, stopping.signal, feishuState, wake, settingsScope, {
-    updates, draining: () => draining || applyingSettings, sealed: () => sealed,
+    updates, draining: () => draining || applyingSettings, probation, sealed: () => sealed,
     available: () => startupComplete && channelReady(), configOk: () => available && (credential.state !== 'missing'),
   })
   studio = service
@@ -273,12 +277,13 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
   if (binding && feishuSdk) channel = new StudioFeishuConversation(feishuSdk, binding, service.feishu, channelReady,
     message => ctx.logger.warn('%s', message), value => setup.receive(value))
   if (channel) service.bindFeishuLookup(channel)
-  // 仅密钥不可用不代表用户解绑，保留同一已发布 binding 的切换边界。
-  store.studio.deactivateFeishu(binding ? feishuSourceScope(binding) : undefined)
+  // 试运行可验证原飞书连接，但须等控制器确认，才允许切换绑定或开始收发。
+  feishuDeferred = probation()
+  if (!feishuDeferred) syncFeishuBinding()
 
   const configuration = new StudioConfigurationControl(ctx, config, { credentials, credential, setup, feishuState,
     quiesce(_next, directory) {
-      if (!channelReady() || draining || sessions.busy || [...scopes.keys()].some(agent => agent.status !== 'idle')) {
+      if (!channelReady() || writesPaused() || sessions.busy || [...scopes.keys()].some(agent => agent.status !== 'idle')) {
         throw new StudioError('STUDIO_CONFIG_WORK_ACTIVE', 'Wait until current Studio work ends before applying settings.', 409)
       }
       applyingSettings = true
@@ -289,7 +294,7 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
   ctx.effect(() => registerStudioHttp(ctx, ctx.connection, channelReady, { ...service.operations, ...configuration.operations }, {
     health: () => service.health(),
     beginWrite() {
-      if (draining) throw new StudioError('STUDIO_DRAINING', 'Studio is draining for a managed update.', 503)
+      if (writesPaused()) throw new StudioError('STUDIO_DRAINING', 'Studio is not accepting writes during managed reload.', 503)
       writes++
       return () => { writes-- }
     },
@@ -424,13 +429,13 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
   for (const agent of ctx.agents.list()) configure(agent)
 
   ctx.effect(() => ctx.commands.register({ name: PROJECT_COMMAND, description: 'Inspect or manage Studio projects and their task results.',
-    input: { hint: PROJECT_HINT }, recordInput: false, handler: ({ agent, rawInput, signal }) => draining ? { kind: 'error', text: 'Studio is draining for a managed update.' }
+    input: { hint: PROJECT_HINT }, recordInput: false, handler: ({ agent, rawInput, signal }) => writesPaused() ? { kind: 'error', text: 'Studio is draining for a managed update.' }
       : projects.command(agent, rawInput, signal) }))
   ctx.effect(() => ctx.commands.register({ name: MEMORY_COMMAND, description: 'View, save, edit or forget explicit Studio preferences.',
     input: { hint: MEMORY_HINT }, recordInput: false, handler: ({ agent, rawInput, signal }) => {
       signal.throwIfAborted()
       if (!ready(agent, 'assistant') && !ready(agent, 'leader')) return { kind: 'error', text: 'Use a current Studio Assistant or Leader Session.' }
-      if (draining) return { kind: 'error', text: 'Studio is draining for a managed update.' }
+      if (writesPaused()) return { kind: 'error', text: 'Studio is draining for a managed update.' }
       return memoryCommand(store.memory, rawInput, id => ready(agent, 'assistant') || store.projects.currentLeader(agent.id)?.id === id)
     },
   }))
@@ -444,7 +449,7 @@ export async function apply(context: Context, config: StudioHostConfig): Promise
     },
   }))
   if (channel) channelRun = ctx.agents.withoutInitiator(() => channel!.run(stopping.signal))
-  try { closeHealth = await openStudioHealthSocket(stateDir, () => service.health()) }
+  try { closeHealth = await openStudioHealthSocket(stateDir, () => ({ ...service.health(true), origin: webOrigin() })) }
   catch { if (config.selfUpdate) ctx.logger.warn('Studio managed reload requires its private Unix health endpoint') }
   startupComplete = true
   if (store.recoveredTasks) ctx.logger.warn('Agent Studio interrupted %d unfinished tasks from a previous run', store.recoveredTasks)

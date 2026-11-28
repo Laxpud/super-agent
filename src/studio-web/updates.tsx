@@ -9,11 +9,11 @@ import { SettingSelect } from './settings-fields.tsx'
 import { Button, Time, useStudio } from './ui.tsx'
 
 const pollInterval = 2_500
-const switching = new Set<StudioSelfUpdatePhase>(['approved', 'draining', 'stopping', 'switching', 'starting', 'rolling_back'])
+const switching = new Set<StudioSelfUpdatePhase>(['approved', 'draining', 'stopping', 'switching', 'starting', 'reloading', 'rolling_back'])
 const inFlight = (phase: StudioSelfUpdatePhase) => phase === 'prechecking' || phase === 'awaiting_confirmation' || switching.has(phase)
 const phaseTone = {
   prechecking: undefined, awaiting_confirmation: 'warn', approved: undefined, draining: undefined, stopping: undefined,
-  switching: undefined, starting: undefined, rolling_back: 'warn', succeeded: 'success', failed_precheck: 'error',
+  switching: undefined, starting: undefined, reloading: undefined, rolling_back: 'warn', succeeded: 'success', failed_precheck: 'error',
   failed_drain: 'error', rolled_back: 'warn', recovery_required: 'error', cancelled: undefined, expired: 'warn',
 } as const satisfies Record<StudioSelfUpdatePhase, string | undefined>
 
@@ -27,6 +27,7 @@ const updateErrors = {
   STUDIO_UPDATE_WORKSPACE_MISMATCH: 'updateError.workspace',
   STUDIO_UPDATE_SOURCE_INVALID: 'updateError.source',
   STUDIO_UPDATE_INSTALL_INVALID: 'updateError.install',
+  STUDIO_UPDATE_LOCK_CONFLICT: 'updateError.lockConflict',
   STUDIO_UPDATE_BUSY: 'updateError.busy',
   STUDIO_UPDATE_CONFIRMATION_INVALID: 'updateError.confirmation',
   STUDIO_UPDATE_NO_BASELINE: 'updateError.noBaseline',
@@ -46,12 +47,6 @@ const projectCoordinate = ({ id, managementEpoch }: StudioProjectSummary) => JSO
 function newRequestId() {
   // 局域网 HTTP 页面也需要唯一标记；getRandomValues 不依赖安全上下文。
   return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')
-}
-
-/** 宿主只返回绝对 logPath。只显示已知更新目录与日志名，不暴露数据目录、用户名或日志内容。 */
-function logReference({ logPath, updateId }: StudioSelfUpdateRecord) {
-  const match = /(?:^|[/\\])(updates[/\\]([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})[/\\](?:precheck|controller)\.log)$/u.exec(logPath)
-  return match?.[2] === updateId ? match[1]!.replaceAll('\\', '/') : undefined
 }
 
 function UpdateFailure({ failure, write = false }: { failure: unknown; write?: boolean }) {
@@ -94,7 +89,7 @@ function UpdateRecord({ record, busy, locked, canApprove, resolved, answer, roll
   const { t } = useStudio()
   const { phase, kind } = record
   const confirming = phase === 'awaiting_confirmation' && !!record.pendingId
-  const reference = logReference(record)
+  const reference = `updates/${record.updateId}/${record.logRef}`
   return <article className="as-card as-update-record" data-confirming={confirming || undefined}>
     <div className="as-meta">
       <h3>{t(`updateRecord.${kind}`)}</h3>
@@ -107,10 +102,11 @@ function UpdateRecord({ record, busy, locked, canApprove, resolved, answer, roll
       <Fact label={t('updateBaselineFingerprint')}><Fingerprint value={record.baselineFingerprint} /></Fact>
       {confirming && record.expiresAt !== undefined && <Fact label={t('updateConfirmationExpiry')}><Time value={record.expiresAt} /></Fact>}
       {record.failedPhase && <Fact label={t('updateFailedPhase')}>{t(`updatePhase.${record.failedPhase}`)}</Fact>}
+      {record.failureCode && <Fact label={t('updateFailureCode')}>
+        {t(`updateFailure.${record.failureCode}`)} <code>{record.failureCode}</code>
+      </Fact>}
       {record.exitCode !== undefined && <Fact label={t('updatePrecheckExit')}>{record.exitCode ?? t('updateUnknown')}</Fact>}
-      <Fact label={t('updateLog')}>
-        {reference ? <code>{reference}</code> : <span>{t('updateLogPrivate')}</span>}
-      </Fact>
+      <Fact label={t('updateLog')}><code>{reference}</code></Fact>
     </dl>
     {confirming && !resolved && <>
       <p className="as-warning">{t('updateInterruption')}</p>
@@ -261,5 +257,5 @@ export function Updates({ locked, busyChange }: { locked: boolean; busyChange: (
 }
 
 function recordBlocked(record?: StudioSelfUpdateRecord | null) {
-  return !!record && (inFlight(record.phase) || record.phase === 'recovery_required')
+  return !!record && inFlight(record.phase)
 }

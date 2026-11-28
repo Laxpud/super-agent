@@ -1,8 +1,10 @@
-import { randomUUID } from 'node:crypto'
-import { closeSync, cpSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { appendFileSync, closeSync, cpSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { computeReleaseManifest, RELEASE_ASSETS, verifyStudioClientBuild } from './build-info.ts'
-import type { StudioSelfUpdatePhase, StudioSelfUpdateRecord } from './protocol.ts'
+import { tryLocalFileLock } from './local-process.ts'
+import type { StudioSelfUpdateFailureCode, StudioSelfUpdatePhase, StudioSelfUpdateRecord } from './protocol.ts'
+import { updateRecordView } from './self-update-ledger.ts'
 import type { StudioSelfUpdateConfig } from './settings-protocol.ts'
 
 export const updateIdPattern = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u
@@ -34,7 +36,49 @@ export function readPrivateJson<T>(path: string): T {
 
 export function writeUpdateState(dir: string, record: StudioSelfUpdateRecord, phase: StudioSelfUpdatePhase,
   values: Partial<StudioSelfUpdateRecord> = {}): StudioSelfUpdateRecord {
-  return atomicJson(dir, 'state.json', { ...record, ...values, phase, updatedAt: Date.now() })
+  return atomicJson(dir, 'state.json', updateRecordView({ ...record, ...values, phase, updatedAt: Date.now() }))
+}
+
+/** 将本地失败转换成稳定的协议原因码，不转发原始异常及其中可能存在的宿主路径。 */
+export class StudioUpdateFailure extends Error {
+  constructor(readonly code: StudioSelfUpdateFailureCode) { super(code) }
+}
+export const updateFailureCode = (error: unknown, fallback: StudioSelfUpdateFailureCode): StudioSelfUpdateFailureCode =>
+  error instanceof StudioUpdateFailure ? error.code : fallback
+
+/** 状态正文与结构化原因并列；不把子进程异常文本或内部路径写进摘要。 */
+export function logUpdateController(dir: string, phase: string, failedPhase?: StudioSelfUpdatePhase, failureCode?: StudioSelfUpdateFailureCode): void {
+  try {
+    appendFileSync(join(dir, 'controller.log'), `${new Date().toISOString()} ${phase}${failedPhase ? ` (failed: ${failedPhase})` : ''}`
+      + `${failureCode ? ` ${JSON.stringify({ failureCode })}` : ''}\n`, { mode: 0o600 })
+  } catch { /* 已持久化的状态不因附加日志失败而改变。 */ }
+}
+
+const installOwnerFile = '.studio-owner.json'
+const installOwner = (stateDir: string) => createHash('sha256').update(canonicalDirectory(stateDir, true)).digest('hex')
+
+export function assertStudioInstallOwner(installRoot: string, stateDir: string): void {
+  canonicalDirectory(installRoot, true)
+  const path = join(installRoot, installOwnerFile)
+  if (!lstatSync(path, { throwIfNoEntry: false })) return
+  try {
+    if (readPrivateJson<{ stateDirHash?: string }>(path)?.stateDirHash === installOwner(stateDir)) return
+  } catch { /* 未证明归属的发布根不能被认领。 */ }
+  throw new StudioUpdateFailure('LOCK_CONFLICT')
+}
+
+/** 原子认领托管根，控制器持锁到切换或回退完成；不同数据目录不能复用已经认领的发布根。 */
+export function lockStudioInstallRoot(installRoot: string, stateDir: string): () => void {
+  assertStudioInstallOwner(installRoot, stateDir)
+  const unlock = tryLocalFileLock(join(installRoot, '.studio-install.lock'))
+  if (!unlock) throw new StudioUpdateFailure('LOCK_CONFLICT')
+  try {
+    assertStudioInstallOwner(installRoot, stateDir)
+    if (!lstatSync(join(installRoot, installOwnerFile), { throwIfNoEntry: false })) {
+      atomicJson(installRoot, installOwnerFile, { stateDirHash: installOwner(stateDir) })
+    }
+    return unlock
+  } catch (error) { unlock(); throw error }
 }
 
 export function canonicalDirectory(path: string, privateToOwner = false): string {

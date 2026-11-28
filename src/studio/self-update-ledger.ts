@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite'
-import type { StudioPending, StudioSelfUpdateRecord } from './protocol.ts'
+import { STUDIO_SELF_UPDATE_FAILURE_CODES, STUDIO_SELF_UPDATE_PHASES, type StudioPending, type StudioSelfUpdateRecord } from './protocol.ts'
 import type { StudioStore } from './store.ts'
 
 export interface UpdateEntry {
@@ -9,8 +9,23 @@ export interface UpdateEntry {
   record: StudioSelfUpdateRecord
 }
 interface UpdateRow { run_id: string; request_id: string; request_hash: string; record: string }
+
+/** 只投影协议字段；旧账本或控制器镜像中的绝对 logPath 不得进入 DTO。 */
+export function updateRecordView(record: StudioSelfUpdateRecord): StudioSelfUpdateRecord {
+  const { updateId, kind, phase, createdAt, updatedAt, baselineBuildId, baselineFingerprint, candidateBuildId, candidateFingerprint,
+    projectId, projectEpoch, rollbackOf, pendingId, expiresAt, sourceHead, sourceFingerprint, failedPhase, failureCode, exitCode } = record
+  const controller = ['draining', 'failed_drain', 'stopping', 'switching', 'starting', 'reloading', 'rolling_back', 'rolled_back', 'succeeded', 'recovery_required']
+  return { updateId, kind, phase, createdAt, updatedAt, baselineBuildId, baselineFingerprint, candidateBuildId,
+    ...(candidateFingerprint !== undefined && { candidateFingerprint }), ...(projectId !== undefined && { projectId }),
+    ...(projectEpoch !== undefined && { projectEpoch }), ...(rollbackOf !== undefined && { rollbackOf }), ...(pendingId !== undefined && { pendingId }),
+    ...(expiresAt !== undefined && { expiresAt }), ...(sourceHead !== undefined && { sourceHead }), ...(sourceFingerprint !== undefined && { sourceFingerprint }),
+    ...(failedPhase !== undefined && STUDIO_SELF_UPDATE_PHASES.includes(failedPhase) && { failedPhase }),
+    ...(failureCode !== undefined && STUDIO_SELF_UPDATE_FAILURE_CODES.includes(failureCode) && { failureCode }),
+    ...(exitCode !== undefined && { exitCode }), logRef: controller.includes(phase) ? 'controller.log' : 'precheck.log' }
+}
+
 const decode = (row: UpdateRow): UpdateEntry => ({ runId: row.run_id, requestId: row.request_id, requestHash: row.request_hash,
-  record: JSON.parse(row.record) as StudioSelfUpdateRecord })
+  record: updateRecordView(JSON.parse(row.record) as StudioSelfUpdateRecord) })
 
 /** 写权限只在现役 Host 运行中生效；待办、出箱与一次性更新授权共用同一事务。 */
 export class StudioSelfUpdateLedger {
@@ -30,7 +45,7 @@ export class StudioSelfUpdateLedger {
   }
 
   recent(allActive = false): UpdateEntry[] {
-    const scope = allActive ? "WHERE phase IN ('prechecking', 'awaiting_confirmation', 'approved', 'draining')" : 'ORDER BY rowid DESC LIMIT 1'
+    const scope = allActive ? "WHERE phase IN ('prechecking', 'awaiting_confirmation', 'approved', 'draining', 'stopping', 'switching', 'starting', 'reloading', 'rolling_back')" : 'ORDER BY rowid DESC LIMIT 1'
     return (this.db.prepare(`SELECT run_id, request_id, request_hash, record FROM studio_self_update ${scope}`).all() as unknown as UpdateRow[]).map(decode)
   }
 
@@ -66,12 +81,16 @@ export class StudioSelfUpdateLedger {
     })
   }
 
-  expire(entry: UpdateEntry): boolean {
+  /** 新宿主只可收敛旧运行记录，不能把旧批准转移到当前运行。 */
+  settle(entry: UpdateEntry, record: StudioSelfUpdateRecord): boolean {
     return this.write(() => {
-      const { record } = entry
-      if (!this.update(entry, { ...record, phase: 'expired', updatedAt: Date.now() })) return false
+      if (!this.update(entry, record)) return false
       if (record.pendingId) this.studio.settleTaskPendingInTx(record.pendingId, 'expired')
       return true
     })
+  }
+
+  expire(entry: UpdateEntry): boolean {
+    return this.settle(entry, { ...entry.record, phase: 'expired', updatedAt: Date.now() })
   }
 }

@@ -22,6 +22,7 @@ import { disabledSelfUpdateStatus, studioBuildIdentity, type StudioSelfUpdate } 
 interface StudioServiceRuntime {
   readonly updates?: StudioSelfUpdate
   draining(): boolean
+  probation?(): boolean
   sealed(): boolean
   available(): boolean
   configOk(): boolean
@@ -46,11 +47,12 @@ export class StudioService {
   }
 
   /** 健康读取不经过普通状态查询，不刷新待办或调用 Feishu / 模型适配器。 */
-  health(): StudioHealthStatus {
+  health(internalProbe = false): StudioHealthStatus {
     const build = studioBuildIdentity(resolveLoadedBuildInfo())
     const sqlite = this.domain.sqliteHealth(), configOk = this.runtime?.configOk() ?? !this.stopping.aborted
     const feishu = this.feishuState(), transportOk = feishu === 'disabled' || feishu === 'online'
-    const draining = this.runtime?.draining() ?? false
+    // 私有探针可测试候选就绪，但浏览器在控制器确认前仍看到排空；业务写入使用独立栅栏。
+    const draining = this.runtime?.draining() || (!internalProbe && this.runtime?.probation?.())
     const ok = configOk && sqlite.ok && transportOk
     const ready = ok && !draining && (this.runtime?.available() ?? !this.stopping.aborted)
     return { ...build, ok, ready, phase: draining ? 'draining' : ready ? 'ready' : 'starting', pid: process.pid, sqlite, feishu, configOk }
@@ -59,7 +61,7 @@ export class StudioService {
   get busy(): boolean { return this.sessions.busy || this.ownerLookups > 0 }
 
   private assertAccepting(): void {
-    if (this.runtime?.draining()) throw new StudioError('STUDIO_DRAINING', 'Studio is draining for a managed update.', 503)
+    if (this.runtime?.draining() || this.runtime?.probation?.()) throw new StudioError('STUDIO_DRAINING', 'Studio is not accepting writes during managed reload.', 503)
   }
 
   private get store() { return this.domain.studio }
@@ -339,7 +341,7 @@ export class StudioService {
 
   /** Refresh the status of managed blockers without invoking a model, changing a job, or clearing a hold. */
   refreshBlockers(): void {
-    if (this.runtime?.draining()) return
+    if (this.runtime?.draining() || this.runtime?.probation?.()) return
     const current = new Map(this.domain.studioBlockingItems().map(item => [item.id, item]))
     const previous = new Map(this.store.openBlockers().map(item => [item.id, item]))
     for (const item of current.values()) if (!previous.has(item.id)) this.store.addPending(item)
@@ -583,14 +585,14 @@ export class StudioService {
 
   readonly feishu: StudioFeishuPort = {
     activate: (scope, at) => {
-      if (!this.runtime?.draining()) return this.store.activateFeishu(scope, at)
+      if (!this.runtime?.draining() && !this.runtime?.probation?.()) return this.store.activateFeishu(scope, at)
       const cutover = this.store.feishuCutover(scope)
       if (cutover === undefined || this.runtime.sealed()) throw new StudioError('STUDIO_DRAINING', 'Studio is draining for a managed update.', 503)
       return cutover
     },
     receive: (input, signal) => this.receiveFeishu(input, signal),
     answer: input => this.answerCard(input),
-    next: scope => { if (!this.runtime?.sealed()) { this.refreshBlockers(); return this.store.nextFeishu(scope) } },
+    next: scope => { if (!this.runtime?.sealed() && !this.runtime?.probation?.()) { this.refreshBlockers(); return this.store.nextFeishu(scope) } },
     finish: (id, remoteId) => this.store.finishFeishu(id, remoteId),
   }
 

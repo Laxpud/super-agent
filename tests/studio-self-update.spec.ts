@@ -1,22 +1,24 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
-import { createConnection } from 'node:net'
+import { createConnection, createServer as createSocketServer } from 'node:net'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
 import { afterEach, expect, it, vi } from 'vitest'
+import { validateStudioDatabase } from '../src/managed-worker/sqlite-state.ts'
 import { ManagedWorkerStore } from '../src/managed-worker/store.ts'
+import { lockStudioHostDirectory } from '../src/managed-worker/state-lock.ts'
 import { computeReleaseManifest, RELEASE_ASSETS } from '../src/studio/build-info.ts'
 import { openStudioHealthSocket, probeStudioHealth, studioHealthSocket } from '../src/studio/health.ts'
 import { registerStudioHttp, type StudioHttpOperations } from '../src/studio/http.ts'
 import { SELF_UPDATE_CHOICES, STUDIO_HEADER, STUDIO_HEALTH, type StudioSelfUpdateRecord } from '../src/studio/protocol.ts'
 import { StudioSelfUpdate } from '../src/studio/self-update.ts'
-import { runStudioUpdateController, type StudioControllerPlan } from '../src/studio/self-update-controller.ts'
-import { atomicJson, copyRelease, releaseTarget } from '../src/studio/self-update-files.ts'
+import { handoffStudioUpdate, runStudioUpdateController, type StudioControllerPlan } from '../src/studio/self-update-controller.ts'
+import { atomicJson, copyRelease, lockStudioInstallRoot, releaseTarget, switchRelease } from '../src/studio/self-update-files.ts'
 import { StudioService } from '../src/studio/service.ts'
 import { STUDIO_DB, type StudioSelfUpdateConfig } from '../src/studio/settings-protocol.ts'
 
@@ -37,6 +39,15 @@ const signal = new AbortController().signal
 const [approve, cancel] = SELF_UPDATE_CHOICES
 const noop = () => {}
 const err = (code: string, status = 409) => expect.objectContaining({ code, status })
+const loopback = 'http://127.0.0.1:38472'
+const snapshotPath = (stateDir: string, updateId: string, name: string) => join(stateDir, 'updates', updateId, name)
+async function until(predicate: () => boolean, ms = 3_000): Promise<void> {
+  const end = Date.now() + ms
+  while (!predicate()) {
+    if (Date.now() >= end) throw new Error('Timed out waiting for Studio fixture')
+    await delay(20)
+  }
+}
 
 function release(root: string, buildId: string) {
   for (const name of RELEASE_ASSETS) {
@@ -50,10 +61,13 @@ function release(root: string, buildId: string) {
   return computeReleaseManifest(root).artifactFingerprint
 }
 
-function fixture(overrides: Partial<StudioSelfUpdateConfig> = {}, failedCheck = false) {
+function fixture(overrides: Partial<StudioSelfUpdateConfig> = {}, failedCheck = false,
+  mode: 'mock' | 'real-precheck' | 'real-handoff' = 'mock', runnerBody?: string) {
   const root = temp(), stateDir = mkdir(join(root, 's')), installRoot = mkdir(join(root, 'i'))
   const packageRoot = mkdir(join(installRoot, 'releases', 'v0')), repoPath = mkdir(join(root, 'repo'))
-  const artifactFingerprint = release(packageRoot, 'baseline')
+  release(packageRoot, 'baseline')
+  if (runnerBody) writeFileSync(join(packageRoot, 'lib', 'self-update-runner.js'), runnerBody)
+  const artifactFingerprint = computeReleaseManifest(packageRoot).artifactFingerprint
   symlinkSync('releases/v0', join(installRoot, 'current'))
   mkdir(join(repoPath, 'src', 'managed-worker')); mkdir(join(repoPath, 'src', 'studio-web'))
   for (const name of ['cordis.patch.yml', 'tsdown.config.ts', 'pnpm-lock.yaml', 'src/managed-worker/index.ts', 'src/studio-web/index.tsx']) {
@@ -80,11 +94,17 @@ function fixture(overrides: Partial<StudioSelfUpdateConfig> = {}, failedCheck = 
   })
   const build = { packageRoot, artifactFingerprint, buildId: 'baseline', version: '0.1.0' }
   const config = { repoPath, installRoot, reloadCommand: { executable: process.execPath, args: ['--profile', 'isolated'], profileName: 'isolated' }, ...overrides }
-  updates = new StudioSelfUpdate(domain, { stopping: stop.signal, canReload: () => true, enterMaintenance: () => noop,
-    busy: () => false, sealed: noop, wake: noop, warn: message => { throw new Error(message) } }, { stateDir, build, config, runPrecheck: precheck, handoff })
+  let draining = false, sealed = false
+  const runtime = { stopping: stop.signal, canReload: () => true, origin: () => loopback, enterMaintenance: () => {
+    draining = true
+    return () => { draining = false }
+  }, busy: () => false, sealed: (value: boolean) => { sealed = value; if (!value) draining = false }, wake: noop,
+  warn: (message: string) => { throw new Error(message) } }
+  updates = new StudioSelfUpdate(domain, runtime, { stateDir, build, config, runPrecheck: mode === 'real-precheck' ? undefined : precheck,
+    handoff: mode === 'real-handoff' ? handoffStudioUpdate : handoff })
   const ctx = { on: () => noop, logger: { warn: noop } } as unknown as Context
   const service = new StudioService(ctx, domain, repoPath, { assistant: null, leader: null }, () => true,
-    stop.signal, () => 'disabled', noop, undefined, { updates, draining: () => false, sealed: () => false, available: () => true, configOk: () => true })
+    stop.signal, () => 'disabled', noop, undefined, { updates, draining: () => draining, sealed: () => sealed, available: () => true, configOk: () => true })
   const input = { requestId: 'prepare', expectedCurrentFingerprint: artifactFingerprint }
   const prepare = () => {
     const record = service.operations.prepareSelfUpdate(input, signal) as StudioSelfUpdateRecord
@@ -92,7 +112,8 @@ function fixture(overrides: Partial<StudioSelfUpdateConfig> = {}, failedCheck = 
     return record
   }
   const awaiting = async () => { const { updateId } = prepare(); await updates.drain(); return updates.status(updateId).record! }
-  return { root, repoPath, installRoot, packageRoot, stateDir, path, domain, updates, service, ctx, handoff, precheck, input, prepare, awaiting }
+  return { root, repoPath, installRoot, packageRoot, stateDir, path, domain, updates, service, ctx, handoff, precheck, input, prepare, awaiting,
+    runtime, config, build, draining: () => draining }
 }
 
 it('hashes sorted relative paths and every runtime asset byte, without including the release manifest itself', () => {
@@ -147,7 +168,7 @@ it('retains the idempotent receipt and never creates a confirmation or moves cur
   expect(() => f.updates.prepareUpdate({ ...f.input, expectedCurrentFingerprint: 'c'.repeat(64) }, signal)).toThrow(err('STUDIO_UPDATE_REQUEST_CONFLICT'))
   await f.updates.drain()
   expect(f.updates.prepareUpdate(f.input, signal)).toMatchObject({ updateId: record.updateId, phase: 'failed_precheck', failedPhase: 'prechecking', exitCode: 17 })
-  expect(readFileSync(record.logPath, 'utf8')).toContain('process.exit(17)')
+  expect(readFileSync(snapshotPath(f.stateDir, record.updateId, record.logRef), 'utf8')).toContain('process.exit(17)')
   expect(f.precheck).toHaveBeenCalledTimes(1)
   expect(f.handoff).not.toHaveBeenCalled()
   expect(f.domain.studio.pendingCount()).toBe(0)
@@ -208,7 +229,7 @@ it('requires a fresh, cancellable rollback confirmation for a verified baseline'
   const baselineFingerprint = release(mkdir(join(dir, 'baseline')), 'older')
   const ledger = f.domain.enableSelfUpdateLedger()
   const target: StudioSelfUpdateRecord = { updateId, kind: 'update', phase: 'succeeded', candidateBuildId: 'baseline', baselineBuildId: 'older',
-    baselineFingerprint, candidateFingerprint: f.input.expectedCurrentFingerprint, createdAt: Date.now(), updatedAt: Date.now(), logPath: join(dir, 'controller.log') }
+    baselineFingerprint, candidateFingerprint: f.input.expectedCurrentFingerprint, createdAt: Date.now(), updatedAt: Date.now(), logRef: 'controller.log' }
   ledger.start(target, 'historic', 'historic')
   const request = { ...f.input, updateId }
   const rollback = f.updates.rollbackSelfUpdate(request, signal)
@@ -299,6 +320,169 @@ it('echoes independent Unix socket challenges, restricts socket permissions and 
   await expect(probeStudioHealth(f.stateDir)).rejects.toThrow()
 })
 
+it('rejects a no-op check script in the real isolated precheck without staging a candidate or approval', async () => {
+  const f = fixture({}, false, 'real-precheck')
+  const checked = (args: string[], input?: string) => {
+    const result = spawnSync('git', args, { cwd: f.repoPath, input, encoding: 'utf8', timeout: 5_000 })
+    expect(result.status, result.stderr ?? String(result.error)).toBe(0)
+    return result.stdout.trim()
+  }
+  // 只为临时夹具写入合成 HEAD；隔离候选本身没有 Git 元数据，不依赖原仓库引用。
+  checked(['init', '--quiet'])
+  const tree = checked(['mktree'], '')
+  const head = checked(['hash-object', '-w', '-t', 'commit', '--stdin'],
+    `tree ${tree}\nauthor Fixture <fixture@example.invalid> 0 +0000\ncommitter Fixture <fixture@example.invalid> 0 +0000\n\nSynthetic test fixture\n`)
+  checked(['update-ref', 'HEAD', head])
+  writeFileSync(join(f.repoPath, 'package.json'), JSON.stringify({ name: 'agent-studio', scripts: {
+    check: 'true', typecheck: 'tsc --noEmit', test: 'vitest run', build: 'tsdown',
+  } }))
+  const receipt = f.prepare()
+  await f.updates.drain()
+  expect(f.updates.status(receipt.updateId).record).toMatchObject({ phase: 'failed_precheck', exitCode: 1, failureCode: 'PRECHECK_FAILED' })
+  expect(readFileSync(snapshotPath(f.stateDir, receipt.updateId, 'precheck.log'), 'utf8')).toContain('scripts do not match')
+  expect(f.domain.studio.pendingCount()).toBe(0)
+  expect(existsSync(snapshotPath(f.stateDir, receipt.updateId, 'candidate'))).toBe(false)
+  expect(releaseTarget(f.installRoot)).toBe(f.packageRoot)
+})
+
+it.skipIf(process.platform !== 'linux')('unseals the still-running baseline when the detached controller dies after staging stopping', async () => {
+  const f = fixture({}, false, 'real-handoff', `import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { inspectLocalProcess } from ${JSON.stringify(new URL('../src/studio/local-process.ts', import.meta.url).href)}
+const path = process.argv[2], dir = dirname(path), plan = JSON.parse(readFileSync(path, 'utf8'))
+const write = (name, value) => {
+  const tmp = join(dir, name + '.tmp')
+  writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 })
+  renameSync(tmp, join(dir, name))
+}
+const { pid, bootId, starttime } = inspectLocalProcess(process.pid)
+write('runner-ready.json', { pid, started: bootId + ':' + starttime })
+const deadline = Date.now() + 4000
+while (!existsSync(join(dir, 'seal.json')) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+if (!existsSync(join(dir, 'seal.json'))) process.exit(46)
+write('state.json', { ...plan.record, phase: 'stopping', updatedAt: Date.now() })
+process.kill(process.pid, 'SIGKILL')
+`)
+  const ready = await f.awaiting()
+  f.updates.answer(ready.pendingId!, approve, 'gui')
+  await f.updates.drain()
+  await until(() => f.updates.status(ready.updateId).record?.phase === 'failed_drain')
+  expect(f.updates.status(ready.updateId).record).toMatchObject({ failedPhase: 'stopping', failureCode: 'CONTROLLER_EXITED' })
+  expect(f.draining()).toBe(false)
+  expect(releaseTarget(f.installRoot)).toBe(f.packageRoot)
+  expect(f.service.health().phase).toBe('ready')
+  expect(() => f.domain.studio.addUser({ requestId: 'after-crash', conversationId: 'assistant', text: 'accepted after resuming', channel: 'gui' })).not.toThrow()
+  expect(() => validateStudioDatabase(snapshotPath(f.stateDir, ready.updateId, `baseline/${STUDIO_DB}.bak`), f.domain.runId)).not.toThrow()
+})
+
+it.each(['baseline', 'candidate', 'unknown'] as const)('converges old-run intermediate phases on startup (%s) without replay or permanent busy', async actual => {
+  const f = fixture(), ledger = f.domain.enableSelfUpdateLedger()
+  const candidate = mkdir(join(f.installRoot, 'releases', 'next')), candidateFingerprint = release(candidate, 'next')
+  const phases = ['prechecking', 'draining', 'stopping', 'switching', 'reloading'] as const
+  const previous = phases.map(phase => {
+    const updateId = randomUUID()
+    mkdir(join(f.stateDir, 'updates', updateId))
+    ledger.start({ updateId, kind: 'update', phase, candidateBuildId: 'next', baselineBuildId: 'baseline', baselineFingerprint: f.build.artifactFingerprint,
+      candidateFingerprint: phase === 'prechecking' ? undefined : candidateFingerprint, logRef: 'precheck.log', createdAt: Date.now(), updatedAt: Date.now() }, updateId, updateId)
+    return updateId
+  })
+  const build = { ...f.build }
+  if (actual !== 'baseline') {
+    build.packageRoot = actual === 'candidate' ? candidate : mkdir(join(f.installRoot, 'releases', 'unrelated'))
+    build.buildId = actual === 'candidate' ? 'next' : 'unrelated'
+    build.artifactFingerprint = actual === 'candidate' ? candidateFingerprint : release(build.packageRoot, build.buildId)
+    switchRelease(f.installRoot, build.packageRoot, f.packageRoot)
+  }
+  f.domain.close()
+  using _cleanup = { [Symbol.dispose]: () => domain.close() }
+  const domain = new ManagedWorkerStore(f.path, f.stateDir)
+  const startup = new StudioSelfUpdate(domain, f.runtime, { stateDir: f.stateDir, build, config: f.config, runPrecheck: f.precheck, handoff: f.handoff })
+  for (const [index, updateId] of previous.entries()) {
+    const record = startup.status(updateId).record!
+    expect(record.phase).toBe(actual === 'unknown' || (actual === 'candidate' && index === 0) ? 'recovery_required'
+      : actual === 'candidate' ? 'succeeded' : index === 0 ? 'failed_precheck' : 'rolled_back')
+    expect(JSON.parse(readFileSync(snapshotPath(f.stateDir, updateId, 'state.json'), 'utf8')).phase).toBe(record.phase)
+  }
+  expect(startup.prepareUpdate({ requestId: 'new-after-restart', expectedCurrentFingerprint: build.artifactFingerprint }, signal).phase).toBe('prechecking')
+  await startup.drain()
+  expect(f.handoff).not.toHaveBeenCalled()
+})
+
+it.skipIf(process.platform !== 'linux')('rejects a second state directory for the same install root and excludes even same-owner concurrent controllers', () => {
+  const f = fixture(), secondDir = mkdir(join(f.root, 'second'))
+  const unlock = lockStudioInstallRoot(f.installRoot, f.stateDir)
+  try {
+    expect(() => lockStudioInstallRoot(f.installRoot, f.stateDir)).toThrow(expect.objectContaining({ code: 'LOCK_CONFLICT' }))
+    expect(() => lockStudioInstallRoot(f.installRoot, secondDir)).toThrow(expect.objectContaining({ code: 'LOCK_CONFLICT' }))
+  } finally { unlock() }
+  expect(() => lockStudioInstallRoot(f.installRoot, secondDir)).toThrow(expect.objectContaining({ code: 'LOCK_CONFLICT' }))
+  lockStudioInstallRoot(f.installRoot, f.stateDir)()
+  expect(JSON.parse(readFileSync(join(f.installRoot, '.studio-owner.json'), 'utf8'))).toEqual({ stateDirHash: sha(f.stateDir) })
+  const secondStore = new ManagedWorkerStore(join(secondDir, STUDIO_DB), secondDir)
+  try {
+    const second = new StudioSelfUpdate(secondStore, f.runtime, { stateDir: secondDir, build: f.build, config: f.config })
+    expect(() => second.prepareUpdate(f.input, signal)).toThrow(err('STUDIO_UPDATE_LOCK_CONFLICT'))
+    expect(secondStore.studio.pendingCount()).toBe(0)
+    expect(releaseTarget(f.installRoot)).toBe(f.packageRoot)
+  } finally { secondStore.close() }
+})
+
+it.skipIf(process.platform !== 'linux')('never reclaims the state lock while the recorded host identity is still alive', async () => {
+  const f = fixture()
+  const unlock = await lockStudioHostDirectory(f.stateDir, noop)
+  try {
+    const owner = readFileSync(join(f.stateDir, 'runtime/host-lock.json'), 'utf8')
+    const inode = lstatSync(`${f.stateDir}.lock`).ino
+    await expect(lockStudioHostDirectory(f.stateDir, noop)).rejects.toMatchObject({ code: 'ELOCKED' })
+    expect(lstatSync(`${f.stateDir}.lock`).ino).toBe(inode)
+    expect(readFileSync(join(f.stateDir, 'runtime/host-lock.json'), 'utf8')).toBe(owner)
+  } finally { unlock() }
+  expect(existsSync(join(f.stateDir, 'runtime/host-lock.json'))).toBe(false)
+  expect(existsSync(`${f.stateDir}.lock`)).toBe(false)
+})
+
+it('serves an allowlisted logRef and structured failureCode over HTTP even for a legacy absolute logPath', async () => {
+  const f = fixture(), updateId = randomUUID(), dir = mkdir(join(f.stateDir, 'updates', updateId)), now = Date.now()
+  const record = { updateId, kind: 'update', phase: 'draining', baselineBuildId: 'baseline', baselineFingerprint: f.build.artifactFingerprint,
+    candidateBuildId: 'next', logRef: 'controller.log', createdAt: now, updatedAt: now, logPath: join(dir, 'controller.log') } as const
+  f.domain.enableSelfUpdateLedger().start(record, 'legacy-path', 'legacy-path')
+  atomicJson(dir, 'state.json', { ...record, phase: 'failed_drain', failedPhase: 'stopping', failureCode: 'STOP_TIMEOUT' })
+  const http = createServer()
+  cleanups.push(() => { http.closeAllConnections(); http.close() })
+  const ctx = { ...f.ctx, webServer: { register({ handler }: { handler: Parameters<typeof http.on>[1] }) { http.on('request', handler); return noop } } }
+  const peer = { id: 'browser', principal: { kind: 'owner' } }
+  registerStudioHttp(ctx as unknown as Context, { browserPeer: peer, admit: () => ({ peer }) }, () => true, f.service.operations as StudioHttpOperations)
+  await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve))
+  const address = http.address()
+  if (!address || typeof address === 'string') throw new Error('Missing isolated listener')
+  const response = await fetch(`http://127.0.0.1:${address.port}/agent-studio/api`, { method: 'POST', headers: { [STUDIO_HEADER]: '1', 'content-type': 'application/json' },
+    body: JSON.stringify({ op: 'selfUpdateStatus', input: { updateId } }) })
+  expect(response.status).toBe(200)
+  const text = await response.text()
+  expect(text).not.toContain('logPath')
+  expect(text).not.toContain(f.root)
+  expect(JSON.parse(text).record).toMatchObject({ phase: 'failed_drain', failureCode: 'STOP_TIMEOUT', logRef: 'controller.log' })
+})
+
+it('enforces an absolute Unix probe deadline despite receiving a continuous trickle of bytes', async () => {
+  const f = fixture(), address = studioHealthSocket(f.stateDir)
+  mkdir(join(f.stateDir, 'runtime'))
+  let socketClosed = false
+  const server = createSocketServer(socket => {
+    const timer = setInterval(() => socket.write('.'), 20)
+    socket.on('error', noop)
+    socket.on('close', () => { clearInterval(timer); socketClosed = true })
+    socket.resume()
+  })
+  cleanups.push(() => { server.close() })
+  await new Promise<void>(resolve => server.listen(address, resolve))
+  chmodSync(address, 0o600)
+  const before = performance.now()
+  await expect(probeStudioHealth(f.stateDir, 150)).rejects.toThrow('health response is unavailable')
+  expect(performance.now() - before).toBeLessThan(1_500)
+  await until(() => socketClosed)
+})
+
 function started(pid: number) {
   try {
     const result = readFileSync(`/proc/${pid}/stat`, 'utf8'), fields = result.slice(result.lastIndexOf(') ') + 2).split(' ')
@@ -306,37 +490,57 @@ function started(pid: number) {
   } catch { return undefined }
 }
 
-it.skipIf(process.platform !== 'linux').each(['succeeded', 'rolled_back', 'recovery_required'] as const)(
-  'runs the real controller with an atomic pointer and bounded replacement attempts: %s', async outcome => {
+it.skipIf(process.platform !== 'linux').each(['succeeded', 'rolled_back', 'recovery_required', 'db-corrupt', 'sigkill', 'origin-mismatch'] as const)(
+  'runs the real controller with an atomic pointer and bounded replacement attempts: %s', async scenario => {
+    const outcome = scenario === 'succeeded' || scenario === 'recovery_required' ? scenario : 'rolled_back'
     const f = fixture(), updateId = randomUUID(), dir = mkdir(join(f.stateDir, 'updates', updateId))
     const current = join(f.installRoot, 'current'), initialLink = lstatSync(current).ino
-    const fallback = join(f.installRoot, 'releases', `${updateId}-baseline`), candidate = mkdir(join(f.installRoot, 'releases', updateId))
-    const candidateFingerprint = release(candidate, 'next')
-    const snapshot = join(dir, 'baseline')
+    const fallback = join(f.installRoot, 'releases', `${updateId}-baseline`), candidate = join(f.installRoot, 'releases', updateId)
+    const candidateFingerprint = release(mkdir(join(dir, 'candidate')), 'next')
+    const snapshot = join(dir, 'baseline'), backup = join(snapshot, `${STUDIO_DB}.bak`)
     copyRelease(f.packageRoot, snapshot, 'baseline', f.input.expectedCurrentFingerprint)
-    copyRelease(snapshot, fallback, 'baseline', f.input.expectedCurrentFingerprint)
+    f.domain.studio.activateFeishu('retained-binding', 123456)
     const history = join(f.root, 'launches'), oldExit = join(f.root, 'old-exit'), script = join(f.root, 'process.mjs')
-    // 假宿主只模拟旧进程退场和新进程健康；信号、SQLite 校验、符号链接及控制器均走真实实现。
-    writeFileSync(script, `import { appendFileSync, realpathSync, writeFileSync } from 'node:fs'
+    // fixture 仅替换 DSH 启动；真实子进程调用宿主锁、SQLite 和 Unix 健康服务。
+    writeFileSync(script, `import { appendFileSync, existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { openStudioHealthSocket } from ${JSON.stringify(new URL('../src/studio/health.ts', import.meta.url).href)}
-const [mode, current, candidate, state, history, oldExit, result, nextHash, baselineHash] = process.argv.slice(2)
+import { lockStudioHostDirectory } from ${JSON.stringify(new URL('../src/managed-worker/state-lock.ts', import.meta.url).href)}
+import { ManagedWorkerStore } from ${JSON.stringify(new URL('../src/managed-worker/store.ts', import.meta.url).href)}
+const [mode, current, candidate, state, history, oldExit, scenario, nextHash, baselineHash, origin] = process.argv.slice(2)
 if (mode === 'old') {
   process.on('SIGTERM', () => { writeFileSync(oldExit, realpathSync(current)); process.exit(0) })
   process.send('ready')
 } else {
-  const path = realpathSync(current), next = path === candidate
-  const ready = result === 'succeeded' || (!next && result === 'rolled_back')
+  const path = realpathSync(current), next = path === candidate, db = join(state, '${STUDIO_DB}')
+  const unlock = await lockStudioHostDirectory(state, error => { throw error })
+  const owner = JSON.parse(readFileSync(join(state, 'runtime/host-lock.json'), 'utf8'))
+  const register = () => appendFileSync(history, JSON.stringify({ pid: process.pid, path, started: owner.starttime,
+    held: existsSync(state + '.lock') && owner.pid === process.pid }) + '\\n')
+  if (next && scenario === 'db-corrupt') {
+    register()
+    writeFileSync(db, 'damaged SQLite header')
+    writeFileSync(db + '-wal', 'discard this sidecar')
+    writeFileSync(db + '-shm', 'discard this sidecar')
+    unlock()
+    process.exit(9)
+  }
+  const store = new ManagedWorkerStore(db, state)
+  const ready = scenario === 'succeeded' || (!next && scenario !== 'recovery_required') || scenario === 'origin-mismatch'
   const close = await openStudioHealthSocket(state, () => ({ buildId: next ? 'next' : 'baseline', artifactFingerprint: next ? nextHash : baselineHash,
-    pid: process.pid, ready, ok: ready, phase: ready ? 'ready' : 'starting', sqlite: { ok: true }, configOk: true, feishu: 'disabled' }))
-  appendFileSync(history, JSON.stringify({ pid: process.pid, path, started: (await import('node:fs')).readFileSync('/proc/self/stat', 'utf8').split(') ').at(-1).split(' ')[19] }) + '\\n')
-  process.on('SIGTERM', () => { close(); process.exit(0) })
+    pid: process.pid, ready, ok: ready, phase: ready ? 'ready' : 'starting', sqlite: store.sqliteHealth(), configOk: true, feishu: 'disabled',
+    origin: next && scenario === 'origin-mismatch' ? 'http://127.0.0.1:38473' : origin }))
+  register()
+  if (next && scenario === 'sigkill') process.kill(process.pid, 'SIGKILL')
+  process.on('SIGTERM', () => { close(); store.close(); unlock(); process.exit(0) })
 }
 setInterval(() => {}, 1000)
 `)
-    const old = spawn(process.execPath, [script, 'old', current, candidate, f.stateDir, history, oldExit], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
+    const old = spawn(process.execPath, ['--experimental-transform-types', script, 'old', current, candidate, f.stateDir, history, oldExit],
+      { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] })
     const oldPid = old.pid!
     const oldToken = started(oldPid)!
-    const launches = (): Array<{ pid: number; path: string; started: string }> => existsSync(history)
+    const launches = (): Array<{ pid: number; path: string; started: string; held: boolean }> => existsSync(history)
       ? readFileSync(history, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : []
     cleanups.push(async () => {
       const pids = [{ pid: oldPid, started: oldToken.split(':').at(-1) }, ...launches()]
@@ -349,10 +553,11 @@ setInterval(() => {}, 1000)
     })
     const exited = new Promise<{ code: number | null; signal: string | null }>(resolve => old.on('exit', (code, signal) => resolve({ code, signal })))
     const record: StudioSelfUpdateRecord = { updateId, kind: 'update', phase: 'draining', candidateBuildId: 'next', candidateFingerprint,
-      baselineBuildId: 'baseline', baselineFingerprint: f.input.expectedCurrentFingerprint, createdAt: Date.now(), updatedAt: Date.now(), logPath: join(dir, 'controller.log') }
-    const plan: StudioControllerPlan = { stateDir: f.stateDir, installRoot: f.installRoot, current: f.packageRoot,
-      old: { pid: oldPid, started: oldToken }, runId: f.domain.runId, healthTimeoutMs: 800, record, command: { executable: process.execPath,
-        args: [script, 'new', current, candidate, f.stateDir, history, oldExit, outcome, candidateFingerprint, record.baselineFingerprint] } }
+      baselineBuildId: 'baseline', baselineFingerprint: f.input.expectedCurrentFingerprint, createdAt: Date.now(), updatedAt: Date.now(), logRef: 'controller.log' }
+    const plan: StudioControllerPlan = { stateDir: f.stateDir, installRoot: f.installRoot, current: f.packageRoot, origin: loopback,
+      old: { pid: oldPid, started: oldToken }, runId: f.domain.runId, healthTimeoutMs: 1_400, record, command: { executable: process.execPath,
+        args: ['--experimental-transform-types', script, 'new', current, candidate, f.stateDir, history, oldExit, scenario, candidateFingerprint,
+          record.baselineFingerprint, loopback] } }
     const planFile = join(dir, 'controller.json')
     atomicJson(dir, 'controller.json', plan)
     const run = runStudioUpdateController(planFile)
@@ -360,7 +565,10 @@ setInterval(() => {}, 1000)
     const watch = setInterval(() => { try { observed.add(releaseTarget(f.installRoot)) } catch { observed.add('missing') } }, 5)
     try {
       expect(realpathSync(current)).toBe(f.packageRoot)
-      atomicJson(dir, 'seal.json', f.domain.checkpointAndSeal())
+      const seal = f.domain.checkpointAndSeal()
+      await f.domain.backupSealedUpdate(backup)
+      f.domain.close()
+      atomicJson(dir, 'seal.json', seal)
       await run
     } finally { clearInterval(watch) }
     expect(await exited).toEqual({ code: 0, signal: null })
@@ -369,9 +577,11 @@ setInterval(() => {}, 1000)
     expect(lstatSync(current).ino).not.toBe(initialLink)
     expect(observed.has('missing')).toBe(false)
     const final = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')) as StudioSelfUpdateRecord
-    const log = readFileSync(final.logPath, 'utf8')
+    const log = readFileSync(join(dir, final.logRef), 'utf8')
     expect(final.phase).toBe(outcome)
-    expect(final.logPath).toBe(join(dir, 'controller.log'))
+    expect(final.logRef).toBe('controller.log')
+    expect(() => validateStudioDatabase(backup, plan.runId)).not.toThrow()
+    expect(statSync(backup).mode & 0o777).toBe(0o600)
     expect(log).toMatch(/stopping[\s\S]+switching[\s\S]+starting/u)
     if (outcome === 'succeeded') {
       expect(releaseTarget(f.installRoot)).toBe(candidate)
@@ -380,15 +590,27 @@ setInterval(() => {}, 1000)
       expect(next?.pid).not.toBe(oldPid)
       expect(await probeStudioHealth(f.stateDir)).toMatchObject({ pid: next?.pid, ready: true, buildId: 'next', artifactFingerprint: candidateFingerprint })
     } else {
-      expect(final.failedPhase).toBe('starting')
+      const failureCode = { succeeded: undefined, recovery_required: 'ROLLBACK_FAILED', rolled_back: 'HEALTH_TIMEOUT', 'db-corrupt': 'DB_CORRUPT',
+        sigkill: 'CANDIDATE_EXITED', 'origin-mismatch': 'ORIGIN_MISMATCH' }[scenario]
+      expect(final).toMatchObject({ failedPhase: 'starting', failureCode })
       expect(releaseTarget(f.installRoot)).toBe(fallback)
-      expect(log).toContain(`${outcome} (failed: starting)`)
+      expect(log).toContain(`${outcome} (failed: starting) ${JSON.stringify({ failureCode })}`)
       const [failed, restored] = launches()
       expect(launches().map(entry => entry.path)).toEqual([candidate, fallback])
       expect(started(failed!.pid)).toBeUndefined()
       expect(new Set([oldPid, failed?.pid, restored?.pid]).size).toBe(3)
-      if (outcome === 'rolled_back') expect(await probeStudioHealth(f.stateDir)).toMatchObject({ pid: restored?.pid, ready: true,
-        buildId: 'baseline', artifactFingerprint: record.baselineFingerprint })
-      else { await delay(150); expect(launches()).toHaveLength(2) }
+      if (outcome === 'rolled_back') {
+        expect(await probeStudioHealth(f.stateDir)).toMatchObject({ pid: restored?.pid, ready: true, origin: loopback,
+          buildId: 'baseline', artifactFingerprint: record.baselineFingerprint })
+        expect(() => validateStudioDatabase(f.path)).not.toThrow()
+        using restoredDb = new DatabaseSync(f.path, { readOnly: true })
+        expect(restoredDb.prepare('SELECT scope, cutover FROM agent_studio_feishu_binding').get()).toEqual({ scope: 'retained-binding', cutover: 123456 })
+      } else { await delay(150); expect(launches()).toHaveLength(2) }
+      if (scenario === 'db-corrupt') expect(log).toContain('restoring_database (failed: starting) {"failureCode":"DB_CORRUPT"}')
+      if (scenario === 'sigkill') {
+        expect(failed?.held).toBe(true)
+        expect(restored?.held).toBe(true)
+        expect(JSON.parse(readFileSync(join(f.stateDir, 'runtime/host-lock.json'), 'utf8')).pid).toBe(restored?.pid)
+      }
     }
   }, 8_000)

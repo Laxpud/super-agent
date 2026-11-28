@@ -1,8 +1,20 @@
 import { randomBytes } from 'node:crypto'
 import { chmodSync, lstatSync, mkdirSync, realpathSync, unlinkSync } from 'node:fs'
-import { createConnection, createServer } from 'node:net'
+import { createConnection, createServer, isIPv4 } from 'node:net'
 import { join } from 'node:path'
 import type { StudioHealthStatus } from './protocol.ts'
+
+export interface StudioInternalHealth extends StudioHealthStatus { origin?: string }
+
+export function isStudioLoopbackOrigin(origin: unknown): origin is string {
+  if (typeof origin !== 'string') return false
+  try {
+    const url = new URL(origin)
+    const host = url.hostname
+    return url.origin === origin && (url.protocol === 'http:' || url.protocol === 'https:')
+      && (host === 'localhost' || host === '[::1]' || (host.startsWith('127.') && isIPv4(host)))
+  } catch { return false }
+}
 
 const challengePattern = /^[a-f0-9]{64}$/u
 export const studioHealthSocket = (stateDir: string) => join(stateDir, 'runtime', 'health.sock')
@@ -15,7 +27,7 @@ function assertPrivate(path: string, directory: boolean): void {
 }
 
 /** 每条连接仅接受一个 256 bit 随机挑战，原样回显以绑定该次应答。权限由 Unix socket 的父目录限定。 */
-export async function openStudioHealthSocket(stateDir: string, health: () => StudioHealthStatus): Promise<() => void> {
+export async function openStudioHealthSocket(stateDir: string, health: () => StudioInternalHealth): Promise<() => void> {
   if (process.platform === 'win32' || realpathSync(stateDir) !== stateDir) throw new Error('Studio health socket requires a canonical Unix state directory')
   const info = lstatSync(stateDir)
   if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o022)) throw new Error('Studio state directory is not owner controlled')
@@ -31,7 +43,8 @@ export async function openStudioHealthSocket(stateDir: string, health: () => Stu
   const server = createServer(socket => {
     let input = ''
     socket.on('error', () => socket.destroy())
-    socket.setTimeout(1_000, () => socket.destroy())
+    const deadline = setTimeout(() => socket.destroy(), 1_000)
+    socket.once('close', () => clearTimeout(deadline))
     socket.setEncoding('utf8')
     socket.on('data', (part: string) => {
       input += part
@@ -56,7 +69,7 @@ export async function openStudioHealthSocket(stateDir: string, health: () => Stu
   }
 }
 
-export async function probeStudioHealth(stateDir: string): Promise<StudioHealthStatus> {
+export async function probeStudioHealth(stateDir: string, timeoutMs = 1_000): Promise<StudioInternalHealth> {
   const address = studioHealthSocket(stateDir)
   assertPrivate(join(stateDir, 'runtime'), true)
   assertPrivate(address, false)
@@ -64,19 +77,22 @@ export async function probeStudioHealth(stateDir: string): Promise<StudioHealthS
   return new Promise((resolve, reject) => {
     const socket = createConnection(address)
     let output = ''
-    const invalid = () => { socket.destroy(); reject(new Error('Studio health response is unavailable')) }
-    socket.setTimeout(1_000, invalid)
+    const invalid = () => { clearTimeout(deadline); socket.destroy(); reject(new Error('Studio health response is unavailable')) }
+    // 不因收到部分数据而重置截止时间，防止探针持续分段发送而阻塞控制器。
+    const deadline = setTimeout(invalid, timeoutMs)
     socket.on('error', invalid)
     socket.on('connect', () => socket.write(`${nonce}\n`))
     socket.setEncoding('utf8')
     socket.on('data', (part: string) => { output += part; if (output.length > 4_096) invalid() })
     socket.on('end', () => {
       try {
-        const response = JSON.parse(output) as { nonce?: string; health?: StudioHealthStatus }
+        const response = JSON.parse(output) as { nonce?: string; health?: StudioInternalHealth }
         if (response.nonce !== nonce || !response.health || typeof response.health !== 'object') throw new Error('Invalid challenge response')
+        clearTimeout(deadline)
+        socket.destroy()
         resolve(response.health)
       } catch { invalid() }
     })
-    socket.on('close', () => reject(new Error('Studio health connection closed')))
+    socket.on('close', invalid)
   })
 }

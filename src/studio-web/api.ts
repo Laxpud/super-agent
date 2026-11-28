@@ -1,5 +1,6 @@
 /** 浏览器只调用同源 Studio API；会话身份由宿主 Cookie 验证。 */
-import { STUDIO_API, STUDIO_HEADER, STUDIO_HEALTH, STUDIO_SELF_UPDATE_PHASES, STUDIO_TASK_STATUSES, type StudioHealthStatus, type StudioInput, type StudioOp, type StudioRecordRole, type StudioResult } from '../studio/protocol.ts'
+import { STUDIO_API, STUDIO_HEADER, STUDIO_HEALTH, STUDIO_SELF_UPDATE_FAILURE_CODES, STUDIO_SELF_UPDATE_LOG_REFS, STUDIO_SELF_UPDATE_PHASES,
+  STUDIO_TASK_STATUSES, type StudioHealthStatus, type StudioInput, type StudioOp, type StudioRecordRole, type StudioResult } from '../studio/protocol.ts'
 import type { en, T } from './locales.ts'
 
 declare const __AGENT_STUDIO_BUILD_ID__: string | undefined
@@ -39,8 +40,10 @@ const revision = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}
 const buildIdentity = (value: unknown) => object(value) && text(value.version) && text(value.buildId)
   && (value.artifactFingerprint === '' || revision(value.artifactFingerprint))
 const updatePhase = (value: unknown) => choice(value, STUDIO_SELF_UPDATE_PHASES)
-const updateRecord = (value: unknown) => object(value) && text(value.updateId) && choice(value.kind, ['update', 'rollback'])
-  && updatePhase(value.phase) && whole(value.createdAt) && whole(value.updatedAt) && text(value.logPath)
+const updateRecord = (value: unknown) => object(value) && typeof value.updateId === 'string'
+  && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(value.updateId) && choice(value.kind, ['update', 'rollback'])
+  && updatePhase(value.phase) && whole(value.createdAt) && whole(value.updatedAt) && choice(value.logRef, STUDIO_SELF_UPDATE_LOG_REFS)
+  && !Object.hasOwn(value, 'logPath') && optional(value.failureCode, code => choice(code, STUDIO_SELF_UPDATE_FAILURE_CODES))
   && text(value.baselineBuildId) && text(value.candidateBuildId) && revision(value.baselineFingerprint)
   && optional(value.candidateFingerprint, revision) && optional(value.expiresAt, whole) && optional(value.failedPhase, updatePhase)
   && optional(value.projectEpoch, positiveWhole)

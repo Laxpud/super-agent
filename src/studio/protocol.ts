@@ -148,8 +148,13 @@ export interface StudioHealthStatus extends StudioBuildIdentity {
 }
 
 export const STUDIO_SELF_UPDATE_PHASES = ['prechecking', 'failed_precheck', 'awaiting_confirmation', 'expired', 'cancelled', 'approved',
-  'draining', 'failed_drain', 'stopping', 'switching', 'starting', 'succeeded', 'rolling_back', 'rolled_back', 'recovery_required'] as const
+  'draining', 'failed_drain', 'stopping', 'switching', 'starting', 'reloading', 'succeeded', 'rolling_back', 'rolled_back', 'recovery_required'] as const
 export type StudioSelfUpdatePhase = typeof STUDIO_SELF_UPDATE_PHASES[number]
+export const STUDIO_SELF_UPDATE_FAILURE_CODES = ['PRECHECK_FAILED', 'DRAIN_FAILED', 'SEAL_MISSING', 'STOP_TIMEOUT', 'LOCK_CONFLICT',
+  'CONTROLLER_EXITED', 'CANDIDATE_EXITED', 'ORIGIN_MISMATCH', 'FINGERPRINT_MISMATCH', 'HEALTH_TIMEOUT', 'DB_CORRUPT', 'ROLLBACK_FAILED',
+  'RECOVERY_UNCONFIRMED'] as const
+export type StudioSelfUpdateFailureCode = typeof STUDIO_SELF_UPDATE_FAILURE_CODES[number]
+export const STUDIO_SELF_UPDATE_LOG_REFS = ['precheck.log', 'controller.log'] as const
 export interface StudioSelfUpdateRecord {
   updateId: string
   kind: 'update' | 'rollback'
@@ -168,8 +173,9 @@ export interface StudioSelfUpdateRecord {
   sourceHead?: string
   sourceFingerprint?: string
   failedPhase?: StudioSelfUpdatePhase
+  failureCode?: StudioSelfUpdateFailureCode
   exitCode?: number | null
-  logPath: string
+  logRef: typeof STUDIO_SELF_UPDATE_LOG_REFS[number]
 }
 export interface StudioSelfUpdateStatus {
   enabled: boolean

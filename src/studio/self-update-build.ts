@@ -3,7 +3,12 @@ import { createHash } from 'node:crypto'
 import { accessSync, appendFileSync, constants, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
-import { canonicalDirectory, within } from './self-update-files.ts'
+import { canonicalDirectory, verifyRelease, within } from './self-update-files.ts'
+
+const gateScripts = {
+  typecheck: 'tsc --noEmit', test: 'vitest run', build: 'tsdown', check: 'pnpm typecheck && pnpm test && pnpm build',
+}
+const gateCommands = [['exec', 'tsc', '--noEmit'], ['exec', 'vitest', 'run'], ['exec', 'tsdown']] as const
 
 /** 子进程不继承宿主环境；只提供受信工具路径、区域以及显式配置的 profile 坐标。 */
 export function minimalEnvironment(): NodeJS.ProcessEnv {
@@ -115,8 +120,21 @@ export const runStudioPrecheck: RunStudioPrecheck = async (source, workspace, lo
     COREPACK_HOME: hostCache, COREPACK_ENABLE_NETWORK: '0', npm_config_store_dir: store }
   const signal = AbortSignal.any([requestSignal, AbortSignal.timeout(10 * 60_000)])
   const receipt = snapshot(source, workspace, env)
+  // package.json 只能声明现有门禁契约，不能决定实际执行的命令或 argv。
+  const { scripts } = JSON.parse(readFileSync(join(workspace, 'package.json'), 'utf8')) as { scripts?: Record<string, unknown> }
+  if (!Object.entries(gateScripts).every(([name, command]) => scripts?.[name] === command)) {
+    appendFileSync(log, 'Studio package scripts do not match the required precheck commands.\n')
+    return { exitCode: 1, ...receipt }
+  }
   const pnpm = executable('pnpm', env)
   const dependencies = await runCommand(pnpm, ['install', '--frozen-lockfile', '--ignore-scripts', '--store-dir', store], workspace, env, log, signal)
   if (dependencies !== 0) return { exitCode: dependencies, ...receipt }
-  return { exitCode: await runCommand(pnpm, ['check'], workspace, env, log, signal), ...receipt }
+  for (const argv of gateCommands) {
+    appendFileSync(log, `> pnpm ${argv.join(' ')}\n`)
+    const exitCode = await runCommand(pnpm, [...argv], workspace, env, log, signal)
+    if (exitCode !== 0) return { exitCode, ...receipt }
+  }
+  try { verifyRelease(workspace, buildId) }
+  catch { appendFileSync(log, 'Studio build is missing verified release artifacts.\n'); return { exitCode: 1, ...receipt } }
+  return { exitCode: 0, ...receipt }
 }

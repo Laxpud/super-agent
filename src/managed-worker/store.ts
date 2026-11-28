@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
+import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, realpathSync, renameSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { backup, DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { studioActiveTasks, studioArtifacts, studioBlockingItems, studioDeliverySummary, studioHiddenIds, studioPendingRecord, studioProject, studioProjects,
@@ -7,11 +7,13 @@ import { studioActiveTasks, studioArtifacts, studioBlockingItems, studioDelivery
 import { ASSISTANT_CONVERSATION, GUARD_PENDING_CHOICES, GUARD_PENDING_PREFIX, type StudioCheckResult, type StudioPending, type StudioRecordRole,
   type StudioMessage, type StudioProjectSummary, type StudioRole, type StudioTaskScope, type StudioTaskStatus, type StudioWorkerPermission } from '../studio/protocol.ts'
 import { STUDIO_OWNER_PREFIX } from '../studio/source.ts'
+import { syncPath } from '../studio/self-update-files.ts'
 import { StudioSelfUpdateLedger } from '../studio/self-update-ledger.ts'
 import { TASK_WRITE_PENDING_PREFIX, STUDIO_SCHEMA, STUDIO_FORWARD_SCHEMA, StudioStore } from '../studio/store.ts'
 import { MemoryStore } from './memory-store.ts'
 import { ProjectArchiveStore } from './project-archive-store.ts'
 import { ProjectStore } from './project-store.ts'
+import { CURRENT_STUDIO_VERSION, unlinkIfPresent, V1_TABLES, V2_TABLES, validateForeignKeys, validateStudioDatabase } from './sqlite-state.ts'
 import type { WorkerGuardDenial } from './worker-guard.ts'
 import { canonicalizeWorkspaceRoot, protectedHostRoots } from './workspace.ts'
 
@@ -67,15 +69,7 @@ const SCHEMA = `
   ) STRICT;
 `
 
-const V1_TABLES = [
-  'studio_bot', 'studio_project', 'studio_project_leader', 'studio_session', 'studio_task', 'studio_task_execution',
-  'studio_project_archive', 'studio_preference', 'studio_host_run',
-  'agent_studio_assistant', 'agent_studio_settings', 'agent_studio_message', 'agent_studio_parallel_turn', 'agent_studio_route_control',
-  'agent_studio_session', 'agent_studio_pending', 'agent_studio_feishu_binding', 'agent_studio_feishu_outbox',
-] as const
-
-const V2_TABLES = [...V1_TABLES, 'studio_project_forward', 'studio_project_forward_notice'] as const
-const CURRENT_STUDIO_VERSION = 2
+export { validateStudioCopy } from './sqlite-state.ts'
 
 const MIGRATED_AT = new Date(0).toISOString()
 export const studioNow = () => new Date().toISOString()
@@ -298,20 +292,6 @@ function migrateV2(db: DatabaseSync): void {
   db.exec('PRAGMA user_version=2')
 }
 
-function validateForeignKeys(db: DatabaseSync, tables: readonly string[], subject: string): void {
-  for (const table of tables) {
-    if (db.prepare(`PRAGMA foreign_key_check(${quote(table)})`).get()) throw new Error(`${subject} failed foreign key validation: ${table}`)
-  }
-}
-
-/** 目录副本必须是当前版本且现役表外键完整；迁移保留的只读旧表不属于现役关系图。 */
-export function validateStudioCopy(db: DatabaseSync): void {
-  if (db.prepare('PRAGMA quick_check').all().some(row => row.quick_check !== 'ok')) throw new Error('Studio database copy did not pass integrity checking')
-  const version = db.prepare('PRAGMA user_version').get()?.user_version
-  if (version !== CURRENT_STUDIO_VERSION) throw new Error(`Unsupported Studio database copy user_version: ${String(version)}`)
-  validateForeignKeys(db, V2_TABLES, 'Studio database copy')
-}
-
 function privateFile(path: string, create: boolean): void {
   const existing = lstatSync(path, { throwIfNoEntry: false })
   if (existing) {
@@ -501,6 +481,25 @@ export class ManagedWorkerStore {
     })
     try { truncate() } catch (error) { this.resumeAfterSeal(this.#runId); throw error }
     return { runId: this.#runId, checkpointed: true, sealedAt: studioNow() }
+  }
+
+  /** 从已封存的 SQLite 连接生成独立可恢复的备份；验证和同步完成后才发布备份名称。 */
+  async backupSealedUpdate(path: string): Promise<void> {
+    this.assertStateSealed()
+    const staged = `${path}.${randomUUID()}`
+    try {
+      privateFile(staged, true)
+      await backup(this.#db, staged, { rate: 256 })
+      this.assertStateSealed()
+      {
+        using copy = new DatabaseSync(staged)
+        if (copy.prepare('PRAGMA journal_mode=DELETE').get()?.journal_mode !== 'delete') throw new Error('Cannot make Studio backup standalone')
+      }
+      validateStudioDatabase(staged, this.#runId)
+      syncPath(staged)
+      renameSync(staged, path)
+      syncPath(dirname(path))
+    } finally { unlinkIfPresent(staged) }
   }
 
   /** 只有尚未交接的同一进程可撤销封存；新运行仍不能接过旧回执。 */
