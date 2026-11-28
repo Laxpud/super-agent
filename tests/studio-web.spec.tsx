@@ -7,6 +7,8 @@ import { DRAFT_DELEGATE, DRAFT_READ, STUDIO_API, STUDIO_HEADER, WORKER_DELEGATE,
 import { STUDIO_TASK_STATUSES, type StudioPreference, type StudioProjectArchive, type StudioProjectSummary, type StudioTaskSummary } from '../src/studio/protocol.ts'
 import type { ConfigurationSnapshot } from '../src/studio/settings-protocol.ts'
 import { apply } from '../src/studio-web/index.tsx'
+import { STUDIO_WEB_BUILD_ID } from '../src/studio-web/api.ts'
+import { SELF_UPDATE_CHOICES, STUDIO_HEALTH, type StudioSelfUpdateRecord } from '../src/studio/protocol.ts'
 import { en, NS, zh, type T } from '../src/studio-web/locales.ts'
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
@@ -620,4 +622,120 @@ it('isolates global and project preferences, edits the displayed version and for
   expect(panel.textContent).toContain(en.preferenceForgotten)
   await click(en.globalPreferences, panel)
   expect(node('.as-detail article .as-message-text', panel).textContent).toBe(global.text)
+})
+
+const updateId = '11111111-1111-4111-8111-111111111111'
+const rollbackId = '22222222-2222-4222-8222-222222222222'
+const oldHash = 'a'.repeat(64), nextHash = 'b'.repeat(64)
+const literalBuild = '<img src=x onerror=bad()>'
+const updateRecord = (phase: StudioSelfUpdateRecord['phase'], overrides: Partial<StudioSelfUpdateRecord> = {}): StudioSelfUpdateRecord => ({
+  updateId, kind: 'update', phase, createdAt: at, updatedAt: at, baselineBuildId: 'baseline', baselineFingerprint: oldHash,
+  candidateBuildId: literalBuild, candidateFingerprint: nextHash, logPath: `/home/private-owner/data/updates/${updateId}/controller.log`, ...overrides,
+})
+function updatesServer(handle: (request: Request) => unknown = () => undefined) {
+  const current = { version: '0.1.0-fixture', buildId: 'updated-host', artifactFingerprint: oldHash }
+  let record: StudioSelfUpdateRecord | null = null
+  const app = server(request => request.op === 'selfUpdateStatus' ? { enabled: true, managedReload: true, current, record } : handle(request))
+  const api = globalThis.fetch
+  const probes = vi.fn()
+  vi.stubGlobal('fetch', (url: string, init: RequestInit) => {
+    if (url !== STUDIO_HEALTH) return api(url, init)
+    probes()
+    expect(init.method ?? 'GET').toBe('GET')
+    expect(init.credentials).toBe('same-origin')
+    expect(new Headers(init.headers).get(STUDIO_HEADER)).toBe('1')
+    return Promise.resolve(Response.json({ ...current, ok: true, ready: true, phase: 'ready', pid: 42,
+      sqlite: { version: 2, ok: true }, configOk: true, feishu: 'disabled' }))
+  })
+  return { ...app, current, probes, show: (value: StudioSelfUpdateRecord | null) => { record = value } }
+}
+async function renderUpdates() {
+  const panel = await render(slots().main)
+  await click(en.settings, panel)
+  await click(en['section.updates'], panel)
+  return panel
+}
+
+it('shows the Host version and current browser build, then offers a manual refresh only for a mismatch', async () => {
+  const app = updatesServer()
+  const panel = await renderUpdates()
+  expect(panel.textContent).toContain(app.current.version)
+  expect(panel.textContent).toContain(app.current.buildId)
+  expect(panel.textContent).toContain(STUDIO_WEB_BUILD_ID)
+  expect(panel.textContent).toContain(en['updateHealth.ready'])
+  expect(panel.textContent).toContain(en.updateBrowserOutdated)
+  expect(button(en.updateReloadPage, panel).disabled).toBe(false)
+  expect(app.probes).toHaveBeenCalled()
+  app.current.buildId = STUDIO_WEB_BUILD_ID
+  await click(en.updateRefreshStatus, panel)
+  expect(panel.textContent).not.toContain(en.updateBrowserOutdated)
+})
+
+it.each([true, false])('prepares once, polls by update ID and uses the unified answer flow (approve=%s)', async approve => {
+  vi.useFakeTimers()
+  vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
+  const id = `self-update:${updateId}`
+  const app = updatesServer(({ op, input }) => {
+    if (op === 'prepareSelfUpdate') {
+      const running = updateRecord('prechecking', { logPath: `/private/updates/${updateId}/precheck.log` })
+      app.show(running)
+      return running
+    }
+    if (op === 'answer') {
+      app.show(updateRecord(approve ? 'approved' : 'cancelled'))
+      return { ...confirmation, id, state: 'resolved', answeredBy: 'gui', answer: input.value }
+    }
+  })
+  app.state.projects[0]!.workspacePath = '/registered-source'
+  const panel = await renderUpdates()
+  await change(node<HTMLSelectElement>('.as-config-view:not([hidden]) fieldset select', panel), JSON.stringify(['project-a', 1]))
+  await click(en.updatePrepare, panel)
+  expect(app.requests.filter(item => item.op === 'prepareSelfUpdate').map(({ input }) => input)).toEqual([
+    { requestId: expect.stringMatching(/^[0-9a-f]{32}$/u), expectedCurrentFingerprint: oldHash, projectId: 'project-a', expectedEpoch: 1 },
+  ])
+  expect(panel.textContent).toContain(en['updatePhase.prechecking'])
+  expect(app.requests.some(item => item.op === 'answer')).toBe(false)
+  app.show(updateRecord('awaiting_confirmation', { pendingId: id, expiresAt: at + 15 * 60_000 }))
+  const beforePoll = app.requests.length
+  await act(async () => { await vi.advanceTimersByTimeAsync(2_500) })
+  expect(app.requests.slice(beforePoll).some(item => item.op === 'selfUpdateStatus' && item.input.updateId === updateId)).toBe(true)
+  expect(panel.textContent).toContain(en['updatePhase.awaiting_confirmation'])
+  await click(approve ? en.updateApprove : en.updateCancel, panel)
+  expect(app.requests.filter(item => item.op === 'answer').map(item => item.input)).toEqual([{ id, value: SELF_UPDATE_CHOICES[approve ? 0 : 1] }])
+  expect(panel.textContent).toContain(en[approve ? 'updatePhase.approved' : 'updatePhase.cancelled'])
+})
+
+it('renders failures and safe log references literally, and requests rollback only for the verified earlier release', async () => {
+  const app = updatesServer(({ op }) => {
+    if (op === 'rollbackSelfUpdate') {
+      const rollback = updateRecord('awaiting_confirmation', { updateId: rollbackId, rollbackOf: updateId, kind: 'rollback',
+        pendingId: `self-update-rollback:${rollbackId}`, baselineFingerprint: nextHash, candidateFingerprint: oldHash })
+      app.show(rollback)
+      return rollback
+    }
+  })
+  const panel = await renderUpdates()
+  for (const phase of ['failed_precheck', 'rolled_back', 'recovery_required'] as const) {
+    app.show(updateRecord(phase, { failedPhase: phase === 'failed_precheck' ? 'prechecking' : 'starting', exitCode: 7,
+      ...(phase === 'recovery_required' && { logPath: '<script>bad()</script>' }) }))
+    await click(en.updateRefreshStatus, panel)
+    const card = node('.as-update-record', panel)
+    expect(card.textContent).toContain(en[`updatePhase.${phase}`])
+    expect(card.textContent).toContain(literalBuild)
+    expect(card.querySelector('img, script')).toBeNull()
+    expect(card.textContent).not.toMatch(/private-owner|bad\(\)<\/script>/u)
+    expect(card.textContent).toContain(phase === 'recovery_required' ? en.updateLogPrivate : `updates/${updateId}/controller.log`)
+    expect(card.textContent).not.toContain(en.updateRequestRollback)
+  }
+  expect(button(en.updatePrepare, panel).closest('fieldset')?.disabled).toBe(true)
+  app.show(updateRecord('succeeded'))
+  await click(en.updateRefreshStatus, panel)
+  expect(panel.textContent).not.toContain(en.updateRequestRollback)
+  app.current.artifactFingerprint = nextHash
+  await click(en.updateRefreshStatus, panel)
+  await click(en.updateRequestRollback, panel)
+  expect(app.requests.find(item => item.op === 'rollbackSelfUpdate')?.input).toEqual({ updateId, requestId: expect.any(String), expectedCurrentFingerprint: nextHash })
+  expect(panel.textContent).toContain(en['updateRecord.rollback'])
+  expect(button(en.updateApproveRollback, panel).disabled).toBe(false)
+  expect(app.requests.some(item => item.op === 'answer')).toBe(false)
 })

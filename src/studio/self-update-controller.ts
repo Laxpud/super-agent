@@ -76,7 +76,9 @@ export async function handoffStudioUpdate(dir: string, plan: Omit<StudioControll
   signal.throwIfAborted()
   const runner = join(plan.current, 'lib', 'self-update-runner.js')
   if (realpathSync(runner) !== runner || !lstatSync(runner).isFile()) throw new Error('No installed Studio update runner')
-  const child = spawn(process.execPath, [runner, path], { cwd: dir, shell: false, detached: true, stdio: 'ignore', env: minimalEnvironment() })
+  // runner 会以同一 HOME 重启宿主；丢失 HOME 会让命名 profile 之外的写入落到系统账户主目录。
+  const child = spawn(process.execPath, [runner, path], { cwd: dir, shell: false, detached: true, stdio: 'ignore',
+    env: { ...minimalEnvironment(), HOME: homedir() } })
   let exited = false
   child.once('error', () => { exited = true })
   child.once('exit', () => { exited = true })

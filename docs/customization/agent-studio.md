@@ -1,6 +1,6 @@
 # 使用 Agent Studio
 
-Agent Studio 是 DSH Web 左侧的独立入口。默认进入 **Assistant**，也可在项目列表选择活动项目，与它的现任 **Leader** 对话。各项目与 Assistant 分开保存对话；复用同一个 Leader Bot 也不会合并项目上下文。本指南说明截至阶段 3（闭环交互与管理）的能力，不是 [V1 全部规格](requirements/v1-scope.md)的完成清单。
+Agent Studio 是 DSH Web 左侧的独立入口。默认进入 **Assistant**，也可在项目列表选择活动项目，与它的现任 **Leader** 对话。各项目与 Assistant 分开保存对话；复用同一个 Leader Bot 也不会合并项目上下文。本指南说明截至阶段 4（自举无缝更新）的能力，现场核验范围见 [V1 验收清单与证据](progress.md#v1-验收清单与证据)。
 
 ## 启用
 
@@ -47,6 +47,32 @@ DSH_HOME=/absolute/path/to/studio-test-home dsh --profile web \
 先停止旧宿主接收新工作，等待在途轮次结束，再停用旧 bundle。用 SQLite 备份接口把 `managed-worker.sqlite` 完整复制到新目录，核对副本完整性，然后让当前版本的 `stateDir` 指向副本。不要复制仍由旧宿主持锁的主文件，不要同时运行两个副本。保留原库、旧配置档和旧安装包，供核对或回退；不要用旧程序打开已迁移的库。
 
 首次打开 SQLite V0 或 V1 旧库时，宿主将其迁移到 V2（`user_version = 2`）。已发布对话、已有项目、对话模型设置和飞书绑定分界保留；普通已完成结果可查，旧在途执行标记为中断，不会自动重跑。V0 旧 Session 仅供查阅，不恢复为可执行身份；受保护结果不会进入现行任务与交付视图。SQLite 迁移不搬运 DSH 会话日志或本地工作文件。旧 `textWorkerRoutes` / `textWorkerDefaults` 只用于读取兼容，应用设置时写回新键；旧飞书收件配置不会替你启用共用对话，需要用户重新明确验证绑定。
+
+## 自举更新与回滚
+
+自举更新只作用于当前受管的 Linux DSH Web 配置档，不升级 DSH 本身。建议先在独立 `HOME`、`DSH_HOME`、命名 profile 和回环端口验收，不要用正在服务的配置档试验。部署者需事先准备：
+
+- 在与源码、Studio 数据目录和 DSH 数据目录分开的 `<installRoot>/releases/<release>` 中放置已构建的发布（Host、Web Client 和运行资产）。`<installRoot>/current` 是指向该目录的唯一活动符号链接，配置档必须通过 `current` 加载 Studio；不要直接引用物理发布路径。安装根、`releases`、每套发布的根和 Studio 数据目录要求仅所有者可访问（`0700`）。提供发布所需的运行时依赖，并保持 profile 所用依赖和运行入口在切换后可解析；依赖不随发布指针切换。发布内的运行资产不得是符号链接。为 `<stateDir>/runtime/health.sock` 选择足够短的绝对路径。
+- 在 `agent-studio-managed-worker.config` 登记下例中的 `selfUpdate`，它不是 Web 可写配置。`repoPath` 必须是专用、受信的 Agent Studio Git 仓库根；构建会读取已跟踪及未忽略的工作树字节（包括未提交修改），但不会运行 Git hooks 或改写原工作树。若从项目入口准备更新，项目必须绑定这个规范路径，管理轮次也必须仍有效。控制器在临时工作树按锁文件安装依赖（禁用安装脚本）并运行真实 `pnpm check`。部署者须保证可信工具与注册表可用；新建构建 HOME 并不等同于对不可信源码做 OS 级隔离。
+- `reloadCommand` 是部署者固定的 argv，不经过 shell。它必须直接启动并保留当前 profile 的 DSH PID（避免 daemonize 或用不 `exec` 的包装脚本），用同一回环端口，不能包含 `--from-default-profile`。飞书已配置时，App Secret 必须在 DSH 凭据库中保存；仅启动时注入的密钥不能用于受管重载。缺少可用重载配方时可准备候选，但不能批准切换。
+
+```yaml
+selfUpdate:
+  repoPath: /absolute/path/to/trusted-agent-studio-repo
+  installRoot: /absolute/path/to/studio-install
+  healthTimeoutMs: 30000
+  reloadCommand:
+    executable: /absolute/path/to/node
+    args: [/absolute/path/to/installed/dsh/lib/bin.js, --profile, studio, --host, 127.0.0.1, --port, '3080', --no-open]
+    cwd: /absolute/path/to/studio-workspace
+    profileName: studio
+    dshHome: /absolute/path/to/studio-dsh-home
+```
+
+1. 打开 **Studio 设置 → 更新**，核对宿主版本、构建 ID、指纹和浏览器构建 ID。选已登记源码或使用该源码的活动项目，点 **准备更新**。前置检查完成才创建一条有时限的「待我处理」确认；失败（`failed_precheck`）没有待办，也不停止旧宿主或修改指针。
+2. 在更新页或统一待办核对当前指纹和候选指纹，再明确 **批准更新** 或 **取消更新**。已配置飞书时可在绑定的私聊卡片或明确回复处理同一待办；两个入口只有一个决定生效，旧确认不能补交重放。批准后宿主停止接收新写入，等待在途工作与出箱排空并封存 SQLite WAL。脱离控制器核对封存回执和旧进程身份，确认旧 PID 已退出后才原子替换 `current` 并重启同一配置档。排空或交接失败不会切换发布。
+3. `GET /agent-studio/health` 仅允许 DSH 所有者浏览器登录及 Studio 请求标头，返回构建标识、PID、就绪与阶段、SQLite、配置和飞书状态，不含路径、凭据或消息，不触发写入。控制器使用私有 Unix socket 的随机挑战核验新 PID、预期构建和指纹；浏览器显示版本不一致时手动刷新页面，不重发上次决定。
+4. 切换或启动核验失败时，控制器终止失败候选，原子切回已验证基线并重新检查；成功记为 `rolled_back`。基线也无法恢复时记为 `recovery_required`，不循环重启：保留数据、发布与 `state.json`，按设置页的脱敏 `updates/<updateId>/controller.log` 引用在数据目录查看私有日志，再由部署者处理。成功更新后，设置页可针对该次保留的基线**申请回滚**，但仍必须批准一条全新的确认才切换，不会回滚或覆盖共享数据库。
 
 ## 对话、项目和任务
 
