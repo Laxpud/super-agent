@@ -1,6 +1,13 @@
 # 定制进展与下一步
 
-> **说明：** 需求文档已于 2026-11-27 重整为[Agent Studio 需求总览](requirements/README.md)（含 [V1 规格与验收](requirements/v1-scope.md)、[终态蓝图与演进路线](requirements/roadmap-and-blueprint.md) 与 [现有代码保留与清理边界](requirements/cleanup-and-reuse.md)）。下文保留重整前对早期实验版本的模拟验证与隔离宿主记录。
+## 2026-11-28 · 阶段 1（做减法与稳骨架）完成记录
+
+- **减负范围：**现役 Studio 移除了受管文档与接续、纯文字修订、Study、Advisor、Watchdog、共享额度管理、外部作业及两套旧飞书收件箱。保留 Web/飞书共用的 Assistant 对话、项目 Leader、无工具 Worker、任务交付、待处理事项和只读来源。上游 GitHub Ticket 代码、预设和测试不受此轮改动影响。
+- **SQLite、配置与预设：**SQLite `user_version = 1` 使用统一七态任务账本，分开 Bot、项目、Session、任务和执行身份；旧库保留已发布消息、对话设置和飞书分界，隔离旧会话与受保护成果，不重放中断的工作。项目档案与显式偏好使用简化存储。设置收敛为「对话模型」「Worker 派工」「飞书」「高级」；旧模型配置仅向新路由键兼容，旧飞书收件箱不会自动启用共用对话。Studio 三个预设独立于 Ticket；`workspace-write` 当前只记账，执行仍是只读沙箱，Worker 不开放文件或 shell 工具。
+- **验证：**隔离的 DSH `0.2.2-rc.5` Host smoke 复跑通过，覆盖原生 Web 授权、项目会话隔离、统一派工交付和结果来源；没有连接真实飞书。阶段骨架新增 14 项测试，覆盖真实 SQLite V0 → V1 迁移与防泄漏、执行和项目管理栅栏、档案和偏好、配置兼容、模型核验及活动 Worker 拒绝文件写入和 shell。`pnpm check`（类型检查、66 个测试文件共 1,252 项测试、构建）通过。
+- **下一步：**[阶段 2 · 打通本地工作区执行](requirements/cleanup-and-reuse.md#6-建议实施顺序)，实现限定目录的只读调查、受控修改与本地检查，并验证宿主在实际工具执行时拒绝越界和未获准的高危动作。
+
+> **历史基线：** 需求文档已于 2026-11-27 重整为[Agent Studio 需求总览](requirements/README.md)（含 [V1 规格与验收](requirements/v1-scope.md)、[终态蓝图与演进路线](requirements/roadmap-and-blueprint.md) 与 [现有代码保留与清理边界](requirements/cleanup-and-reuse.md)）。下文保留重整前对早期实验版本的模拟验证与隔离宿主记录，不代表阶段 1 的现役能力。
 
 普通文字委派、跨入口更正和长作业接续三条主流程已在独立 DSH Web 宿主上运行。下文分别记录模拟验证和实际服务的验收范围。
 

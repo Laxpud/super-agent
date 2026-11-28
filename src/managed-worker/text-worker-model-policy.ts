@@ -95,8 +95,10 @@ export class WorkerModelPolicy {
   }
 
   async pin(route: StudioModel, signal: AbortSignal): Promise<Readonly<StudioModel>> {
-    await confirmStudioModel(this.ctx, route, signal)
-    return Object.freeze({ ...route })
+    // 查目录可能等待提供方响应；先固定输入，确保返回的组合与实际核验的是同一个快照。
+    const pinned = Object.freeze({ ...route })
+    await confirmStudioModel(this.ctx, pinned, signal)
+    return pinned
   }
 
   classifyProviderFailure(error: unknown): ProviderFailure { return classifyProviderFailure(error) }

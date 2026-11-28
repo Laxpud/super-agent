@@ -482,13 +482,15 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
 | `tests/studio-store.spec.ts` | Shared timeline, provenance, model CAS, V1 historical Session roles, run fencing, and pending and Feishu delivery recovery |
+| `tests/studio-v1-store.spec.ts` | Real V1 SQLite task and execution constraints, V0 migration without protected result disclosure, project epoch fencing, archives and preference tombstones |
+| `tests/studio-v1-host.spec.ts` | Settings round trips and legacy projection, Worker model routing and failure classification, and the live Worker tool guard with workspace-write recorded |
 | `tests/studio-service.spec.ts`, `studio-feishu.spec.ts` | Shared conversation intake, topic and confirmation addressing, task blocker clearance, SDK payloads and Feishu binding with offline network fixtures |
 | `tests/studio-web.spec.tsx`, `studio-workspace.spec.ts` | Sidebar/main entry, literal tool output, read-only history, settings CAS and owner flows, and reversible hiding of Studio Sessions from the browser catalog |
 | `tests/fixtures/studio-runtime.smoke.mjs` | Opt-in installed DSH rc.5 Host smoke test for native Web authorization, exact provenance, isolated Leader contexts and unified task delivery, using a local deterministic model adapter |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
 
-`tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
+`tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`. The Studio migration tests use the frozen legacy table definitions in `tests/fixtures/studio-v0.sql`, not the current schema.
 
 ## Persistence
 

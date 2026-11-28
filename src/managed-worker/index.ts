@@ -61,11 +61,9 @@ const hostFields = s.object({
   studioDirectoryToken: s.string(),
   textWorkerRoutes: s.array(LegacyWorkerRouteConfig).max(64).description('Legacy input alias; new writes use workerModelRoutes.'),
   textWorkerDefaults: LegacyWorkerDefaultsConfig.description('Legacy input alias; new writes use workerModelDefaults.'),
-  feishuDocumentInbox: s.const(null),
-  feishuTextInbox: s.const(null),
 })
 
-/** 解析旧模型配置只为读兼容；不会继承任何已退役飞书通道。 */
+/** 旧模型配置仅作只读兼容。忽略已退役的飞书收件箱，使旧配置档仍能启动并由设置页清理旧键，不会沿用旧绑定。 */
 export const Config: s<Record<string, unknown>, StudioHostConfig> = s.transform(hostFields, (value): StudioHostConfig => {
   if (!value.stateDir) throw new Error('Agent Studio stateDir is required')
   return {
